@@ -1,0 +1,52 @@
+{
+  "name": "pi-pane",
+  "version": "0.0.0-m0",
+  "private": true,
+  "type": "module",
+  "description": "M0 spike for mirroring a live pi TUI session in a browser",
+  "keywords": [
+    "pi-package"
+  ],
+  "pi": {
+    "extensions": [
+      "./dist/extension/index.js"
+    ]
+  },
+  "scripts": {
+    "dev": "vite --host 127.0.0.1",
+    "build": "vite build && tsc -p tsconfig.extension.json",
+    "typecheck": "tsc --noEmit",
+    "test": "tsx --test tests/*.test.ts",
+    "m0:smoke": "node scripts/m0-smoke.mjs",
+    "m0:browser": "node scripts/m0-browser.mjs",
+    "m0:lifecycle": "node scripts/m0-lifecycle.mjs",
+    "m0:boundaries": "node scripts/m0-boundaries.mjs",
+    "m0:projection": "node scripts/m0-projection-extra.mjs",
+    "m0:performance": "node scripts/m0-performance.mjs"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*"
+  },
+  "dependencies": {
+    "ws": "8.22.0"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-ai": "1.0.4",
+    "@earendil-works/pi-coding-agent": "1.0.4",
+    "@types/node": "24.7.0",
+    "@types/ws": "8.18.1",
+    "playwright": "1.55.1",
+    "preact": "10.29.8",
+    "tsx": "4.20.6",
+    "typescript": "5.9.3",
+    "vite": "7.3.7",
+    "zustand": "5.0.8"
+  },
+  "files": [
+    "dist",
+    "web-dist",
+    "docs/design.md",
+    "docs/m0-status.md"
+  ]
+}

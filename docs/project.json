@@ -1,0 +1,15 @@
+{
+  "name": "pi pane",
+  "stage": "M0",
+  "stageStatus": "complete",
+  "m0CompletedDate": "2026-10-08",
+  "spaceId": "page_space_34185c381de88191b84f449560405356",
+  "projectPage": "https://chatgpt.com/space/page_6ac669a979c48191a25f7d5411b378f6",
+  "planPage": "https://chatgpt.com/space/page_6ac66a64d11c8191bbcc2dc63d862e09",
+  "designPage": "https://chatgpt.com/space/page_6ac66a0f8d0c819195fb27d91c06e033",
+  "evidencePage": "https://chatgpt.com/space/page_b3f2b1dc1800819189f2b90d540f931c",
+  "localFollowUpAutomationId": "pi-pane-m0-space",
+  "localFollowUpStatus": "PAUSED",
+  "evidenceDirectory": "build-artifacts/m0",
+  "liveTaskStatusSource": "planPage"
+}
