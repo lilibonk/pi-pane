@@ -47,7 +47,7 @@
 
 ## 尚需维护者或真实环境完成
 
-- npm 发布、许可证与仓库信息、公开预览图地址和 pi.dev gallery 收录仍未执行，`private: true` 保留。
+- npm 发布、许可证和 pi.dev gallery 收录仍未执行，`private: true` 保留。2026-10-09 已创建 [GitHub 公开仓库](https://github.com/lilibonk/pi-pane)，并配置 package 的仓库、问题反馈与公开预览图地址。
 - 一周日常使用反馈、真实 Tailscale Serve、iOS Safari / 真机、真实 OS 输入法，以及 Windows / pnpm / 其他宿主版本验证仍未完成。
 - 4 MiB 无换行文本过载仍属历史宿主诊断项，本轮沿用 `--skip-overload`，未声称已解决。
 - thinking 观测耗时不写入宿主会话文件；分支重置、扩展重载或进程重启后不回填历史耗时。

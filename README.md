@@ -8,9 +8,11 @@
 
 ## 安装
 
-当前仓库仍为私有发布状态，尚未执行 npm 发布。从源码试用：
+项目已在 [GitHub](https://github.com/lilibonk/pi-pane) 公开，npm 包尚未发布。从源码试用：
 
 ```sh
+git clone https://github.com/lilibonk/pi-pane.git
+cd pi-pane
 npm ci
 npm run build
 pi -e .

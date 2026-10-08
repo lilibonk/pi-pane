@@ -4,6 +4,14 @@
   "private": true,
   "type": "module",
   "description": "Open the running pi TUI session in a browser: live mirror, prompts with images, optional HTTPS access from other devices",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/lilibonk/pi-pane.git"
+  },
+  "homepage": "https://github.com/lilibonk/pi-pane#readme",
+  "bugs": {
+    "url": "https://github.com/lilibonk/pi-pane/issues"
+  },
   "keywords": [
     "pi-package"
   ],
@@ -13,7 +21,8 @@
     ],
     "themes": [
       "./themes/*.json"
-    ]
+    ],
+    "image": "https://raw.githubusercontent.com/lilibonk/pi-pane/main/docs/preview.png"
   },
   "scripts": {
     "dev": "vite --host 127.0.0.1",
