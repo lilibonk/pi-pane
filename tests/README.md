@@ -34,3 +34,20 @@ npm run m0:performance
 Reports contain synthetic fixture messages, a redacted terminal transcript and JSON event evidence. Browser tokens are used only in memory for the test connection and are redacted before writing terminal logs. Processes, sockets and temporary test configuration are closed on completion. The PTY harness currently supports macOS/Linux; Windows PTY behavior is not verified.
 
 Prompt receipts are dispatch-only even when a hook consumes input or the host later fails preflight. Race checks prove stale-command rejection and that old completions do not enter a replacement epoch; they do not claim to undo host operations that already began. Lease expiration and receipt-cache eviction use the existing short-TTL Hub integration tests instead of waiting 30 minutes in the TUI harness. All fake-provider calls remain local; no real authentication credentials or model service is used.
+
+## M1 additions
+
+The M0 harnesses remain the regression suite and now speak the M1 protocol: their WebSocket clients reassemble `frame_begin`/`frame_chunk`/`frame_end` and apply events through the shared `applyProjectionEvent` reducer from `dist/protocol`, the same code the browser uses. Build before running them.
+
+```sh
+npm run build
+npm run m1:render
+npm run m1:a6
+node scripts/m0-performance.mjs --skip-overload
+```
+
+`m1:render` starts a real Hub on the built `web-dist` with a stub Bridge holding a fixed transcript (no pi process). It checks Markdown, Shiki highlighting, typed tool cards and diffs, `content_page` expansion, `history_page` loading and the 390px layout, and the content-safety part of A8: raw HTML stays text, `javascript:`/`data:` links are removed, Markdown images become links and nothing remote is requested.
+
+`m1:a6` runs the real TUI with the performance fixture, adds 1,000 visible custom messages of 912 characters (≈0.91 MB of normalized text, no images) and reloads one Chrome tab 20 times. Each sample is the time between the page's `pi-pane:ws-open` and `pi-pane:snapshot-rendered` performance marks (the latter is set one animation frame after the snapshot commit). It reports P50/P95/max, navigation-to-rendered separately, and then pages the whole dataset into the same tab.
+
+`m0-performance` (A5) now verifies the 8 MiB send-buffer recycle of a paused peer, reads a 2 MiB tool result in full through `content_page`, and pages more than 1,000 history messages back to the branch root with every transport frame at most 1 MiB. `--skip-overload` skips the 4 MiB CPU-profile diagnostic, whose earlier non-completion is a host/fixture limitation.

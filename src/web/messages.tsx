@@ -17,10 +17,14 @@ function argsOf(call: ToolCall | undefined): Record<string, unknown> {
 function str(value: unknown): string | undefined {
   return typeof value === "string" ? value : undefined;
 }
-function blockText(message: MessageView, index: number, expansions: Expansions): string {
+/** An expansion is current only while the block still has the length it was read at. */
+function currentExpansion(message: MessageView, index: number, expansions: Expansions): Expansion | undefined {
   const block = message.content[index] as TextBlock;
   const expanded = expansions[`${message.id}#${index}`];
-  return expanded && !expanded.loading && !expanded.error ? expanded.text : block.text;
+  return expanded && !expanded.loading && !expanded.error && expanded.total === block.total ? expanded : undefined;
+}
+function blockText(message: MessageView, index: number, expansions: Expansions): string {
+  return currentExpansion(message, index, expansions)?.text ?? (message.content[index] as TextBlock).text;
 }
 
 /** Shows how much of a clipped block is present and lets the reader load the rest. */
@@ -28,7 +32,8 @@ function Clipped({ message, index, expansions }: { message: MessageView; index: 
   const block = message.content[index] as TextBlock;
   if (block.total === undefined) return null;
   const expansion = expansions[`${message.id}#${index}`];
-  if (expansion && !expansion.loading && !expansion.error) {
+  const stale = !!expansion && !expansion.loading && !expansion.error && expansion.total !== block.total;
+  if (currentExpansion(message, index, expansions) && expansion) {
     return (
       <p class="truncation">
         {expansion.capped ? `已加载前 ${expansion.text.length.toLocaleString()} / ${expansion.total.toLocaleString()} 字符（浏览器上限）。` : `已加载全部 ${expansion.total.toLocaleString()} 字符。`}
@@ -40,7 +45,7 @@ function Clipped({ message, index, expansions }: { message: MessageView; index: 
     <p class="truncation">
       显示前 {block.text.length.toLocaleString()} / {block.total.toLocaleString()} 字符。
       <button type="button" class="link-button" disabled={expansion?.loading} onClick={() => expandContent(message, index)}>
-        {expansion?.loading ? `加载中 ${expansion.text.length.toLocaleString()}…` : "加载全部"}
+        {expansion?.loading ? `加载中 ${expansion.text.length.toLocaleString()}…` : stale ? "内容已更新，重新加载" : "加载全部"}
       </button>
       {expansion?.error && <span class="error-text">{expansion.error}</span>}
     </p>

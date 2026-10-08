@@ -231,12 +231,12 @@ S → C  { t: "event", epoch, seq, ev: {...} } …（之后一直推增量）
 
 | 类型 | 来源 | 说明 |
 |---|---|---|
-| `agent_state` | `agent_start` / `agent_settled`，结合 `ctx.isIdle()` | `agent_settled` 用于终止自动续跑后的收敛；压缩期间不能仅因没有文本输出就判定 idle |
-| `msg_start` / `msg_delta` / `msg_end` | `message_*` | 带 `messageId`；delta 带 `contentIndex`、`kind`（text/thinking/toolcall）和 `delta`；end 包含最终内容或可完整读取的版本引用 |
+| `agent_state` | `agent_start` / `agent_settled`，结合 `ctx.isIdle()` | `agent_settled` 用于终止自动续跑后的收敛；压缩期间不能仅因没有文本输出就判定 idle。M1：`state.tools` 恒为空数组，工具进度只走 `tool_*` 事件，reducer 保留已有工具列表 |
+| `msg_start` / `msg_delta` / `msg_end` | `message_*` | start/end 携带完整的有界 `MessageView`。M1 实现：`message_update` 在服务端按 16ms 合并，`msg_delta { id, ops }` 中每个 op 为 `{ i, append, total? }`（文本块追加）或 `{ i, set }`（替换块）；元数据变化时退回 `msg_delta { id, message }` 整条替换。差量以所有客户端共享的“最后已发送”视图为基线，快照与其一致 |
 | `tool_start` / `tool_update` / `tool_end` | `tool_execution_*` | 带 `toolCallId`、可选 `parentToolCallId`；partial 按工具在 50ms 内合并，end 刷新最终结果并清除待发 partial |
 | `model` / `thinking` | `model_select` / `thinking_level_select` | 推送实际生效值，包括模型能力导致的 thinking 钳制 |
 | `ui_prompt` | `ui_prompt_start/end` | 按可用标识维护待处理集合；网页提示终端待处理的 kind/title，不提供代答 |
-| `compaction` | `session_before_compact` / `session_compact` / `session_compact_failed` 及回调 | 展示可观测进度，完成后校准历史与上下文用量；取消路径须恢复操作状态 |
+| `history_window` | `session_compact` | M1 实现：压缩成功后发布一个带 seq 的 `history_window { messages, olderCursor }`，客户端整体替换当前窗口；保持 epoch，以便 compact 命令仍能送达结果。`session_before_compact` / `session_compact_failed` 反映在 `agent_state.compacting` |
 | `queue_state` | Bridge 读取 `ctx.hasPendingMessages()` | 有网页连接时每 250ms 采样，值变化才推送；相关输入/消息事件后也刷新，不伪造不存在的扩展 `queue_update` 事件 |
 | `session_meta` | `session_info_changed` | 更新名称等元信息 |
 | `theme` | Bridge 比较颜色与 appearance 指纹 | 值变化才推送，见 §8 |
@@ -283,14 +283,14 @@ Hub 在调用宿主前预留命令记录，按 `clientId + commandNo` 去重，�
 
 - 前后端共享运行时 schema；拒绝未知命令、非法枚举、过期版本和非预期字段。模型/图片只传白名单字段，不把配置、凭据或任意扩展内部状态原样发给浏览器。
 - 初始限制：单条 prompt 文本 64 KiB UTF-8；最多 4 张 PNG/JPEG/WebP 图片、每张 base64 解码后的文件不超过 5 MiB、总计不超过 10 MiB，单图解码像素不超过 2,000 万。校验 base64、文件签名及实际可解码格式。客户端命令帧上限 16 MiB；认证和 hello 请求体各不超过 8 KiB。图片在 M2 开启前拒绝上传。
-- 逻辑快照装配上限初始为 8 MiB，包含当前状态、活动内容及最近的有界历史窗口。较大快照拆成 `snapshot_begin { snapshotId, epoch, seq, manifest }`、若干 `snapshot_chunk` 和 `snapshot_end`；chunk/end 均带 snapshotId、epoch，chunk 另带连续 chunkIndex，end 带预期块数。客户端完整性检查通过后一次应用；同连接只允许一个装配中的快照，reset/resync/新 begin 立即取消旧装配及尚未发送的旧块，旧 ID 的块不得再次提交。
-- 完整历史通过只读 `history_page { epoch, sessionId, branchRevision, cursor }` 按页加载；服务端验证版本，游标锚定稳定 entry ID，返回带同版本标识的页和下一游标，页面大小初始不超过 1 MiB。这些定向响应不消耗 seq；前端按 entry ID 合并，切 epoch 立即丢弃旧页。前端历史页缓存也设上限（初始 16 MiB），滚出窗口可回收并再次加载，不能靠分块把全部历史无限累积在内存中。
-- 单条超大消息/工具结果使用限长预览、显式截断标记和带版本的内容引用；只读 `content_page` 通过消息/附件 ID 读取指定版本的片段，禁止接受文件路径。历史图片同样经鉴权 WS 懒加载，不把全部 base64 塞进首屏。引用过期或宿主已不保留完整结果时明确说明不可恢复，不以摘要冒充完整结果；活动文本引用与后续 delta 的版本衔接原列入 M0，Spike 已记录为未实现的能力降级，移至 M1 验收。
+- 逻辑帧上限 8 MiB（快照、历史页等定向响应同样适用）。M1 实现为通用传输分块：序列化后超过 1 MiB 的逻辑帧拆成 `frame_begin { id, parts }`、连续的 `frame_chunk { id, index, data }`（每块 128K 字符的 JSON 文本）和 `frame_end { id }`，在同一事件循环回合内依次入队，不会与其他帧交错；客户端校验 id、连续 index 与块数后再解析并处理逻辑帧，任何交错或缺块都丢弃并 `resync`。与原设计的 `snapshot_begin/chunk/end` 等价，但不限于快照。
+- 完整历史通过只读 `history_page { reqId, epoch, sessionId, branchRevision, before }` 按页加载（`before` 为窗口中最早持久化消息的 entry ID，即快照的 `olderCursor`）；服务端验证 epoch、会话和分支版本，从该 entry 向前按 768 KiB 预算取页，返回 `{ messages, olderCursor }`，`olderCursor` 为 null 表示已到分支起点。响应定向发送、不消耗 seq；前端按 entry ID 合并，切 epoch 时丢弃未完成请求。前端保留历史上限 16 MiB：实时增长超限时淘汰最旧的持久化消息并前移游标（可再次加载）；向上加载会超限时拒绝并提示。快照窗口为最近 200 条 / 768 KiB 的持久化消息加上全部活动消息。
+- 单条消息所有块共享 32,768 字符的内联预算；超出预算的文本块保留原索引，只发送前缀并附 `total`（完整长度）。只读 `content_page { reqId, epoch, messageId, index, offset }` 按 128K 字符读取该块的完整原文，响应带 `total` 与 `final`（来源消息是否已结束），只接受消息 ID 与块序号，不接受文件路径。M1 的“版本衔接”以 `total` 与 offset 连续性实现：客户端每页校验 offset 等于已读长度，`total` 变化或 epoch 切换即判定过期需重读；仍在流式生成的超大块可以读取当前内容，但网页的“加载全部”主要面向已结束的消息。宿主不再保留来源消息时返回 `content_unavailable`，不以摘要冒充。工具实时输出在 `ToolView.output` 中只保留末尾 8,192 字符并附 `outputTotal`；完整结果通过对应 toolResult 消息的 `content_page` 读取。图片仍属 M2。
 - 快照分块及附件帧不超过 1 MiB；每连接发送缓冲与待发送增量合计初始上限 8 MiB，达到高水位即停止喂入历史分块，持续无法排空则断开该客户端并允许重连拉新快照。不得等待慢客户端而阻塞宿主事件处理，也不得无界缓存或静默丢 delta。
 - 大工具结果显示限长摘要和明确截断标记，可按需读取宿主仍保留的完整结果；实时投影只保存每个工具的最新 partial。持久化历史采用索引/分页，避免复制完整会话多份。资源上限由 M0 压测调优，并保留在发布配置与验收记录中。
 - 所有解析/归一化/网络错误都在扩展边界捕获；限流按连接和 Hub 总量执行。首次 hello 限时 5 秒；心跳超时、异常关闭和重绑失败统一走幂等清理。
 
-M0 Spike 已记录资源能力降级：历史最多 200 条/512 KiB，单消息文本预算 32,768 字符，单工具值预览 2,048 字符；单快照帧上限 1 MiB、每端发送缓冲上限 2 MiB，慢端断开后重新读取快照。当前没有 `snapshot_chunk`、`history_page`、`content_page` 或完整内容引用恢复；这些功能及引用/delta 版本衔接须在 M1 实现并验收，不能从有界预览测试推断通过。
+M0 Spike 的有界预览（200 条/512 KiB、无分页）已由 M1 替换为上述窗口 + 分页 + 内容页实现；当前常量见 `src/protocol/index.ts` 的 `LIMITS`，验收证据见 [M1 验收记录](m1-status.md)。
 
 ---
 
@@ -300,7 +300,7 @@ M0 Spike 已记录资源能力降级：历史最多 200 条/512 KiB，单消息�
 |---|---|
 | 用户消息 | 气泡，支持显示图片 |
 | assistant 文本 | Markdown（`marked` + `shiki`，shiki 懒加载），流式追加 |
-| thinking | 默认折叠，标题旁显示耗时 |
+| thinking | 默认折叠。M1 未显示耗时：`MessageView` 不含时间戳，耗时需另行设计 |
 | 内置工具 `read` / `write` / `edit` / `bash` / `grep` / `find` / `ls` | 专门的卡片：edit 显示 diff（按词高亮），bash 显示命令、输出和退出码 |
 | 未知工具或扩展工具 | 通用卡片：工具名、参数 JSON、结果文本，可折叠（它们在终端里的自定义渲染是 TUI 组件，网页没法复用） |
 | 嵌套调用（codemode） | 根据 `parentToolCallId` 缩进显示 |
@@ -309,7 +309,7 @@ M0 Spike 已记录资源能力降级：历史最多 200 条/512 KiB，单消息�
 
 输入框：Enter 提交，Shift+Enter 换行；运行中 Enter 请求 followUp，⌘Enter（Windows/Linux 为 Ctrl+Enter）请求 steer，并提供可点击的同名按钮。中文等输入法组合期间不触发提交。M2 支持粘贴和拖入图片。提交状态遵守 §6.3，不能在收到 `dispatched` 后标注“已入队”。
 
-**性能**：长会话用虚拟列表；delta 用 `requestAnimationFrame` 合并后再渲染。前端节流不能代替 §6.5 的服务端背压、快照分块和内存上限。
+**性能**：M1 以 `content-visibility: auto` 跳过屏幕外消息的布局与绘制，配合前端 16 MiB 历史上限和服务端分页；store 更新经 `requestAnimationFrame` 合并后渲染。若后续单页消息数显著增加，再引入真正的窗口化列表。前端节流不能代替 §6.5 的服务端背压、分块和内存上限。
 
 ---
 
@@ -400,15 +400,12 @@ M0 Spike 已记录资源能力降级：历史最多 200 条/512 KiB，单消息�
 pi-pane/
 ├── src/
 │   ├── extension/          # 跑在 pi 进程里
-│   │   ├── index.ts        # factory：命令 / flag / 事件注册
-│   │   ├── hub.ts          # 进程级单例：http + ws + 鉴权
-│   │   ├── bridge.ts       # 会话级：事件归一化、命令执行
-│   │   ├── snapshot.ts     # 历史 + 实时投影、水位、分块快照
-│   │   ├── commands.ts     # 会话守卫、命令租约/去重与回执
-│   │   ├── auth.ts         # token、外部登录、Origin/Host 校验
-│   │   └── theme.ts        # theme.colors → CSS 变量
-│   ├── protocol/           # 前后端共享类型、运行时 schema 与错误码
-│   └── web/                # 前端 SPA
+│   │   ├── index.ts        # factory：命令 / flag / 事件注册、进程级状态
+│   │   ├── hub.ts          # 进程级：http + ws、鉴权、租约/去重、分块发送、分页路由
+│   │   ├── bridge.ts       # 会话级：投影、窗口/分页、内容页、合并发布、主题、命令
+│   │   └── config.ts       # piPane 设置读取与宿主能力检测
+│   ├── protocol/           # 前后端共享类型、LIMITS、运行时校验与共享 reducer
+│   └── web/                # 前端 SPA：store、Markdown/高亮、消息与工具卡片
 ├── themes/                 # 可选：自带的 pi 主题
 └── docs/
 ```

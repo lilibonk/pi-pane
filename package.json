@@ -53,6 +53,7 @@
     "dist",
     "web-dist",
     "docs/design.md",
-    "docs/m0-status.md"
+    "docs/m0-status.md",
+    "docs/m1-status.md"
   ]
 }
