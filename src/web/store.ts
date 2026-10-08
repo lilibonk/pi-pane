@@ -31,6 +31,8 @@ export interface WebState {
   historyLoading: boolean;
   historyError: string;
   expansions: Record<string, Expansion>;
+  /** Increments on every applied snapshot; drives the snapshot-rendered performance mark. */
+  snapshotCount: number;
 }
 
 export const webStore = createStore<WebState>(() => ({
@@ -45,6 +47,7 @@ export const webStore = createStore<WebState>(() => ({
   historyLoading: false,
   historyError: "",
   expansions: {},
+  snapshotCount: 0,
 }));
 
 const TOKEN_KEY = "pi-pane.token";
@@ -156,7 +159,7 @@ function handleFrame(raw: unknown) {
       uncertainSubmissions(frame.epoch);
       resetReads();
       const snapshot = capHistory({ ...frame, state: { ...frame.state, tools: boundedTools(frame.state.tools) } } as Snapshot);
-      webStore.setState({ snapshot, lastAppliedSeq: frame.seq, connection: "online", notice: "" });
+      webStore.setState(state => ({ snapshot, lastAppliedSeq: frame.seq, connection: "online", notice: "", snapshotCount: state.snapshotCount + 1 }));
       attempt = 0;
       break;
     }
@@ -298,6 +301,8 @@ function connect() {
   assembling = undefined;
   ws.onopen = () => {
     if (socket !== ws) return;
+    // Measured by the A6 benchmark: WS open → snapshot applied and rendered.
+    try { performance.clearMarks("pi-pane:snapshot-rendered"); performance.mark("pi-pane:ws-open"); } catch { /* optional */ }
     send({ t: "hello", ...(readSession(CLIENT_KEY) ? { clientId: readSession(CLIENT_KEY) } : {}) });
   };
   ws.onmessage = event => {

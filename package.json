@@ -23,7 +23,8 @@
     "m0:boundaries": "node scripts/m0-boundaries.mjs",
     "m0:projection": "node scripts/m0-projection-extra.mjs",
     "m0:performance": "node scripts/m0-performance.mjs",
-    "m1:render": "node scripts/m1-render.mjs"
+    "m1:render": "node scripts/m1-render.mjs",
+    "m1:a6": "node scripts/m1-a6.mjs"
   },
   "peerDependencies": {
     "@earendil-works/pi-ai": "*",

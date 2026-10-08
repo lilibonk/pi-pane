@@ -10,6 +10,7 @@ import { fileURLToPath } from "node:url";
 import WebSocket from "ws";
 import { chromium } from "playwright";
 import { startFixture, waitFor } from "./m0-smoke.mjs";
+import { LIMITS, applyProjectionEvent, mergeOlderPage } from "../dist/protocol/index.js";
 
 const project = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const outputBase = resolve(process.env.PI_M0_REPORT_DIR || join(project, "build-artifacts/m0"));
@@ -33,13 +34,14 @@ const environment = {
   sourceSha256: Object.fromEntries(await Promise.all(["src/extension/index.ts", "src/extension/bridge.ts", "src/extension/hub.ts", "src/protocol/index.ts", "tests/fixtures/performance-provider.ts", "scripts/m0-performance.mjs"].map(async name => [name, createHash("sha256").update(await readFile(join(project, name))).digest("hex")]))),
 };
 const perfReport = {
-  scope: "M0 bounded preview and host overhead; not M1 full-history/P95 acceptance", environment, repetitions,
+  scope: "M1 paged history, content pages, backpressure and host overhead (A5); browser snapshot P95 (A6) is measured by scripts/m1-a6.mjs", environment, repetitions,
   workload: { kind: "text", chunks: 256, chunkBytes: 1024, yieldMs: 1, outputBytes: 262144 },
   controls: ["Identical provider, PTY drain, evidence writes and 20 ms in-process sampling in all configurations", "Warmup before measurement; generation duration recorded in the provider separately from TUI start/finish commands", "No explicit GC; process RSS/heap includes the pi host's full transcript and fixture telemetry", "Three rounds summarize medians, not a reliable tail-latency or significance estimate"],
-  limits: { messageCharacters: 32768, messageWindow: 200, messageWindowBytes: 524288, toolsMax: 64,
-    toolValuePreviewCharacters: 2048, snapshotFrameBytes: 1048576, serverSendBufferBytes: 2097152, clientLeases: 8 },
-  configurations: [], checks: [], notCovered: ["M1 paged full history and 1,000-message A6 benchmark", "OS/browser network process memory", "Long-term production leak soak beyond the repeated bounded-window stress", "Remote networks/LAN or TLS"],
-  acceptance: { mandatory: ["Reading clients retain contiguous sequence numbers and remain connected", "Paused peer is closed specifically for slow_client and server buffer stays at the declared bound", "TUI settles during paused-peer stress", "Huge results and long history keep explicit bounded previews"],
+  limits: { messageCharacters: LIMITS.messageChars, messageWindow: LIMITS.snapshotWindowMessages, messageWindowBytes: LIMITS.snapshotWindowBytes,
+    pageBytes: LIMITS.pageBytes, contentPageCharacters: LIMITS.contentPageChars, toolsMax: LIMITS.maxTools, toolOutputCharacters: LIMITS.toolOutputChars,
+    transportFrameBytes: LIMITS.frameBytes, logicalFrameBytes: LIMITS.logicalFrameBytes, serverSendBufferBytes: LIMITS.sendBufferBytes, clientLeases: 8 },
+  configurations: [], checks: [], notCovered: ["Browser snapshot P95 (A6) — see scripts/m1-a6.mjs", "OS/browser network process memory", "Long-term production leak soak beyond the repeated bounded-window stress", "Remote networks/LAN or TLS"],
+  acceptance: { mandatory: ["Reading clients retain contiguous sequence numbers and remain connected", "Paused peer is closed specifically for slow_client and server buffer stays at the declared bound", "TUI settles during paused-peer stress", "Huge results keep bounded wire previews and remain fully readable through content_page", "Long history is windowed in snapshots and fully reachable through history_page"],
     exploratoryRegressionGuard: "For the identical 256-KiB case, median generation overhead ≤25% and event-loop p95 increase ≤10 ms vs no-pane; these are M0 local engineering guards, not design A6 or statistical confidence claims" },
 };
 const themeReport = { scope: "Q3 real-TUI/public-API theme synchronization", environment, checks: [], publicAPI: "ctx.ui.setTheme, ctx.ui.theme.colors, ctx.ui.theme.appearance",
@@ -71,7 +73,7 @@ async function pressureClient(url) {
   const token = new URLSearchParams(parsed.hash.slice(1)).get("t");
   const socket = new WebSocket(`ws://${parsed.host}/ws`, ["pi-pane.v1", `pi-pane.bearer.${token}`], { origin: parsed.origin });
   const client = { socket, snapshot: undefined, clientId: undefined, seq: 0, epoch: undefined, closed: false,
-    closeCode: undefined, closeReason: undefined, protocolErrors: [], errors: [], snapshots: 0,
+    closeCode: undefined, closeReason: undefined, protocolErrors: [], errors: [], snapshots: 0, replies: new Map(), assembling: undefined, requestNo: 0,
     stats: { frames: 0, bytes: 0, events: 0, maxFrameBytes: 0, toolUpdates: 0, maxToolValueCharacters: 0 },
     send(frame) { socket.send(JSON.stringify(frame)); },
     async resync() {
@@ -79,6 +81,12 @@ async function pressureClient(url) {
       client.send({ t: "resync" });
       await waitFor(() => client.snapshots > before, "bounded snapshot response");
       return performance.now() - started;
+    },
+    /** Directed read request; resolves with the matching reply or error frame. */
+    async read(frame) {
+      const reqId = `r${++client.requestNo}`;
+      client.send({ ...frame, reqId, epoch: client.epoch });
+      return waitFor(() => client.replies.get(reqId), `${frame.t} reply`, 20_000);
     },
     async close() {
       if (client.closed) return;
@@ -90,7 +98,15 @@ async function pressureClient(url) {
   socket.on("close", (code, reason) => { client.closed = true; client.closeCode = code; client.closeReason = reason.toString(); });
   socket.on("message", data => {
     client.stats.frames++; client.stats.bytes += data.length; client.stats.maxFrameBytes = Math.max(client.stats.maxFrameBytes, data.length);
-    const frame = JSON.parse(data.toString());
+    let frame = JSON.parse(data.toString());
+    if (frame.t === "frame_begin") { client.assembling = { id: frame.id, parts: frame.parts, chunks: [] }; client.stats.chunkedFrames = (client.stats.chunkedFrames ?? 0) + 1; return; }
+    if (frame.t === "frame_chunk") { client.assembling?.chunks.push(frame.data); return; }
+    if (frame.t === "frame_end") {
+      const done = client.assembling; client.assembling = undefined;
+      if (!done || done.id !== frame.id || done.chunks.length !== done.parts) { client.protocolErrors.push({ chunkEnd: frame.id }); return; }
+      frame = JSON.parse(done.chunks.join(""));
+    }
+    if (frame.reqId && (frame.t === "history_page" || frame.t === "content_page" || frame.t === "error")) { client.replies.set(frame.reqId, frame); return; }
     if (frame.t === "welcome") client.clientId = frame.clientId;
     if (frame.t === "snapshot") { client.snapshot = frame; client.seq = frame.seq; client.epoch = frame.epoch; client.snapshots++; }
     if (frame.t === "session_reset") { client.snapshot = undefined; client.epoch = frame.epoch; client.seq = 0; }
@@ -102,19 +118,12 @@ async function pressureClient(url) {
     const state = client.snapshot;
     if (!state) return;
     const event = frame.ev;
-    if (event.message) {
-      const index = state.session.messages.findIndex(message => message.id === event.message.id);
-      if (index === -1) state.session.messages.push(event.message); else state.session.messages[index] = event.message;
-      state.session.messages = state.session.messages.slice(-200);
-    }
     if (event.tool) {
       client.stats.toolUpdates++;
-      client.stats.maxToolValueCharacters = Math.max(client.stats.maxToolValueCharacters, JSON.stringify(event.tool.partial ?? event.tool.result ?? null).length);
-      const index = state.state.tools.findIndex(tool => tool.id === event.tool.id);
-      if (index === -1) state.state.tools.push(event.tool); else state.state.tools[index] = event.tool;
+      client.stats.maxToolValueCharacters = Math.max(client.stats.maxToolValueCharacters, (event.tool.output ?? "").length);
     }
-    if (event.type === "agent_state") state.state = event.state;
-    if (event.type === "theme") state.theme = event.theme;
+    try { client.snapshot = applyProjectionEvent(state, event); }
+    catch (error) { client.protocolErrors.push({ seq: frame.seq, type: event?.type, error: String(error) }); }
   });
   await new Promise((accept, reject) => { socket.once("open", accept); socket.once("error", reject); });
   client.send({ t: "hello" });
@@ -257,7 +266,7 @@ try {
       assert.ok(telemetry.samples.some(sample => sample.authenticatedConnections === 3), "server authenticated count drops to three");
       assert.equal(telemetry.idleAtFinish, true);
       assert.deepEqual(currentClients.slice(0, 3).flatMap(client => client.protocolErrors), []);
-      assert.ok(telemetry.samples.every(sample => sample.maxBufferedBytes <= perfReport.limits.serverSendBufferBytes + 65536), "server buffers stay bounded at the M0 limit plus one sampled frame");
+      assert.ok(telemetry.samples.every(sample => sample.maxBufferedBytes <= perfReport.limits.serverSendBufferBytes + 65536), "server buffers stay bounded at the send-buffer limit plus one sampled frame");
       return { clientCloseCode: slow.closeCode, clientCloseReason: slow.closeReason, serverCloseEvents: telemetry.socketCloses,
         serverCloseRequests: telemetry.socketCloseRequests,
         peakBufferedBytes: Math.max(...telemetry.samples.map(sample => sample.maxBufferedBytes)),
@@ -265,22 +274,39 @@ try {
         providerDurationMs: telemetry.providers[0]?.durationMs, remainingClients: 3, pressure: "48 legal resync requests for a ~400-KiB bounded snapshot while TCP reads are paused; fixed 256-KiB provider runs concurrently",
         transport: "Node ws.pause() stops TCP receive consumption of the same browser wire protocol; not a browser network-process freeze", rawTelemetry: "slow-client.json" };
     });
-    await check(perfReport, "two-MiB tool partials and final result are bounded on the wire with explicit previews", async () => {
+    await check(perfReport, "two-MiB tool partials stay bounded on the wire and the final result is readable in full through content pages", async () => {
       const telemetry = await measure(currentFixture, "large-tool-partial", () => perform(currentFixture, { kind: "tool", partialBytes: 2 * 1024 * 1024, updates: 16, yieldMs: 20 }));
       const reader = currentClients[0];
       await reader.resync();
       const tool = reader.snapshot.state.tools.find(tool => tool.name === "m0_perf_tool");
       assert.ok(tool && tool.status === "complete");
-      assert.equal(tool.result.truncated, true);
-      assert.ok(tool.result.preview.length <= 2048);
-      assert.ok(reader.stats.maxToolValueCharacters < 2200);
-      assert.ok(reader.stats.maxFrameBytes <= perfReport.limits.snapshotFrameBytes);
-      return { inputPartialBytes: 2 * 1024 * 1024, updates: 16, toolWireValueMaxCharacters: reader.stats.maxToolValueCharacters,
-        finalPreviewCharacters: tool.result.preview.length, peakRssBytes: Math.max(...telemetry.samples.map(sample => sample.memory.rss)),
+      assert.ok(tool.output.length <= LIMITS.toolOutputChars);
+      assert.ok(tool.outputTotal > 2 * 1024 * 1024, "the tail advertises the full output length");
+      assert.ok(reader.stats.maxToolValueCharacters <= LIMITS.toolOutputChars);
+      assert.ok(reader.stats.maxFrameBytes <= LIMITS.frameBytes, "every transport frame stays within 1 MiB");
+      const result = reader.snapshot.session.messages.find(message => message.role === "toolResult" && message.toolCallId === tool.id);
+      assert.ok(result, "the persisted tool result is in the snapshot window");
+      const index = result.content.findIndex(block => block.type === "text" && block.total !== undefined);
+      assert.ok(index >= 0 && result.content[index].text.length <= LIMITS.messageChars);
+      const total = result.content[index].total;
+      const started = performance.now();
+      let text = "";
+      let pages = 0;
+      while (text.length < total) {
+        const page = await reader.read({ t: "content_page", messageId: result.id, index, offset: text.length });
+        assert.equal(page.t, "content_page", JSON.stringify(page.error ?? {}));
+        assert.equal(page.total, total);
+        text += page.text; pages++;
+      }
+      const readMs = performance.now() - started;
+      assert.ok(text.startsWith("FINAL\n") && text.length === total);
+      return { inputPartialBytes: 2 * 1024 * 1024, updates: 16, toolWireOutputMaxCharacters: reader.stats.maxToolValueCharacters,
+        finalOutputTotal: tool.outputTotal, contentPages: pages, fullResultCharacters: total, fullReadMs: readMs,
+        peakRssBytes: Math.max(...telemetry.samples.map(sample => sample.memory.rss)),
         toolExecutionDurationMs: telemetry.tools[0]?.durationMs, measurementDurationMs: telemetry.durationMs,
         eventLoopDelayMs: telemetry.eventLoopDelayMs, rawTelemetry: "large-tool-partial.json" };
     });
-    await check(perfReport, "1,000 persisted history messages retain only the advertised 200-message/512-KiB M0 window", async () => {
+    await check(perfReport, "1,000 persisted history messages are windowed in snapshots and fully reachable through history pages", async () => {
       const reader = currentClients[0];
       const inspections = [];
       for (let batch = 0; batch < 4; batch++) {
@@ -292,18 +318,34 @@ try {
         currentFixture.command("/m0-perf-inspect");
         const inspection = await currentFixture.waitEvent("perf_inspect", inspectBefore);
         inspections.push(inspection);
-        assert.ok(reader.snapshot.session.historyTruncated);
-        assert.ok(reader.snapshot.session.messages.length <= 200);
-        const sum = reader.snapshot.session.messages.reduce((total, message) => total + Buffer.byteLength(JSON.stringify(message)), 0);
-        assert.ok(sum <= 512 * 1024);
+        assert.ok(reader.snapshot.session.olderCursor, "older history is reachable");
+        assert.ok(reader.snapshot.session.messages.length <= LIMITS.snapshotWindowMessages + 1);
+        const sum = reader.snapshot.session.messages.filter(message => message.entryId).reduce((total, message) => total + Buffer.byteLength(JSON.stringify(message)), 0);
+        assert.ok(sum <= LIMITS.snapshotWindowBytes);
         assert.ok(inspection.branchEntries >= (batch + 1) * 250);
       }
       const responseMs = [];
       for (let index = 0; index < 20; index++) responseMs.push(await reader.resync());
-      await writeFile(join(performanceDir, "history-inspections.json"), `${JSON.stringify({ inspections, snapshotRoundTripMs: responseMs }, null, 2)}\n`);
-      return { persistedHistoryAdded: 1000, projectedMessages: reader.snapshot.session.messages.length,
-        boundedSnapshotBytes: Buffer.byteLength(JSON.stringify(reader.snapshot)), roundTripMs: statistics(responseMs),
-        measurement: "Node WS resync request to complete JSON snapshot; includes harness 20 ms polling; does not measure browser application or full A6 history", rawEvidence: "history-inspections.json" };
+      const started = performance.now();
+      let messages = reader.snapshot.session.messages;
+      let cursor = reader.snapshot.session.olderCursor;
+      let pages = 0;
+      while (cursor) {
+        const page = await reader.read({ t: "history_page", sessionId: reader.snapshot.session.id, branchRevision: reader.snapshot.session.branchRevision, before: cursor });
+        assert.equal(page.t, "history_page", JSON.stringify(page.error ?? {}));
+        assert.ok(page.messages.length > 0);
+        messages = mergeOlderPage(messages, page.messages);
+        cursor = page.olderCursor; pages++;
+      }
+      const pagingMs = performance.now() - started;
+      const history = messages.filter(message => message.content.some(block => block.type === "text" && block.text.startsWith("HISTORY ")));
+      assert.ok(history.length >= 1000, `all history messages reachable (${history.length})`);
+      assert.equal(new Set(messages.map(message => message.id)).size, messages.length, "no duplicate identities");
+      assert.ok(reader.stats.maxFrameBytes <= LIMITS.frameBytes, "frames over 1 MiB are chunked");
+      await writeFile(join(performanceDir, "history-inspections.json"), `${JSON.stringify({ inspections, snapshotRoundTripMs: responseMs, pages, pagingMs }, null, 2)}\n`);
+      return { persistedHistoryAdded: 1000, windowMessages: reader.snapshot.session.messages.length, reachableMessages: messages.length,
+        historyPages: pages, fullPagingMs: pagingMs, snapshotBytes: Buffer.byteLength(JSON.stringify(reader.snapshot)), roundTripMs: statistics(responseMs),
+        measurement: "Node WS resync to complete snapshot, and sequential history_page reads to the branch root; browser application is A6", rawEvidence: "history-inspections.json" };
     });
     await writeFile(join(performanceDir, "fixture-events.jsonl"), await readFile(currentFixture.eventPath, "utf8"));
     await cleanupFixture(currentFixture, currentClients); currentFixture = undefined; currentClients = [];

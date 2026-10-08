@@ -93,6 +93,12 @@ function App() {
 
   useEffect(() => { startConnection(); }, []);
   useEffect(() => {
+    if (!state.snapshotCount) return;
+    // After the commit, the next frame includes layout of the new snapshot.
+    const frame = requestAnimationFrame(() => { try { performance.mark("pi-pane:snapshot-rendered"); } catch { /* optional */ } });
+    return () => cancelAnimationFrame(frame);
+  }, [state.snapshotCount]);
+  useEffect(() => {
     const element = textarea.current;
     if (!element) return;
     // Preact's event-name inference can keep CompositionStart capitalized in browsers

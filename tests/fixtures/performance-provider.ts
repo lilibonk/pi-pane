@@ -226,7 +226,7 @@ export default function performanceProvider(pi: ExtensionAPI) {
     const body = state?.bridge?.snapshot();
     evidence("perf_inspect", { branchEntries: branch.length, branchMessages: branch.filter(entry => entry.type === "message").length,
       projectionMessages: body?.session.messages.length ?? 0, projectionMessageBytes: Buffer.byteLength(JSON.stringify(body?.session.messages ?? [])),
-      historyTruncated: body?.session.historyTruncated ?? false, tools: body?.state.tools.length ?? 0,
+      olderCursor: body?.session.olderCursor ?? null, tools: body?.state.tools.length ?? 0,
       projectionBytes: body ? Buffer.byteLength(JSON.stringify(body)) : 0, connections: state?.hub?.connectionCount ?? 0,
       memory: process.memoryUsage() });
   } });
