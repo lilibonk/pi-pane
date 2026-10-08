@@ -1,8 +1,14 @@
 {
   "name": "pi pane",
-  "stage": "M0",
-  "stageStatus": "complete",
+  "stage": "M2",
+  "stageStatus": "local-acceptance-complete-publication-pending",
   "m0CompletedDate": "2026-10-08",
+  "m1LocalAcceptanceCompletedDate": "2026-10-08",
+  "m2LocalAcceptanceCompletedDate": "2026-10-08",
+  "implementationFollowUpCompletedDate": "2026-10-09",
+  "publicationStatus": "pending",
+  "dailyUseFeedbackStatus": "not-started",
+  "spaceSyncStatus": "pending",
   "spaceId": "page_space_34185c381de88191b84f449560405356",
   "projectPage": "https://chatgpt.com/space/page_6ac669a979c48191a25f7d5411b378f6",
   "planPage": "https://chatgpt.com/space/page_6ac66a64d11c8191bbcc2dc63d862e09",
@@ -10,6 +16,6 @@
   "evidencePage": "https://chatgpt.com/space/page_b3f2b1dc1800819189f2b90d540f931c",
   "localFollowUpAutomationId": "pi-pane-m0-space",
   "localFollowUpStatus": "PAUSED",
-  "evidenceDirectory": "build-artifacts/m0",
-  "liveTaskStatusSource": "planPage"
+  "evidenceDirectory": "build-artifacts/m2/followup",
+  "liveTaskStatusSource": "docs/m2-followup-status.md"
 }

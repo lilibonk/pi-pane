@@ -122,8 +122,15 @@ export async function runBoundaries() {
       const before = c.snapshot.session.messages.find((message) => message.status === "streaming" && message.content.some((part) => part.type === "thinking"));
       await reconnect(); const restored = c.snapshot.session.messages.find((message) => message.id === before.id);
       assert.ok(restored?.content.some((part) => part.type === "thinking" && part.text.length > 24));
+      assert.equal(restored.content.find((part) => part.type === "thinking").timingStatus, "running");
       await c.settled("M0_THINKING_RECONNECT");
-      assert.equal(c.assistants("M0_THINKING_RECONNECT")[0].content.find((part) => part.type === "thinking").text, "M0_THOUGHT:" + "thinking-block-".repeat(16));
+      const finalThought = c.assistants("M0_THINKING_RECONNECT")[0].content.find((part) => part.type === "thinking");
+      assert.equal(finalThought.text, "M0_THOUGHT:" + "thinking-block-".repeat(16));
+      assert.equal(finalThought.timingStatus, "complete");
+      assert.ok(finalThought.durationMs >= 100 && finalThought.durationMs < 30_000, "duration measures the observed fixture stream");
+      await reconnect();
+      assert.deepEqual(c.assistants("M0_THINKING_RECONNECT")[0].content.find((part) => part.type === "thinking"), finalThought, "completed timing survives canonical snapshots and reconnect");
+      return { timingStatus: finalThought.timingStatus, durationMs: finalThought.durationMs };
     });
     await check("tool argument JSON can reconnect mid-stream and retain the final executed arguments", ["Q7"], async () => {
       await c.command("prompt", { text: "M0_TOOL_ARGUMENTS" });

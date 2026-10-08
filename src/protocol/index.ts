@@ -54,7 +54,8 @@ export type CommandName = (typeof COMMANDS)[number];
 /** `total` is present when `text` is a prefix of a longer block readable through content_page. */
 export type ContentView =
   | { type: "text"; text: string; total?: number }
-  | { type: "thinking"; text: string; total?: number }
+  /** Host-observed intervals only. Running blocks have no elapsed duration until they stop. */
+  | { type: "thinking"; text: string; total?: number; durationMs?: number; timingStatus?: "running" | "complete" | "interrupted" }
   | { type: "diff"; text: string; total?: number }
   | { type: "toolCall"; id: string; name: string; arguments: unknown; argsTruncated?: boolean }
   /** Image metadata only; the bytes are read on demand through image_page. */
@@ -444,7 +445,9 @@ export function diffMessage(prev: MessageView, next: MessageView): DeltaOp[] | n
     const before = prev.content[i];
     const after = next.content[i]!;
     if (!before) { ops.push({ i, set: after }); continue; }
-    if (isTextContent(before) && isTextContent(after) && before.type === after.type && after.text.startsWith(before.text)) {
+    const timingChanged = before.type === "thinking" && after.type === "thinking" &&
+      (before.durationMs !== after.durationMs || before.timingStatus !== after.timingStatus);
+    if (isTextContent(before) && isTextContent(after) && before.type === after.type && !timingChanged && after.text.startsWith(before.text)) {
       if (after.text.length !== before.text.length || after.total !== before.total)
         ops.push({ i, append: after.text.slice(before.text.length), ...(after.total !== undefined ? { total: after.total } : {}) });
       continue;

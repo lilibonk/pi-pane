@@ -1,0 +1,11 @@
+/* Optional, package-local web overrides. Vite copies this file unchanged to web-dist.
+   Edit this file before building, or edit web-dist/pi-pane.css in an installed package.
+   It loads after the application stylesheet. Use local system fonts; the CSP blocks remote assets.
+
+   Example:
+   :root { font-family: "PingFang SC", system-ui, sans-serif; }
+   .composer { border-radius: 12px; }
+
+   Live theme colors are inline custom properties. To override one intentionally, use !important:
+   :root { --bg: #121820 !important; }
+*/

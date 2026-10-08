@@ -1,6 +1,6 @@
 # pi `/web`：设计方案
 
-> 状态：草案 v0.3 · 2026-10-07（v0.3：修补快照一致性、命令语义、生命周期、安全与验收边界）
+> 状态：实现对照 v0.4 · 2026-10-09（v0.4：补齐主题背景与派生、按词 diff、thinking 观测耗时；v0.3 修补快照一致性、命令语义、生命周期、安全与验收边界）
 > 工作名：`pi-pane`（暂定，发布前核验 npm 名称；备选 `pi-webview` / `pi-mirror` / `pi-web-handoff`）
 > 基线：pi `@earendil-works/pi-coding-agent` 1.0.4
 > 验证状态：M0、M1 已于 2026-10-08 完成验收（[M0](m0-status.md)、[M1](m1-status.md)）；M2 的本地验收（A9–A11，除 npm 发布与 gallery 收录）见 [M2 验收记录](m2-status.md)。§4 的源码事实与 §13 的运行验证分开管理；当前结果见 [M0 执行计划与跟进](https://chatgpt.com/space/page_6ac66a64d11c8191bbcc2dc63d862e09) 和 [本地验收记录](m0-status.md)。
@@ -287,6 +287,7 @@ Hub 在调用宿主前预留命令记录，按 `clientId + commandNo` 去重，�
 - 完整历史通过只读 `history_page { reqId, epoch, sessionId, branchRevision, before }` 按页加载（`before` 为窗口中最早持久化消息的 entry ID，即快照的 `olderCursor`）；服务端验证 epoch、会话和分支版本，从该 entry 向前按 768 KiB 预算取页，返回 `{ messages, olderCursor }`，`olderCursor` 为 null 表示已到分支起点。响应定向发送、不消耗 seq；前端按 entry ID 合并，切 epoch 时丢弃未完成请求。前端保留历史上限 16 MiB：实时增长超限时淘汰最旧的持久化消息并前移游标（可再次加载）；向上加载会超限时拒绝并提示。快照窗口为最近 200 条 / 768 KiB 的持久化消息加上全部活动消息。
 - 单条消息所有块共享 32,768 字符的内联预算；超出预算的文本块保留原索引，只发送前缀并附 `total`（完整长度）。只读 `content_page { reqId, epoch, messageId, index, offset }` 按 128K 字符读取该块的完整原文，响应带 `total` 与 `final`（来源消息是否已结束），只接受消息 ID 与块序号，不接受文件路径。M1 的“版本衔接”以 `total` 与 offset 连续性实现：客户端每页校验 offset 等于已读长度，`total` 变化或 epoch 切换即判定过期需重读；仍在流式生成的超大块可以读取当前内容，但网页的“加载全部”主要面向已结束的消息。宿主不再保留来源消息时返回 `content_unavailable`，不以摘要冒充。工具实时输出在 `ToolView.output` 中只保留末尾 8,192 字符并附 `outputTotal`；完整结果通过对应 toolResult 消息的 `content_page` 读取。
 - 图片（M2）：快照与增量只携带 `{ type: "image", mimeType, bytes, width?, height? }` 元数据，块序号与原消息一致；字节通过只读 `image_page { reqId, epoch, messageId, index }` 定向读取（≤5 MiB，超出返回 `image_too_large`，经通用分块传输）。前端在图片接近视口（以 timeline 为根、600px 边距）时请求，最多 2 个并发，解码为 object URL，按最近显示淘汰，总量 ≤48 MiB；epoch 切换丢弃未完成请求，已加载的图片保留。
+- 思考耗时（M1/M2 收尾）：thinking 块可带 `timingStatus: "running" | "complete" | "interrupted"` 和 `durationMs`。Bridge 只对实际观测到的 `assistantMessageEvent.thinking_start/end` 按原始 `contentIndex` 用单调时钟计时，结束时定值；缺少 end 而消息/轮次结束时标为 interrupted。running 不带递增时长，快照读取不推进时间；元数据变化用块级 `set` 增量发布，与共享 reducer 保持一致。旧历史、错过 start 的段不补算；同条消息的持久化和重连保留观测值，canonical 思考文本被改写则撤掉不再可证明的耗时。计时状态跟随来源对象生命周期，分支重置、扩展重载及会话替换清空，不写入宿主会话文件。
 - 快照分块及附件帧不超过 1 MiB；每连接发送缓冲与待发送增量合计初始上限 8 MiB，达到高水位即停止喂入历史分块，持续无法排空则断开该客户端并允许重连拉新快照。不得等待慢客户端而阻塞宿主事件处理，也不得无界缓存或静默丢 delta。
 - 大工具结果显示限长摘要和明确截断标记，可按需读取宿主仍保留的完整结果；实时投影只保存每个工具的最新 partial。持久化历史采用索引/分页，避免复制完整会话多份。资源上限由 M0 压测调优，并保留在发布配置与验收记录中。
 - 所有解析/归一化/网络错误都在扩展边界捕获；限流按连接和 Hub 总量执行。首次 hello 限时 5 秒；心跳超时、异常关闭和重绑失败统一走幂等清理。
@@ -301,8 +302,8 @@ M0 Spike 的有界预览（200 条/512 KiB、无分页）已由 M1 替换为上�
 |---|---|
 | 用户消息 | 气泡，图片按需懒加载（§6.5） |
 | assistant 文本 | Markdown（`marked` + `shiki`，shiki 懒加载），流式追加 |
-| thinking | 默认折叠。M1 未显示耗时：`MessageView` 不含时间戳，耗时需另行设计 |
-| 内置工具 `read` / `write` / `edit` / `bash` / `grep` / `find` / `ls` | 专门的卡片：edit 显示 diff（按词高亮），bash 显示命令、输出和退出码 |
+| thinking | 默认折叠。观测到的思考段结束后显示耗时；未观测的历史不显示耗时，中断段标明“已观测 / 已停止”，见 §6.5 |
+| 内置工具 `read` / `write` / `edit` / `bash` / `grep` / `find` / `ls` | 专门的卡片：edit 显示 diff（按词高亮，超出 128 KiB 文本、每侧 2,048 token 或累计 250,000 个匹配格时回退行级着色），bash 显示命令、输出和退出码 |
 | 未知工具或扩展工具 | 通用卡片：工具名、参数 JSON、结果文本，可折叠（它们在终端里的自定义渲染是 TUI 组件，网页没法复用） |
 | 嵌套调用（codemode） | 根据 `parentToolCallId` 缩进显示 |
 | 自定义消息 / 自定义条目 | 自定义消息尊重 `display`；普通 custom entry 是扩展内部状态，默认不发送其 data，只有显式适配的可展示字段进入网页 |
@@ -332,9 +333,9 @@ M0 Spike 的有界预览（200 条/512 KiB、无分页）已由 M1 替换为上�
 | `md*` / `syntax*` | `--md-*` / `--syntax-*` | Markdown 和代码高亮 |
 | `success` / `warning` / `error` | `--ok` / `--warn` / `--err` | 状态 |
 
-3. **pi 主题里没有的网页元素**（页面背景、侧栏、hover、阴影）：页面背景优先用主题的 `export.pageBg`，其余在 OKLCH 空间里由 `appearance` 和上面这些颜色推导出来。字体、圆角、间距是 pi-pane 自己的设计 token，跟 pi 主题无关。
-4. **自定义主题**：按标准 pi theme JSON 写，放在包的 `themes/` 目录里，TUI 和网页都能用。网页专属的覆盖（比如字体）放在可选的 `pi-pane.css` 里。
-5. **主题切换后网页跟着变**：比较解析后的 `colors` 和 `appearance` 指纹，不只比较 `theme.name`。快照前、相关事件后及有连接时每 500ms 检查一次；值变化才推 `theme`。同名文件热更新、system 主题及终端默认色变化均纳入验收。纯扩展不深导入内部 `onThemeChange` 覆盖 TUI 自己的回调。
+3. **pi 主题里没有的网页元素**（页面背景、侧栏、hover、阴影）：页面背景优先用主题的 `export.pageBg`，其余在 OKLCH 空间里由 `appearance` 和上面这些颜色推导出来。pi 1.0.4 的 Theme 不公开 export，使用公开 `sourcePath` 或 `ctx.ui.getAllThemes()` 给出的路径，有界读取当前主题 JSON（≤256 KiB），解析 `vars` 与颜色；缺失或无效时按 appearance 回退。缓存文件指纹，读取保持同步以维持快照切点。字体、圆角、间距是 pi-pane 自己的设计 token，跟 pi 主题无关。
+4. **自定义主题**：包的 `themes/` 自带 `pi-pane-dark` / `pi-pane-light`，通过 `pi.themes` 声明，安装包后 TUI 和网页均可使用。网页专属覆盖写在源码的 `public/pi-pane.css`，随构建复制到 `web-dist/pi-pane.css` 并在应用样式之后加载；安装后可编辑该文件并刷新，无需重新构建，不自动扫描工作目录。动态主题变量为内联 CSS 属性，有意覆盖需 `!important`；现有 CSP 仍生效。
+5. **主题切换后网页跟着变**：比较最终 CSS 变量指纹，包含解析后的 `colors`、`appearance` 与 `export.pageBg`，不只比较 `theme.name`。快照前以及 Bridge 活跃轮询（当前 250ms）时检查；值变化才推 `theme`。同名文件热更新、仅 export 变化、system 主题及终端默认色变化均纳入验收。纯扩展不深导入内部 `onThemeChange` 覆盖 TUI 自己的回调。
 
 ---
 
@@ -409,10 +410,13 @@ pi-pane/
 │   │   ├── hub.ts          # 进程级：http + ws、鉴权、租约/去重、分块发送、分页路由
 │   │   ├── bridge.ts       # 会话级：投影、窗口/分页、内容页、合并发布、主题、命令
 │   │   ├── config.ts       # piPane 设置读取与宿主能力检测
+│   │   ├── theme.ts        # 有界主题读取、颜色映射与网页颜色推导
+│   │   ├── thinking.ts     # 宿主事件观测计时，随会话投影回收
 │   │   └── qr.ts           # /web qr 的终端二维码
 │   ├── protocol/           # 前后端共享类型、LIMITS、运行时校验与共享 reducer
 │   └── web/                # 前端 SPA：store、Markdown/高亮、消息与工具卡片
-├── themes/                 # 可选：自带的 pi 主题
+├── themes/                 # 自带的 pi-pane-dark / pi-pane-light
+├── public/pi-pane.css      # 可选的包内网页样式覆盖
 └── docs/
 ```
 

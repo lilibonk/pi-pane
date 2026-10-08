@@ -10,6 +10,9 @@
   "pi": {
     "extensions": [
       "./dist/extension/index.js"
+    ],
+    "themes": [
+      "./themes/*.json"
     ]
   },
   "scripts": {
@@ -58,6 +61,7 @@
   "files": [
     "dist",
     "web-dist",
+    "themes",
     "README.md",
     "docs/design.md"
   ],

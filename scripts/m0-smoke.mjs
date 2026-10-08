@@ -36,7 +36,7 @@ async function freePort() {
 }
 
 export async function startFixture({ autoWeb = true, extraExtensions = [], settings = {}, envOverrides = {}, disablePane = false,
-  provider = "pi-pane-m0", model = "deterministic", packaged = false, prepareAgentDir } = {}) {
+  provider = "pi-pane-m0", model = "deterministic", packaged = false, loadThemes = false, prepareAgentDir } = {}) {
   if (process.platform === "win32") throw new Error("The M0 real-TUI harness requires a POSIX PTY (macOS or Linux).");
   for (const key of Object.keys(envOverrides)) if (!key.startsWith("PI_M0_") && key !== "PI_PANE_PASSWORD") throw new Error(`Fixture env override is not allowed: ${key}`);
   const cli = process.env.PI_M0_CLI || join(dirname(fileURLToPath(import.meta.resolve("@earendil-works/pi-coding-agent"))), "cli.js");
@@ -61,7 +61,7 @@ export async function startFixture({ autoWeb = true, extraExtensions = [], setti
   const env = Object.fromEntries(["PATH", "TMPDIR", "LANG", "LC_ALL", "SYSTEMROOT"].filter((key) => process.env[key]).map((key) => [key, process.env[key]]));
   Object.assign(env, { TERM: "xterm-256color", COLORTERM: "truecolor", PI_OFFLINE: "1", NO_COLOR: "1",
     PI_CODING_AGENT_DIR: agentDir, PI_CODING_AGENT_SESSION_DIR: join(agentDir, "sessions"), PI_M0_EVENTS_PATH: eventPath, ...envOverrides });
-  const argv = [process.execPath, cli, ...(packaged ? [] : ["--no-extensions"]), "--no-skills", "--no-prompt-templates", "--no-themes", "--no-builtin-tools",
+  const argv = [process.execPath, cli, ...(packaged ? [] : ["--no-extensions"]), "--no-skills", "--no-prompt-templates", ...(loadThemes ? [] : ["--no-themes"]), "--no-builtin-tools",
     "-e", join(project, "tests/fixtures/deterministic-provider.ts"), ...(!disablePane && !packaged ? ["-e", extension] : []),
     ...extraExtensions.flatMap((path) => ["-e", resolve(path)]),
     ...(provider && model ? ["--provider", provider, "--model", model] : []),

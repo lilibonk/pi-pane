@@ -46,7 +46,7 @@ const messages = [
     { type: "image", mimeType: "image/png", bytes: image.length, width: 420, height: 180 },
   ] },
   { id: "entry:a1", entryId: "a1", role: "assistant", status: "complete", content: [
-    { type: "thinking", text: "先看 bars() 的实现，再处理 max 为 0 的情况。" },
+    { type: "thinking", text: "先看 bars() 的实现，再处理 max 为 0 的情况。", durationMs: 1420, timingStatus: "complete" },
     { type: "toolCall", id: "t-edit", name: "edit", arguments: { path: "src/chart.ts", edits: [{ oldText: "value / max", newText: "max ? value / max : 0" }] } },
     { type: "toolCall", id: "t-bash", name: "bash", arguments: { command: "npm test -- chart" } },
   ] },

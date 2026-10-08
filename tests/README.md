@@ -70,3 +70,11 @@ npm run m2:install
 `m2:install` (A11) runs `npm pack` (which rebuilds through `prepack`), checks the tarball, serves it from a local registry that proxies other packages to npmjs, runs `pi install npm:pi-pane@<version>` into a clean agent directory and npm cache, and starts the installed package with `--web`. It needs network access for the runtime dependencies. Publication and gallery listing are not covered.
 
 Unit tests add image structure and limit validation (`images.test.ts`), external access with real HTTP/WS and HTTPS/WSS listeners (`external.test.ts`), and a QR round trip through jsQR (`qr.test.ts`).
+
+## M1/M2 收尾
+
+`diff.test.ts` 验证按词 diff 的中文、emoji、空白、多行替换、文件头与内容区分以及计算预算；`theme.test.ts` 验证公开主题路径、`export.pageBg`/vars、OKLCH 派生、文件原子替换与异常降级、包内主题资源；`thinking.test.ts` 验证多段观测计时、重连快照、canonical 改写、未知历史、中断和生命周期清理。协议测试确认耗时变化走块级替换，共享 reducer 不丢字段。
+
+`m1:render` 新增词级范围、恶意 HTML diff 纯文本渲染与折叠思考耗时检查；`m0:boundaries` 验证真实 thinking 流在重连和落盘后保留耗时；`m0:performance` 的主题部分新增仅修改 export 背景及其派生颜色的热更新检查；`m2:install` 检查 tarball 中的主题与覆盖 CSS，并在干净安装后切换两个包内主题、直接修改 CSS 后刷新验证生效。安装夹具显式设置 `loadThemes: true`；其他夹具默认仍使用 `--no-themes`。
+
+这轮完整回归命令与结果见 [M1/M2 收尾验收记录](../docs/m2-followup-status.md)。`m2:install` 的 prepack 会重新构建，仍须最后单独运行。

@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { colorToHex } from "@earendil-works/pi-tui";
+import { ThinkingTimings } from "./thinking.js";
+import { ThemeMapper } from "./theme.js";
 import {
   COMMANDS, LIMITS, ProtocolError, base64Length, commandArgs, decodeBase64, diffMessage, encodedSize, inspectImage, isRecord, toWireError,
   type CommandResult, type ContentPage, type ContentView, type HistoryPage, type ImagePage, type MessageView, type ModelView, type PromptImage,
@@ -23,12 +24,15 @@ export interface BridgeOptions {
   windowBytes?: number;
   pageBytes?: number;
   pollMs?: number;
+  /** Monotonic clock for observed thinking intervals; injectable for deterministic tests. */
+  now?: () => number;
 }
 type EventLike = { type: string; [key: string]: unknown };
 type SnapshotBody = Omit<Snapshot, "t" | "epoch" | "seq">;
 type Completion = (result: Pick<CommandResult, "status" | "value" | "error">) => void;
 type RawBlock =
-  | { type: "text" | "thinking" | "diff"; text: string }
+  | { type: "text" | "diff"; text: string }
+  | { type: "thinking"; text: string; contentIndex: number }
   | { type: "toolCall"; id: string; name: string; arguments: unknown }
   | { type: "image"; mimeType: string; data: string };
 interface BranchItem { entryId: string; id: string; source: Record<string, unknown> }
@@ -77,6 +81,7 @@ export class Bridge {
   private live = new Map<string, { source: Record<string, unknown>; view: MessageView }>();
   private sourceIds = new WeakMap<object, string>();
   private activeByRole = new Map<string, string>();
+  private readonly thinkingTimings: ThinkingTimings;
   // Coalescing state. lastSent is the shared baseline every attached client has applied.
   private lastSent = new Map<string, MessageView>();
   private pendingMessages = new Map<string, Record<string, unknown>>();
@@ -88,11 +93,13 @@ export class Bridge {
   private uiPrompts: StateView["uiPrompts"] = [];
   private lastState = "";
   private lastTheme = "";
+  private readonly themeMapper = new ThemeMapper();
   private readonly timer: ReturnType<typeof setInterval>;
   private refreshTimer?: ReturnType<typeof setTimeout>;
 
   constructor(options: BridgeOptions) {
     this.options = options;
+    this.thinkingTimings = new ThinkingTimings(options.now ?? (() => performance.now()), MAX_BLOCKS);
     this.generation = options.generation;
     this.sessionId = options.ctx.sessionManager.getSessionId();
     this.refreshBranch();
@@ -137,6 +144,7 @@ export class Bridge {
     this.sourceIds = new WeakMap();
     this.live.clear();
     this.activeByRole.clear();
+    this.thinkingTimings.clear();
     this.lastSent.clear();
     this.pendingMessages.clear();
     this.pendingTools.clear();
@@ -196,17 +204,17 @@ export class Bridge {
     const parts = Array.isArray(message.content) ? message.content
       : typeof message.content === "string" ? [{ type: "text", text: message.content }] : [];
     const blocks: RawBlock[] = [];
-    const text = (value: string, type: "text" | "thinking" | "diff" = "text") => { blocks.push({ type, text: value }); };
+    const text = (value: string, type: "text" | "diff" = "text") => { blocks.push({ type, text: value }); };
     if (message.role === "bashExecution") {
       if (typeof message.command === "string") text(`$ ${message.command}\n`);
       if (typeof message.exitCode === "number" && Number.isFinite(message.exitCode)) text(`[Exit code: ${message.exitCode}]\n`);
       if (message.cancelled === true) text("[Cancelled]\n");
       if (message.truncated === true) text("[Output truncated]\n");
     }
-    for (const part of parts.slice(0, MAX_BLOCKS)) {
+    for (const [contentIndex, part] of parts.slice(0, MAX_BLOCKS).entries()) {
       if (!isRecord(part)) continue;
       if (part.type === "text") text(String(part.text ?? ""));
-      else if (part.type === "thinking") text(String(part.thinking ?? part.text ?? ""), "thinking");
+      else if (part.type === "thinking") blocks.push({ type: "thinking", text: String(part.thinking ?? part.text ?? ""), contentIndex });
       else if (part.type === "toolCall") blocks.push({ type: "toolCall", id: String(part.id ?? "").slice(0, 256), name: String(part.name ?? "tool").slice(0, 256), arguments: part.arguments });
       else if (part.type === "image") {
         if (typeof part.data === "string" && typeof part.mimeType === "string") blocks.push({ type: "image", mimeType: part.mimeType.slice(0, 64), data: part.data });
@@ -250,7 +258,8 @@ export class Bridge {
       if (block.type === "image") return this.imageView(block);
       const text = block.text.slice(0, remaining);
       remaining -= text.length;
-      return { type: block.type, text, ...(block.text.length > text.length ? { total: block.text.length } : {}) };
+      return { type: block.type, text, ...(block.text.length > text.length ? { total: block.text.length } : {}),
+        ...(block.type === "thinking" ? this.thinkingTimings.view(id, message, block.contentIndex, block.text) : {}) };
     });
     // Pi records structured prompt/tool updates as system messages with content="".
     // Native TUI skips these internal updates; retain genuine nonempty system content.
@@ -289,6 +298,8 @@ export class Bridge {
     for (const entry of manager.getBranch() as unknown as Array<{ type: string; id: string; [key: string]: unknown }>) {
       const source = this.sourceOf(entry);
       if (!source) continue; // Never expose opaque custom entry data.
+      const previousIndex = this.branchByEntry.get(entry.id);
+      if (previousIndex !== undefined) this.thinkingTimings.transfer(this.branch[previousIndex]!.source, source);
       const id = this.entryToId.get(entry.id) ?? this.sourceIds.get(source) ?? `entry:${entry.id}`;
       this.entryToId.set(entry.id, id);
       this.sourceIds.set(source, id);
@@ -369,7 +380,7 @@ export class Bridge {
     this.sentFinal.set(id, serialized);
     while (this.sentFinal.size > SENT_FINAL_LIMIT) this.sentFinal.delete(this.sentFinal.keys().next().value!);
   }
-  private updateMessage(source: unknown, type: "msg_start" | "msg_delta" | "msg_end"): void {
+  private updateMessage(source: unknown, type: "msg_start" | "msg_delta" | "msg_end", assistantEvent?: unknown): void {
     if (!isRecord(source)) return;
     // Custom messages persist as a different entry shape without object identity; reconcile() owns them.
     if (source.role === "custom") return;
@@ -377,9 +388,17 @@ export class Bridge {
     let id = this.sourceIds.get(source);
     if (!id && type !== "msg_start") id = this.activeByRole.get(role);
     if (!id) id = `live:${randomUUID()}`;
+    if (role === "assistant" && type === "msg_start") {
+      const previousId = this.activeByRole.get(role);
+      if (previousId && previousId !== id) this.finishThinkingMessage(previousId);
+    }
     this.sourceIds.set(source, id);
     if (type !== "msg_end") this.activeByRole.set(role, id);
     else if (this.activeByRole.get(role) === id) this.activeByRole.delete(role);
+    if (role === "assistant") {
+      if (type === "msg_end") this.thinkingTimings.finish(id, source);
+      else this.thinkingTimings.observe(id, source, assistantEvent);
+    }
     if (type === "msg_delta" && this.lastSent.has(id)) {
       this.pendingMessages.set(id, source);
       this.schedule("message");
@@ -397,6 +416,11 @@ export class Bridge {
       if (index !== undefined) this.viewCache.set(this.branch[index]!.source, view);
     } else this.lastSent.set(id, view);
     this.emit({ type: type === "msg_delta" ? "msg_start" : type, message: view });
+  }
+  private finishThinkingMessage(id: string): void {
+    const branchIndex = this.branchById.get(id);
+    const source = this.pendingMessages.get(id) ?? this.live.get(id)?.source ?? (branchIndex !== undefined ? this.branch[branchIndex]!.source : undefined);
+    if (source) this.updateMessage(source, "msg_end");
   }
   private refreshLater(): void {
     if (this.refreshTimer || !this.isCurrent()) return;
@@ -425,7 +449,7 @@ export class Bridge {
     if (!this.isCurrent()) return;
     if (event.type === "message_start" || event.type === "message_update" || event.type === "message_end") {
       this.reconcile();
-      this.updateMessage(event.message, event.type === "message_start" ? "msg_start" : event.type === "message_update" ? "msg_delta" : "msg_end");
+      this.updateMessage(event.message, event.type === "message_start" ? "msg_start" : event.type === "message_update" ? "msg_delta" : "msg_end", event.assistantMessageEvent);
       if (event.type === "message_end") this.refreshLater();
     } else if (event.type.startsWith("tool_execution_")) {
       const id = String(event.toolCallId);
@@ -467,7 +491,8 @@ export class Bridge {
       this.refreshLater();
     } else if (event.type === "session_info_changed") {
       this.publish({ type: "session_meta", ...(typeof event.name === "string" ? { name: event.name } : {}) });
-    } else if (event.type === "turn_end" || event.type === "agent_settled") {
+    } else if (event.type === "turn_end" || event.type === "agent_end" || event.type === "agent_settled") {
+      for (const id of this.thinkingTimings.runningIds()) this.finishThinkingMessage(id);
       this.reconcile();
       // Other extensions may replace finalized content after message_end.
       this.publishCanonicalTail();
@@ -499,22 +524,7 @@ export class Bridge {
     };
   }
   private theme(): Record<string, string> {
-    const theme = this.options.ctx.ui.theme;
-    const colors = theme.colors as Record<string, Parameters<typeof colorToHex>[0]>;
-    const vars: Record<string, string> = {};
-    // Every resolved pi token, for Markdown, syntax, diff and tool styling.
-    for (const key of Object.keys(colors).sort()) {
-      try { vars[`--pi-${key.replace(/[A-Z]/g, (letter) => `-${letter.toLowerCase()}`)}`] = colorToHex(colors[key]!); } catch { /* skip */ }
-    }
-    const color = (key: string, fallback: string): string => vars[`--pi-${key.replace(/[A-Z]/g, (letter) => `-${letter.toLowerCase()}`)}`] ?? fallback;
-    return {
-      ...vars,
-      "--bg": theme.appearance === "light" ? "#f5f5f4" : "#111315",
-      "--fg": color("text", "#eeeeee"), "--fg-muted": color("muted", "#aaaaaa"), "--fg-dim": color("dim", "#888888"),
-      "--accent": color("accent", "#a6b9ef"), "--border": color("border", "#343434"),
-      "--user-bg": color("userMessageBg", "#25272a"), "--err": color("error", "#f88b8b"),
-      "--ok": color("success", "#97cba8"), "--warn": color("warning", "#e5c07b"),
-    };
+    return this.themeMapper.map(this.options.ctx.ui.theme, () => this.options.ctx.ui.getAllThemes());
   }
   private publishState(): void {
     if (!this.observer || !this.isCurrent()) return;

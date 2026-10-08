@@ -62,3 +62,19 @@ test("the shared reducer keeps tools across agent_state and pages merge without 
   const merged = mergeOlderPage(state.session.messages, [{ id: "entry:e1", entryId: "e1", role: "user", status: "complete", content: [] }, { id: "entry:e2", entryId: "e2", role: "user", status: "complete", content: [] }]);
   assert.deepEqual(merged.map((message) => message.entryId), ["e1", "e2"]);
 });
+
+test("thinking timing changes and removals survive the shared delta reducer", () => {
+  let before: MessageView = { id: "m", role: "assistant", status: "streaming", content: [{ type: "thinking", text: "plan", timingStatus: "running" }] };
+  for (const content of [
+    [{ type: "thinking" as const, text: "plan", durationMs: 0, timingStatus: "complete" as const }],
+    [{ type: "thinking" as const, text: "plan more", durationMs: 1200, timingStatus: "interrupted" as const }],
+    [{ type: "thinking" as const, text: "plan more" }],
+  ]) {
+    const after = { ...before, content };
+    const ops = diffMessage(before, after)!;
+    assert.equal(ops.length, 1);
+    assert.ok("set" in ops[0]!, "append deltas cannot convey timing metadata changes");
+    assert.deepEqual(applyDelta(before, ops), after);
+    before = after;
+  }
+});

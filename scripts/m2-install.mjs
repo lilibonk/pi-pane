@@ -47,12 +47,13 @@ try {
     tarball = join(work, info.filename);
     tarballBytes = await readFile(tarball);
     files = info.files.map(file => file.path);
-    for (const required of ["package.json", "README.md", "dist/extension/index.js", "dist/protocol/index.js", "web-dist/index.html"]) assert.ok(files.includes(required), required);
+    for (const required of ["package.json", "README.md", "dist/extension/index.js", "dist/extension/theme.js", "dist/protocol/index.js", "web-dist/index.html", "web-dist/pi-pane.css", "themes/pi-pane-dark.json", "themes/pi-pane-light.json"]) assert.ok(files.includes(required), required);
     assert.ok(files.some(file => /^web-dist\/assets\/index-.*\.js$/.test(file)), "web bundle");
     assert.ok(files.some(file => /^web-dist\/assets\/index-.*\.css$/.test(file)), "web styles");
     for (const file of files) assert.ok(!/^(src|tests|scripts|build-artifacts|node_modules)\//.test(file), `unexpected ${file}`);
     const manifest = JSON.parse(await readFile(join(project, "package.json"), "utf8"));
     assert.deepEqual(manifest.pi.extensions, ["./dist/extension/index.js"]);
+    assert.ok(manifest.pi.themes.includes("./themes/*.json"), "bundled themes are discoverable by pi");
     assert.ok(manifest.keywords.includes("pi-package"));
     return { filename: info.filename, packedBytes: info.size, unpackedBytes: info.unpackedSize, files: files.length };
   });
@@ -81,9 +82,9 @@ try {
   await new Promise(done => registry.listen(0, "127.0.0.1", done));
   const registryUrl = `http://127.0.0.1:${registry.address().port}/`;
 
-  let installed;
+  let installed, installedRoot;
   await check("pi install npm:pi-pane into a clean agent directory and npm cache installs without building", async () => {
-    fixture = await startFixture({ packaged: true, async prepareAgentDir(agentDir, directory) {
+    fixture = await startFixture({ packaged: true, loadThemes: true, extraExtensions: [join(project, "tests/fixtures/performance-provider.ts")], async prepareAgentDir(agentDir, directory) {
       const cli = join(dirname(fileURLToPath(import.meta.resolve("@earendil-works/pi-coding-agent"))), "cli.js");
       const env = { PATH: process.env.PATH, HOME: join(directory, "home"), PI_CODING_AGENT_DIR: agentDir,
         npm_config_registry: registryUrl, npm_config_cache: join(directory, "npm-cache"), npm_config_update_notifier: "false", npm_config_fund: "false", npm_config_audit: "false" };
@@ -97,6 +98,7 @@ try {
     assert.ok(requests.includes(`/${pkg.name}/-/${pkg.name}-${pkg.version}.tgz`), "the tarball came from the registry");
     const { stdout } = await run("find", [fixture.agentDir, "-path", `*node_modules/${pkg.name}/package.json`, "-not", "-path", "*/node_modules/*/node_modules/*"]);
     const root = dirname(stdout.trim().split("\n")[0]);
+    installedRoot = root;
     const names = await readdir(join(root, ".."));
     for (const devOnly of ["vite", "playwright", "typescript", "preact", "shiki"]) assert.ok(!names.includes(devOnly), `${devOnly} is not installed`);
     for (const runtime of ["ws", "qrcode-generator"]) assert.ok(names.includes(runtime), `${runtime} is installed`);
@@ -120,6 +122,28 @@ try {
     await page.getByRole("button", { name: /^(发送 ↗|请求 followUp ↗)$/ }).click();
     await page.locator(".message-assistant").filter({ hasText: "M0_REPLY:M2_INSTALLED:complete" }).waitFor();
     assert.deepEqual(errors, []);
+  });
+  await check("the installed package loads bundled themes and a local CSS override without rebuilding", async () => {
+    const page = await browser.newPage();
+    await page.goto(fixture.url);
+    await page.getByText("已连接", { exact: true }).waitFor();
+    for (const name of ["pi-pane-dark", "pi-pane-light"]) {
+      const theme = JSON.parse(await readFile(join(installedRoot, "themes", `${name}.json`), "utf8"));
+      assert.equal(theme.name, name);
+      assert.ok(theme.export.pageBg);
+      const count = await fixture.eventCount("perf_theme");
+      fixture.command(`/m0-perf-theme ${name}`);
+      const event = await fixture.waitEvent("perf_theme", count);
+      assert.equal(event.result.success, true, `pi discovers ${name}: ${event.result.error ?? JSON.stringify(event.available)}`);
+      assert.equal(event.name, name);
+      await page.waitForFunction(expected => getComputedStyle(document.documentElement).getPropertyValue("--bg").trim() === expected, theme.vars.bg);
+    }
+    await writeFile(join(installedRoot, "web-dist/pi-pane.css"), ':root { font-family: monospace; } .composer { border-radius: 19px; }\n');
+    await page.reload();
+    await page.getByText("已连接", { exact: true }).waitFor();
+    assert.equal(await page.evaluate(() => getComputedStyle(document.querySelector(".composer")).borderRadius), "19px");
+    assert.equal(await page.evaluate(() => getComputedStyle(document.documentElement).fontFamily), "monospace");
+    await page.close();
   });
   report.status = "passed";
 } catch (error) {

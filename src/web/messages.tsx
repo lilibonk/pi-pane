@@ -1,7 +1,8 @@
 import { memo } from "preact/compat";
-import { useEffect, useRef, useState } from "preact/hooks";
+import { useEffect, useMemo, useRef, useState } from "preact/hooks";
 import type { ContentView, MessageView, ToolView } from "../protocol/index.js";
 import { highlight, languageForPath } from "./highlight.js";
+import { parseDiff } from "./diff.js";
 import { renderMarkdown } from "./markdown.js";
 import { collapseContent, expandContent, requestImage, retryImage, webStore, type Expansion, type LoadedImage } from "./store.js";
 
@@ -133,16 +134,9 @@ function Code({ code, lang, class: className = "" }: { code: string; lang?: stri
     : <pre class={`code-block ${className}`}>{code}</pre>;
 }
 
-function lineClass(line: string): string {
-  if (line.startsWith("+++") || line.startsWith("---") || line.startsWith("diff ") || line.startsWith("index ")) return "diff-meta";
-  if (line.startsWith("@@")) return "diff-hunk";
-  if (line.startsWith("+")) return "diff-add";
-  if (line.startsWith("-")) return "diff-del";
-  return "diff-context";
-}
-export function Diff({ patch }: { patch: string }) {
-  const lines = patch.replace(/\n$/, "").split("\n");
-  return <pre class="diff">{lines.map((line, index) => <div class={lineClass(line)} key={index}>{line || " "}</div>)}</pre>;
+export function Diff({ patch, fragment = false }: { patch: string; fragment?: boolean }) {
+  const lines = useMemo(() => parseDiff(patch, fragment), [patch, fragment]);
+  return <pre class="diff">{lines.map((line, index) => <div class={`diff-${line.kind}`} key={index}>{line.parts.some(part => part.text) ? line.parts.map((part, partIndex) => part.changed ? <span class={`diff-word-${line.kind}`} key={partIndex}>{part.text}</span> : part.text) : " "}</div>)}</pre>;
 }
 
 function resultText(result: MessageView | undefined, expansions: Expansions): string | undefined {
@@ -199,7 +193,7 @@ export function ToolCard({ call, result, live, expansions }: { call?: ToolCall; 
         {name === "write" && str(args.content) !== undefined && <Code code={str(args.content)!} lang={languageForPath(path)} />}
         {name === "edit" && diff !== undefined && <Diff patch={diff} />}
         {name === "edit" && diff === undefined && Array.isArray(args.edits) && (args.edits as Array<Record<string, unknown>>).map((edit, index) => (
-          <Diff key={index} patch={[...String(edit.oldText ?? "").split("\n").map((line) => `-${line}`), ...String(edit.newText ?? "").split("\n").map((line) => `+${line}`)].join("\n")} />
+          <Diff key={index} fragment patch={[...String(edit.oldText ?? "").split("\n").map((line) => `-${line}`), ...String(edit.newText ?? "").split("\n").map((line) => `+${line}`)].join("\n")} />
         ))}
         {output !== undefined && name !== "edit" && (
           <>
@@ -245,10 +239,11 @@ function MessageView_({ message, tools, expansions }: { message: MessageView; to
             return <ToolCard key={index} call={content} result={tools.results.get(content.id)} live={tools.live.get(content.id)} expansions={expansions} />;
           if (content.type === "image") return <ImageBlock key={index} message={message} index={index} />;
           const text = blockText(message, index, expansions);
-          if (!text && content.total === undefined) return null;
+          if (!text && content.total === undefined && !(content.type === "thinking" && content.timingStatus)) return null;
           if (content.type === "thinking") return (
             <details class="thinking" key={index}>
-              <summary>思考过程{message.status === "streaming" ? " · 生成中" : ""}</summary>
+              <summary>思考过程{content.timingStatus === "running" ? " · 思考中" : content.durationMs !== undefined
+                ? ` · ${content.timingStatus === "interrupted" ? "已观测 " : ""}${(content.durationMs / 1000).toFixed(1)} 秒${content.timingStatus === "interrupted" ? " · 已停止" : ""}` : ""}</summary>
               <pre>{text}</pre>
               <Clipped message={message} index={index} expansions={expansions} />
             </details>

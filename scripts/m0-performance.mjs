@@ -47,7 +47,7 @@ const perfReport = {
 const themeReport = { scope: "Q3 real-TUI/public-API theme synchronization", environment, checks: [], publicAPI: "ctx.ui.setTheme, ctx.ui.theme.colors, ctx.ui.theme.appearance",
   notCovered: [
     "System-theme color reports and appearance notifications are deterministic protocol replies delivered through a real PTY; desktop OS appearance switching and an actual terminal emulator's preference UI were not exercised.",
-    "Page background follows the host theme's appearance-derived M0 palette; exact reproduction of the terminal's reported OSC background color is not implemented or claimed.",
+    "Page background follows export.pageBg when available and otherwise uses an appearance fallback; exact reproduction of the terminal's reported OSC background color is not implemented or claimed.",
     "When the terminal supplies no OSC default colors, empty color tokens use pi's documented appearance-based guessed defaults; actual terminal pixels were not measured.",
   ] };
 let currentFixture;
@@ -407,7 +407,7 @@ try {
       return { ...values, contrast };
     };
     const baseTheme = JSON.parse(await readFile(join(project, "node_modules/@earendil-works/pi-coding-agent/dist/modes/interactive/theme/dark.json"), "utf8"));
-    const theme = { ...baseTheme, name: "m0-hot-reload", appearance: "dark", colors: { ...baseTheme.colors, accent: "#37c7a5", text: "#eeeeee", userMessageBg: "#24312b", border: "#47594e" } };
+    const theme = { ...baseTheme, name: "m0-hot-reload", appearance: "dark", vars: { ...baseTheme.vars, paneBackground: "#182622" }, export: { ...baseTheme.export, pageBg: "paneBackground" }, colors: { ...baseTheme.colors, accent: "#37c7a5", text: "#eeeeee", userMessageBg: "#24312b", border: "#47594e" } };
     const themesDirectory = join(currentFixture.agentDir, "themes");
     await mkdir(themesDirectory, { recursive: true });
     const themePath = join(themesDirectory, "m0-hot-reload.json");
@@ -421,6 +421,8 @@ try {
       assert.equal(evidence.name, "m0-hot-reload");
       await waitFor(() => reader.snapshot.theme["--accent"] === "#37c7a5", "WS theme from public API");
       await page.waitForFunction(() => getComputedStyle(document.documentElement).getPropertyValue("--accent").trim() === "#37c7a5");
+      assert.equal(reader.snapshot.theme["--bg"], "#182622", "page background resolves the theme's export variable");
+      await page.waitForFunction(() => getComputedStyle(document.body).backgroundColor === "rgb(24, 38, 34)");
       const durationMs = performance.now() - started;
       assert.ok(durationMs < 1000);
       return { name: evidence.name, accent: reader.snapshot.theme["--accent"], durationMs, actualHostAppearance: evidence.appearance,
@@ -447,8 +449,23 @@ try {
       await page.screenshot({ path: join(themeDir, "same-name-hot-reload.png"), fullPage: true });
       return { edits, watcher: "pi's custom-theme directory watcher (100 ms debounce) plus Bridge polling; no private onThemeChange callback registration" };
     });
+    await check(themeReport, "export-only edits refresh the background and derived web colors", async () => {
+      const previous = { ...reader.snapshot.theme };
+      theme.vars.paneBackground = "#202838";
+      const started = performance.now();
+      await writeFile(`${themePath}.tmp`, JSON.stringify(theme)); await rename(`${themePath}.tmp`, themePath);
+      await waitFor(() => reader.snapshot.theme["--bg"] === "#202838", "export-only WS theme update");
+      await page.waitForFunction(() => getComputedStyle(document.body).backgroundColor === "rgb(32, 40, 56)");
+      const elapsedMs = performance.now() - started;
+      assert.ok(elapsedMs < 1000, `background edit visible in ${elapsedMs} ms`);
+      assert.equal(reader.snapshot.theme["--accent"], previous["--accent"]);
+      const derived = Object.keys(reader.snapshot.theme).filter((key) => !key.startsWith("--pi-") && key !== "--bg" && reader.snapshot.theme[key] !== previous[key]);
+      assert.ok(derived.length >= 2, "surface/hover colors follow pageBg even when pi colors do not change");
+      return { elapsedMs, background: reader.snapshot.theme["--bg"], derived };
+    });
     await check(themeReport, "same theme name switching appearance and terminal-default tokens updates the browser", async () => {
       theme.appearance = "light"; theme.colors.text = ""; theme.colors.userMessageBg = "";
+      delete theme.export;
       const started = performance.now(); await writeFile(themePath, JSON.stringify(theme));
       await waitFor(() => reader.snapshot.theme["--bg"] === "#f5f5f4", "light appearance update");
       await page.waitForFunction(() => getComputedStyle(document.documentElement).getPropertyValue("--bg").trim() === "#f5f5f4");
@@ -491,7 +508,7 @@ try {
           mappedForeground: reader.snapshot.theme["--fg"], mappedBackground: reader.snapshot.theme["--bg"], elapsedMs: performance.now() - started,
           sendButton: await buttonContrast() });
       }
-      return { transitions, limitation: "Terminal responses are deterministic PTY protocol replies; no manual test against an actual terminal emulator's color preference UI. Page background is derived from appearance, as M0 implements, rather than exactly matching OSC background." };
+      return { transitions, limitation: "Terminal responses are deterministic PTY protocol replies; no manual test against an actual terminal emulator's color preference UI. The system theme has no export.pageBg, so page background uses the appearance fallback rather than exactly matching OSC background." };
     });
     themeReport.contrastSummary = {
       method: "Chrome getComputedStyle for .send-button background and foreground, evaluated with relative sRGB luminance contrast",

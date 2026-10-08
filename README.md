@@ -4,15 +4,19 @@
 
 ![pi-pane 在浏览器中显示当前 pi 会话](docs/preview.png)
 
-宿主基线为 pi 1.0.4（Node ≥ 22.19）。设计见 [docs/design.md](docs/design.md)，验收记录见 [M0](docs/m0-status.md)、[M1](docs/m1-status.md)、[M2](docs/m2-status.md)。
+宿主基线为 pi 1.0.4（Node ≥ 22.19）。设计见 [docs/design.md](docs/design.md)，验收记录见 [M0](docs/m0-status.md)、[M1](docs/m1-status.md)、[M2](docs/m2-status.md)、[M1/M2 收尾](docs/m2-followup-status.md)。
 
 ## 安装
 
+当前仓库仍为私有发布状态，尚未执行 npm 发布。从源码试用：
+
 ```sh
-pi install npm:pi-pane
+npm ci
+npm run build
+pi -e .
 ```
 
-包内已带预构建的网页，安装时不需要构建。从源码试用：`npm ci && npm run build && pi -e .`。
+发布后可用 `pi install npm:pi-pane` 安装。发布包内带预构建网页，安装时不需要构建。
 
 ## 使用
 
@@ -31,6 +35,7 @@ pi install npm:pi-pane
 - **Enter** 发送，**Shift+Enter** 换行；运行中 Enter 请求 followUp，**⌘/Ctrl+Enter** 请求 steer。触屏设备上 Enter 换行，用按钮发送。
 - **图片**：粘贴、拖入或点“图片”。PNG/JPEG/WebP，最多 4 张，单张 ≤ 5 MiB、合计 ≤ 10 MiB、≤ 2,000 万像素；浏览器和扩展各校验一次，损坏或超限的图片会直接报错。历史里的图片只在滚动到附近时加载，浏览器最多缓存 48 MiB。
 - 历史默认显示最近 200 条，更早的点“加载更早的消息”；超长内容可“加载全部”。
+- edit diff 会强调变更词；超大补丁保留行级着色。思考过程默认折叠，已观测的思考段显示耗时；旧历史和扩展重载前的内容不补算耗时。
 - 网页按原文提交：不执行 slash 命令，不展开模板或 skill。回执只表示“已交给 pi”，不代表已入队或成功；断线后不会自动重发。
 
 ## 从其他设备访问（手机、平板）
@@ -66,6 +71,14 @@ pi install npm:pi-pane
 ```
 
 支持的字段：`host`、`port`、`noOpen`、`publicOrigin`、`tlsCert`、`tlsKey`、`proxy`。对应启动 flags：`--web-host`、`--web-port`、`--web-no-open`、`--web-public-origin`、`--web-tls-cert`、`--web-tls-key`、`--web-proxy`。密码不能写在设置里。配置本身不会自动启动服务；扩展只读设置，不改写。
+
+## 主题
+
+网页跟随 pi 当前主题，包括 Markdown、代码与 diff 配色。页面背景优先读取主题的 `export.pageBg`（支持 `vars` 引用），未提供时按深浅模式回退；面板、hover、代码背景和阴影由主题颜色在 OKLCH 空间推导。同名主题修改和仅修改 `export.pageBg` 都会自动同步。
+
+包内提供 `pi-pane-dark` 和 `pi-pane-light`，在 pi 的 `/settings` → Theme 中选择。从源码以 `pi -e .` 加载时只加载扩展；要一起加载主题，可构建后用 `pi install .` 安装本地包。
+
+网页专属样式可写入源码的 `public/pi-pane.css` 再构建，或直接编辑已安装包的 `web-dist/pi-pane.css` 并刷新网页，例如 `:root { font-family: "PingFang SC", system-ui, sans-serif; }`。它在应用样式之后加载；覆盖动态主题变量需使用 `!important`。文件随包更新可能被替换，请自行保留副本。
 
 ## 安全
 

@@ -31,9 +31,10 @@ const assistantId = "entry:a1";
 const messages = [
   { id: "entry:u1", entryId: "u1", role: "user", status: "complete", content: [{ type: "text", text: "修复价格计算并跑测试" }] },
   { id: assistantId, entryId: "a1", role: "assistant", status: "complete", content: [
-    { type: "thinking", text: "先读文件，再修改，最后运行测试。" },
+    { type: "thinking", text: "先读文件，再修改，最后运行测试。", durationMs: 1234, timingStatus: "complete" },
     { type: "toolCall", id: "t-read", name: "read", arguments: { path: "src/price.js" } },
     { type: "toolCall", id: "t-edit", name: "edit", arguments: { path: "src/price.js", edits: [{ oldText: "cents / 10", newText: "cents / 100" }] } },
+    { type: "toolCall", id: "t-edit-html", name: "edit", arguments: { path: "src/literal.js", edits: [{ oldText: '<img src=x onerror="window.__xss=1">', newText: '<img src=y onerror="window.__xss=1">' }] } },
     { type: "toolCall", id: "t-bash", name: "bash", arguments: { command: "npm test" } },
     { type: "toolCall", id: "t-long", name: "bash", arguments: { command: "seq 3000" } },
     { type: "toolCall", id: "t-custom", name: "fixture_tool", arguments: { query: "<b>not html</b>" } },
@@ -92,6 +93,14 @@ try {
     assert.equal(await md.locator("table td").first().textContent(), "src/price.js");
     await md.locator("pre.shiki span[style*='--shiki-token-keyword']").first().waitFor();
   });
+  await check("observed thinking duration is visible while the thought stays collapsed", async () => {
+    const thinking = page.locator(".thinking").first();
+    assert.match(await thinking.locator("summary").textContent(), /1\.2.*秒/);
+    assert.equal(await thinking.evaluate(node => node.open), false);
+    await thinking.locator("summary").click();
+    assert.equal(await thinking.locator("pre").textContent(), "先读文件，再修改，最后运行测试。");
+    await thinking.locator("summary").click();
+  });
   await check("raw HTML, script URLs and remote images never execute or load", async () => {
     await page.waitForTimeout(300);
     assert.equal(await page.evaluate(() => window.__xss), undefined);
@@ -119,6 +128,15 @@ try {
     assert.ok(await edit.evaluate((node) => node.open), "edit cards open with their diff");
     assert.equal(await edit.locator(".diff-add").textContent(), "+  return cents / 100;");
     assert.equal(await edit.locator(".diff-del").textContent(), "-  return cents / 10;");
+    assert.deepEqual(await edit.locator(".diff-word-add").allTextContents(), ["100"]);
+    assert.deepEqual(await edit.locator(".diff-word-del").allTextContents(), ["10"]);
+    const literal = page.locator(".tool-card[data-tool-id='t-edit-html']");
+    await literal.locator("summary").click();
+    assert.deepEqual(await literal.locator(".diff-word-add").allTextContents(), ["y"]);
+    assert.deepEqual(await literal.locator(".diff-word-del").allTextContents(), ["x"]);
+    assert.match(await literal.locator(".diff").textContent(), /<img src=x onerror=/);
+    assert.equal(await literal.locator("img, script").count(), 0, "diff payloads render as text");
+    assert.equal(await page.evaluate(() => window.__xss), undefined);
     const custom = page.locator(".tool-card[data-tool-id='t-custom']");
     assert.ok(await custom.evaluate((node) => node.classList.contains("tool-error") && node.open));
     assert.match(await custom.locator("pre").first().textContent(), /<b>not html<\/b>/);
