@@ -51,3 +51,22 @@ node scripts/m0-performance.mjs --skip-overload
 `m1:a6` runs the real TUI with the performance fixture, adds 1,000 visible custom messages of 912 characters (≈0.91 MB of normalized text, no images) and reloads one Chrome tab 20 times. Each sample is the time between the page's `pi-pane:ws-open` and `pi-pane:snapshot-rendered` performance marks (the latter is set one animation frame after the snapshot commit). It reports P50/P95/max, navigation-to-rendered separately, and then pages the whole dataset into the same tab.
 
 `m0-performance` (A5) now verifies the 8 MiB send-buffer recycle of a paused peer, reads a 2 MiB tool result in full through `content_page`, and pages more than 1,000 history messages back to the branch root with every transport frame at most 1 MiB. `--skip-overload` skips the 4 MiB CPU-profile diagnostic, whose earlier non-completion is a host/fixture limitation.
+
+## M2 additions
+
+The fixture provider now declares image input and records the images it receives (`provider_call.images`). `tests/fixtures/image-history.ts` appends displayed custom messages that carry noisy PNGs without a model turn. `startFixture` accepts `PI_PANE_PASSWORD` as an environment override, captures external `https://…/#t=` links as `publicUrl`, and supports `packaged: true` with `prepareAgentDir` to load pi-pane from an installed package instead of `-e`.
+
+```sh
+npm run build
+PI_M0_EXTENSION=./dist/extension/index.js npm run m2:images
+PI_M0_EXTENSION=./dist/extension/index.js npm run m2:external
+npm run m2:install
+```
+
+`m2:images` (A9) attaches Chrome-encoded PNG/JPEG/WebP by paste, drop and picker and checks they reach the provider; rejects damaged, oversized, mislabeled, over-pixel, unsupported, undecodable and fifth images in the browser and the same classes again over a raw WebSocket; loads 160 history images lazily while scrolling with the browser image cache at most 48 MiB; and shows an explicit error for a 6 MiB history image.
+
+`m2:external` (A10, A11 mobile) generates a test certificate with `openssl`, maps a public host name to loopback with Chrome's host resolver rules and accepts the certificate with `ignoreHTTPSErrors`. A local TLS reverse proxy preserving Host, Origin and the WebSocket subprotocol stands in for a same-machine proxy such as Tailscale Serve. It covers refusals, login, bootstrap-only upgrades, logout, `/web qr`, rotation, direct TLS, and a Pixel 7 touch viewport including reconnect after the proxy cuts every connection.
+
+`m2:install` (A11) runs `npm pack` (which rebuilds through `prepack`), checks the tarball, serves it from a local registry that proxies other packages to npmjs, runs `pi install npm:pi-pane@<version>` into a clean agent directory and npm cache, and starts the installed package with `--web`. It needs network access for the runtime dependencies. Publication and gallery listing are not covered.
+
+Unit tests add image structure and limit validation (`images.test.ts`), external access with real HTTP/WS and HTTPS/WSS listeners (`external.test.ts`), and a QR round trip through jsQR (`qr.test.ts`).

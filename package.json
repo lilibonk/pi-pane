@@ -1,9 +1,9 @@
 {
   "name": "pi-pane",
-  "version": "0.0.0-m1",
+  "version": "0.1.0",
   "private": true,
   "type": "module",
-  "description": "Mirror a live pi TUI session in a local browser",
+  "description": "Open the running pi TUI session in a browser: live mirror, prompts with images, optional HTTPS access from other devices",
   "keywords": [
     "pi-package"
   ],
@@ -24,7 +24,11 @@
     "m0:projection": "node scripts/m0-projection-extra.mjs",
     "m0:performance": "node scripts/m0-performance.mjs",
     "m1:render": "node scripts/m1-render.mjs",
-    "m1:a6": "node scripts/m1-a6.mjs"
+    "m1:a6": "node scripts/m1-a6.mjs",
+    "prepack": "npm run build",
+    "m2:images": "node scripts/m2-images.mjs",
+    "m2:external": "node scripts/m2-external.mjs",
+    "m2:install": "node scripts/m2-install.mjs"
   },
   "peerDependencies": {
     "@earendil-works/pi-ai": "*",
@@ -41,6 +45,7 @@
     "@types/node": "24.7.0",
     "@types/ws": "8.18.1",
     "dompurify": "3.4.16",
+    "jsqr": "1.4.0",
     "marked": "18.1.0",
     "playwright": "1.55.1",
     "preact": "10.29.8",
@@ -53,8 +58,10 @@
   "files": [
     "dist",
     "web-dist",
-    "docs/design.md",
-    "docs/m0-status.md",
-    "docs/m1-status.md"
-  ]
+    "README.md",
+    "docs/design.md"
+  ],
+  "engines": {
+    "node": ">=22.19.0"
+  }
 }

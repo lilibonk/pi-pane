@@ -1,5 +1,12 @@
 import qrcode from "qrcode-generator";
 
+/** Visible width of qrLines() output. */
+export function qrWidth(text: string, margin = 2): number {
+  const code = qrcode(0, "M");
+  code.addData(text, "Byte");
+  code.make();
+  return code.getModuleCount() + margin * 2;
+}
 /** Terminal lines for a QR code: two modules per row with half blocks, dark on an explicit light background. */
 export function qrLines(text: string, margin = 2): string[] {
   const code = qrcode(0, "M");

@@ -94,10 +94,9 @@ try {
     await waitFor(async () => await attachments() === 2, "pasted and dropped attachments");
     await page.locator("input[type=file]").setInputFiles({ name: "picked.jpg", mimeType: "image/jpeg", buffer: file("image/jpeg") });
     await waitFor(async () => await attachments() === 3, "picked attachment");
-    const before = await fixture.eventCount("provider_call");
     await page.getByRole("textbox", { name: "消息" }).fill("M2_IMAGES");
     await page.getByRole("button", { name: /^(发送 ↗|请求 followUp ↗)$/ }).click();
-    const call = await fixture.waitEvent("provider_call", before, event => event.input === "M2_IMAGES");
+    const call = await fixture.waitEvent("provider_call", 0, event => event.input === "M2_IMAGES");
     assert.equal(call.images.length, 3, "the provider receives all three images");
     assert.equal(await attachments(), 0, "attachments are cleared after sending");
     const message = page.locator(".message-user").filter({ hasText: "M2_IMAGES" });

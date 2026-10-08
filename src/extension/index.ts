@@ -7,7 +7,7 @@ import { ProtocolError } from "../protocol/index.js";
 import { Bridge } from "./bridge.js";
 import { Hub, type ExternalAccess } from "./hub.js";
 import { missingHostCapabilities, readPaneSettings } from "./config.js";
-import { qrLines } from "./qr.js";
+import { qrLines, qrWidth } from "./qr.js";
 
 export const IMPLEMENTATION_VERSION = "m2.0";
 const QR_WIDGET = "pi-pane-qr";
@@ -196,7 +196,16 @@ export default function piPane(pi: ExtensionAPI): void {
   const showQr = (ctx: ExtensionContext, hub: Hub): void => {
     if (hub.mode !== "password") throw new ProtocolError("qr_local", "The QR code is for external access. Start with --public-origin and TLS or --proxy; local links only work on this machine.");
     hideQr();
-    ctx.ui.setWidget(QR_WIDGET, [...qrLines(hub.url), `pi-pane: scan to open ${hub.origin} · the password is entered separately · hides in 2 minutes`]);
+    // A component, not a string array: string widgets are cut at 10 lines and a QR code needs about 20.
+    const lines = qrLines(hub.url);
+    const width = qrWidth(hub.url);
+    const caption = `pi-pane: scan to open ${hub.origin} · enter the password separately · hides in 2 minutes`;
+    ctx.ui.setWidget(QR_WIDGET, () => ({
+      render: (columns: number) => columns >= width
+        ? [...lines, caption.slice(0, columns)]
+        : ["pi-pane: the terminal is too narrow for the QR code; widen it or use the link.".slice(0, columns)],
+      invalidate: () => {},
+    }));
     qrTimer = setTimeout(hideQr, QR_VISIBLE_MS);
     qrTimer.unref?.();
   };

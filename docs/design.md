@@ -3,7 +3,7 @@
 > 状态：草案 v0.3 · 2026-10-07（v0.3：修补快照一致性、命令语义、生命周期、安全与验收边界）
 > 工作名：`pi-pane`（暂定，发布前核验 npm 名称；备选 `pi-webview` / `pi-mirror` / `pi-web-handoff`）
 > 基线：pi `@earendil-works/pi-coding-agent` 1.0.4
-> 验证状态：M0 已于 2026-10-08 完成有界 Spike 验收，Q1–Q10 已记录证据、结论与能力降级；M1 尚未开始。§4 的源码事实与 §13 的运行验证分开管理；当前结果见 [M0 执行计划与跟进](https://chatgpt.com/space/page_6ac66a64d11c8191bbcc2dc63d862e09) 和 [本地验收记录](m0-status.md)。
+> 验证状态：M0、M1 已于 2026-10-08 完成验收（[M0](m0-status.md)、[M1](m1-status.md)）；M2 的本地验收（A9–A11，除 npm 发布与 gallery 收录）见 [M2 验收记录](m2-status.md)。§4 的源码事实与 §13 的运行验证分开管理；当前结果见 [M0 执行计划与跟进](https://chatgpt.com/space/page_6ac66a64d11c8191bbcc2dc63d862e09) 和 [本地验收记录](m0-status.md)。
 
 ---
 
@@ -73,7 +73,7 @@ Kimi 和浏览器相关的能力其实是**两个互不相关的功能**，容�
 | `/web` | 服务没起就先启动，然后打开浏览器；已经在跑就直接打开浏览器，并在终端显示 URL |
 | `/web stop` | 关闭服务，断开所有浏览器连接 |
 | `/web status` | 显示 URL、连接数、监听地址 |
-| `/web qr` | M2：打印已配置的 HTTPS 访问地址二维码，链接含 token，密码仍单独输入 |
+| `/web qr` | 外部访问时以终端 widget 显示公共链接二维码（两分钟后隐藏），链接含 bootstrap token，密码仍单独输入；本机模式拒绝 |
 | `/web --rotate` | 换新 token，撤销浏览器认证并断开现有连接；由终端显示新地址 |
 | `pi --web` | 启动 pi 时同时启动服务（对标 `kimi web`），通过 `registerFlag` 实现 |
 
@@ -247,7 +247,7 @@ S → C  { t: "event", epoch, seq, ev: {...} } …（之后一直推增量）
 
 | 命令 | 对应实现 | 备注 |
 |---|---|---|
-| `prompt { text, images?, mode? }` | `pi.sendUserMessage(content, { deliverAs: mode ?? "followUp", expandPromptTemplates: false })` | 始终传 delivery mode，避免检查 idle 后宿主转为 running 的竞态；空闲时宿主按普通输入处理 |
+| `prompt { text, images?, mode? }` | `pi.sendUserMessage(content, { deliverAs: mode ?? "followUp", expandPromptTemplates: false })` | 始终传 delivery mode，避免检查 idle 后宿主转为 running 的竞态；空闲时宿主按普通输入处理。`images` 为 `{ mimeType, data(base64) }[]`，有图片时 text 可为空，content 为 `[text?, ...ImageContent]`；缩放与格式规整交给 pi 自己的 `processImage` |
 | `abort` | 当前 Bridge 的 `ctx.abort()` | 回执仅确认已调用；实际空闲由状态事件确认 |
 | `set_model { provider, id }` | 从当前 registry 解析模型后调用 `pi.setModel(model)` | v1 只在 idle 且无终端对话框时接受；根据返回 boolean 报结果 |
 | `set_thinking { level }` | `pi.setThinkingLevel()`，再读取实际值 | v1 只在 idle 且无终端对话框时接受；返回钳制后的实际等级 |
@@ -282,10 +282,11 @@ Hub 在调用宿主前预留命令记录，按 `clientId + commandNo` 去重，�
 ### 6.5 校验、资源边界与慢客户端
 
 - 前后端共享运行时 schema；拒绝未知命令、非法枚举、过期版本和非预期字段。模型/图片只传白名单字段，不把配置、凭据或任意扩展内部状态原样发给浏览器。
-- 初始限制：单条 prompt 文本 64 KiB UTF-8；最多 4 张 PNG/JPEG/WebP 图片、每张 base64 解码后的文件不超过 5 MiB、总计不超过 10 MiB，单图解码像素不超过 2,000 万。校验 base64、文件签名及实际可解码格式。客户端命令帧上限 16 MiB；认证和 hello 请求体各不超过 8 KiB。图片在 M2 开启前拒绝上传。
+- 初始限制：单条 prompt 文本 64 KiB UTF-8；最多 4 张 PNG/JPEG/WebP 图片、每张 base64 解码后的文件不超过 5 MiB、总计不超过 10 MiB，单图解码像素不超过 2,000 万。校验 base64、文件签名及实际可解码格式。客户端命令帧上限 16 MiB；认证和 hello 请求体各不超过 8 KiB。M2 实现：共享的 `validateImages()` 检查数量、白名单类型、规范 base64、解码字节、文件结构（PNG 签名 + IHDR CRC + IEND，JPEG SOF + EOI，WebP RIFF 长度 + VP8/VP8L/VP8X 头）、声明类型与实际类型一致及像素上限；浏览器在上传前额外用 `createImageBitmap` 确认可解码，扩展端在调用宿主前再校验一次，不通过的图片返回 `invalid_image` / `image_too_large` 且不调用宿主。
 - 逻辑帧上限 8 MiB（快照、历史页等定向响应同样适用）。M1 实现为通用传输分块：序列化后超过 1 MiB 的逻辑帧拆成 `frame_begin { id, parts }`、连续的 `frame_chunk { id, index, data }`（每块 128K 字符的 JSON 文本）和 `frame_end { id }`，在同一事件循环回合内依次入队，不会与其他帧交错；客户端校验 id、连续 index 与块数后再解析并处理逻辑帧，任何交错或缺块都丢弃并 `resync`。与原设计的 `snapshot_begin/chunk/end` 等价，但不限于快照。
 - 完整历史通过只读 `history_page { reqId, epoch, sessionId, branchRevision, before }` 按页加载（`before` 为窗口中最早持久化消息的 entry ID，即快照的 `olderCursor`）；服务端验证 epoch、会话和分支版本，从该 entry 向前按 768 KiB 预算取页，返回 `{ messages, olderCursor }`，`olderCursor` 为 null 表示已到分支起点。响应定向发送、不消耗 seq；前端按 entry ID 合并，切 epoch 时丢弃未完成请求。前端保留历史上限 16 MiB：实时增长超限时淘汰最旧的持久化消息并前移游标（可再次加载）；向上加载会超限时拒绝并提示。快照窗口为最近 200 条 / 768 KiB 的持久化消息加上全部活动消息。
-- 单条消息所有块共享 32,768 字符的内联预算；超出预算的文本块保留原索引，只发送前缀并附 `total`（完整长度）。只读 `content_page { reqId, epoch, messageId, index, offset }` 按 128K 字符读取该块的完整原文，响应带 `total` 与 `final`（来源消息是否已结束），只接受消息 ID 与块序号，不接受文件路径。M1 的“版本衔接”以 `total` 与 offset 连续性实现：客户端每页校验 offset 等于已读长度，`total` 变化或 epoch 切换即判定过期需重读；仍在流式生成的超大块可以读取当前内容，但网页的“加载全部”主要面向已结束的消息。宿主不再保留来源消息时返回 `content_unavailable`，不以摘要冒充。工具实时输出在 `ToolView.output` 中只保留末尾 8,192 字符并附 `outputTotal`；完整结果通过对应 toolResult 消息的 `content_page` 读取。图片仍属 M2。
+- 单条消息所有块共享 32,768 字符的内联预算；超出预算的文本块保留原索引，只发送前缀并附 `total`（完整长度）。只读 `content_page { reqId, epoch, messageId, index, offset }` 按 128K 字符读取该块的完整原文，响应带 `total` 与 `final`（来源消息是否已结束），只接受消息 ID 与块序号，不接受文件路径。M1 的“版本衔接”以 `total` 与 offset 连续性实现：客户端每页校验 offset 等于已读长度，`total` 变化或 epoch 切换即判定过期需重读；仍在流式生成的超大块可以读取当前内容，但网页的“加载全部”主要面向已结束的消息。宿主不再保留来源消息时返回 `content_unavailable`，不以摘要冒充。工具实时输出在 `ToolView.output` 中只保留末尾 8,192 字符并附 `outputTotal`；完整结果通过对应 toolResult 消息的 `content_page` 读取。
+- 图片（M2）：快照与增量只携带 `{ type: "image", mimeType, bytes, width?, height? }` 元数据，块序号与原消息一致；字节通过只读 `image_page { reqId, epoch, messageId, index }` 定向读取（≤5 MiB，超出返回 `image_too_large`，经通用分块传输）。前端在图片接近视口（以 timeline 为根、600px 边距）时请求，最多 2 个并发，解码为 object URL，按最近显示淘汰，总量 ≤48 MiB；epoch 切换丢弃未完成请求，已加载的图片保留。
 - 快照分块及附件帧不超过 1 MiB；每连接发送缓冲与待发送增量合计初始上限 8 MiB，达到高水位即停止喂入历史分块，持续无法排空则断开该客户端并允许重连拉新快照。不得等待慢客户端而阻塞宿主事件处理，也不得无界缓存或静默丢 delta。
 - 大工具结果显示限长摘要和明确截断标记，可按需读取宿主仍保留的完整结果；实时投影只保存每个工具的最新 partial。持久化历史采用索引/分页，避免复制完整会话多份。资源上限由 M0 压测调优，并保留在发布配置与验收记录中。
 - 所有解析/归一化/网络错误都在扩展边界捕获；限流按连接和 Hub 总量执行。首次 hello 限时 5 秒；心跳超时、异常关闭和重绑失败统一走幂等清理。
@@ -298,7 +299,7 @@ M0 Spike 的有界预览（200 条/512 KiB、无分页）已由 M1 替换为上�
 
 | 内容 | 渲染方式 |
 |---|---|
-| 用户消息 | 气泡，支持显示图片 |
+| 用户消息 | 气泡，图片按需懒加载（§6.5） |
 | assistant 文本 | Markdown（`marked` + `shiki`，shiki 懒加载），流式追加 |
 | thinking | 默认折叠。M1 未显示耗时：`MessageView` 不含时间戳，耗时需另行设计 |
 | 内置工具 `read` / `write` / `edit` / `bash` / `grep` / `find` / `ls` | 专门的卡片：edit 显示 diff（按词高亮），bash 显示命令、输出和退出码 |
@@ -309,7 +310,9 @@ M0 Spike 的有界预览（200 条/512 KiB、无分页）已由 M1 替换为上�
 
 输入框：Enter 提交，Shift+Enter 换行；运行中 Enter 请求 followUp，⌘Enter（Windows/Linux 为 Ctrl+Enter）请求 steer，并提供可点击的同名按钮。中文等输入法组合期间不触发提交。M2 支持粘贴和拖入图片。提交状态遵守 §6.3，不能在收到 `dispatched` 后标注“已入队”。
 
-**性能**：M1 以 `content-visibility: auto` 跳过屏幕外消息的布局与绘制，配合前端 16 MiB 历史上限和服务端分页；store 更新经 `requestAnimationFrame` 合并后渲染。若后续单页消息数显著增加，再引入真正的窗口化列表。前端节流不能代替 §6.5 的服务端背压、分块和内存上限。
+**性能**：`content-visibility: auto` 跳过屏幕外消息的布局与绘制，配合前端 16 MiB 历史上限和服务端分页；store 更新经 `requestAnimationFrame` 合并后渲染，消息组件按不可变投影 memo，流式更新只重渲染变化的消息。M2 增加窗口化列表：跟随最新输出时只挂载最新 200 条；读者上滚或加载更早历史时窗口扩大，回到底部后收回。贴底状态下用 `ResizeObserver` 跟随估算尺寸与图片加载造成的高度变化。前端节流不能代替 §6.5 的服务端背压、分块和内存上限。
+
+**移动端**：触屏（`pointer: coarse`）上 Enter 换行、按钮提交，按钮最小 40px，输入框 16px 字号避免缩放，适配安全区；页面重新可见时立即重连。
 
 ---
 
@@ -349,7 +352,7 @@ M0 Spike 的有界预览（200 条/512 KiB、无分页）已由 M1 替换为上�
 | 日志与浏览器存储 | 不记录认证 body、Authorization、bearer subprotocol 或完整连接链接；日志只记请求 ID 和错误码。token 只存当前标签页 sessionStorage/内存，密码不存储；读取 fragment 后清除地址栏中的 token |
 | 网页能做的事 | 跟终端用户的权限完全一样：能发消息就能让 agent 执行命令。文档里写明这一点 |
 
-### 9.1 外部访问部署（M2）
+### 9.1 外部访问部署（M2，已实现）
 
 外部访问要求 `PI_PANE_PASSWORD` 与 `--public-origin https://host[:port]` 同时存在。密码仅从进程环境读取，不接受命令行密码值，不写入 settings。支持两种明确部署：
 
@@ -365,6 +368,8 @@ M0 Spike 的有界预览（200 条/512 KiB、无分页）已由 M1 替换为上�
 3. 两项凭据通过后签发随机 32 字节 `sessionToken`；服务端保存摘要、认证版本和绝对到期时间（初始 8 小时），返回 `Cache-Control: no-store`。密码不保留在浏览器存储。
 4. WS 升级只接受 `sessionToken`，外部访问模式下拒绝 bootstrap token 直接升级。握手通过后仅回显 `pi-pane.v1`，不回显 bearer。客户端租约续期不得超过认证到期时间。
 5. 凭据到期关闭对应 WS 并要求登录；rotate、stop、Hub 回收清空登录会话和客户端租约。会话/分支切换只更换数据 epoch，不要求再次登录。
+
+实现要点：密码至少 12 字符，以 SHA-256 摘要做定长比较；会话 token 只保存摘要，到期由定时器立即关闭对应连接（close code 4401）；同时最多 16 个登录，失败登录按来源每 5 分钟 10 次、全局每分钟 20 次限流（代理模式下所有请求来自回环，只按全局计）；`GET /auth/info` 只返回模式，`GET/DELETE /auth/session` 用于校验与退出。前端在升级失败时向 `/auth/session` 询问登录是否仍有效，再决定重连或回到登录页。
 
 登录请求、HTTP/WS 连接数、失败升级和单位时间命令量都设置有界限制；代理模式的限流不能信任未经配置的客户端 IP 转发头，全局限流始终生效。静态资源和认证响应设置 `X-Content-Type-Options: nosniff`、`Referrer-Policy: no-referrer`；CSP 至少包含 `default-src 'self'`、`script-src 'self'`、`object-src 'none'`、`base-uri 'none'`、`frame-ancestors 'none'`，`connect-src` 显式允许当前 WS/WSS origin，图片只开放实际需要的 self/blob/data 类型。Shiki/CSS 变量所需样式策略单独验证，不通过放宽 script-src 解决。
 
@@ -382,8 +387,8 @@ M0 Spike 的有界预览（200 条/512 KiB、无分页）已由 M1 替换为上�
     "image": "https://…/preview.png"
   },
   "peerDependencies": { "@earendil-works/pi-coding-agent": "*" },
-  "dependencies": { "ws": "^8" },
-  "files": ["dist", "web-dist", "themes"]
+  "dependencies": { "ws": "8.22.0", "qrcode-generator": "2.0.4" },
+  "files": ["dist", "web-dist", "README.md", "docs/design.md"]
 }
 ```
 
@@ -403,7 +408,8 @@ pi-pane/
 │   │   ├── index.ts        # factory：命令 / flag / 事件注册、进程级状态
 │   │   ├── hub.ts          # 进程级：http + ws、鉴权、租约/去重、分块发送、分页路由
 │   │   ├── bridge.ts       # 会话级：投影、窗口/分页、内容页、合并发布、主题、命令
-│   │   └── config.ts       # piPane 设置读取与宿主能力检测
+│   │   ├── config.ts       # piPane 设置读取与宿主能力检测
+│   │   └── qr.ts           # /web qr 的终端二维码
 │   ├── protocol/           # 前后端共享类型、LIMITS、运行时校验与共享 reducer
 │   └── web/                # 前端 SPA：store、Markdown/高亮、消息与工具卡片
 ├── themes/                 # 可选：自带的 pi 主题
@@ -473,4 +479,4 @@ pi-pane/
 4. 关掉终端，网页就断开；后台运行需满足 M3 的进程分离及唯一写入者门槛。
 5. prompt 回执只确认桥接层提交，不能逐条确认入队或覆盖全部失败原因；超时需检查终端，保留原文供人工恢复。完整待发队列内容也不在扩展 API 能力内。
 6. 多个浏览器属于同一用户权限，均可提交或中止；没有只读访客、多用户角色与协作隔离。未确认操作不会自动重发，跨重启不提供 exactly-once。
-7. M1 仅支持本机访问；外部访问须完成 M2 的密码认证和 HTTPS/WSS 或同机加密代理配置。
+7. 外部访问须同时配置公共 HTTPS origin、`PI_PANE_PASSWORD` 与直接 TLS 或同机加密代理；缺一项不启动。

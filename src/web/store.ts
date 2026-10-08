@@ -493,6 +493,13 @@ export function reconnect() {
   attempt = 0;
   connect();
 }
+// Opening a new /web link in the same tab only changes the fragment; the page does not reload.
+if (typeof window !== "undefined") window.addEventListener("hashchange", () => {
+  const fragment = new URLSearchParams(location.hash.slice(1));
+  if (!fragment.has("t") && !fragment.has("token")) return;
+  receiveToken();
+  reconnect();
+});
 // Phones suspend background tabs; reconnect promptly when the page becomes visible again.
 if (typeof document !== "undefined") document.addEventListener("visibilitychange", () => {
   if (document.visibilityState === "visible" && !stopped && webStore.getState().connection === "disconnected") reconnect();
