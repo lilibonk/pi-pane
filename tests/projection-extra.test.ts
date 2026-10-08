@@ -80,7 +80,10 @@ test("body, error and bash output share the single-message character budget and 
       { type: "message", id: "host-truncated", message: { role: "bashExecution", command: "fixture", output: "small", truncated: true, cancelled: true } },
     );
     const [error, bash, hostTruncated] = f.bridge.snapshot().session.messages;
-    for (const message of [error!, bash!]) { assert.equal(textOf(message).length, 32_768); assert.equal(message.truncated, true); }
+    for (const message of [error!, bash!]) {
+      assert.equal(textOf(message).length, 32_768);
+      assert.ok(message.content.some((part) => part.type !== "toolCall" && part.total !== undefined), "clipped blocks advertise their full length");
+    }
     assert.equal(textOf(error!).slice(-8), "eeeeeeee");
     assert.match(textOf(hostTruncated!), /Cancelled/); assert.equal(hostTruncated!.truncated, true);
   } finally { f.bridge.dispose(); }

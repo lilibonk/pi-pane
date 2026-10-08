@@ -2,7 +2,7 @@ import { render } from "preact";
 import { useEffect, useRef, useState } from "preact/hooks";
 import type { JSX } from "preact";
 import {
-  forgetSubmission, issueCommand, queryReceipt, reconnect, setDraft, startConnection, submitPrompt,
+  forgetSubmission, issueCommand, loadOlder, queryReceipt, reconnect, setDraft, startConnection, submitPrompt,
   webStore, type MessageView, type Submission, type ToolView, type WebState,
 } from "./store.js";
 import "./style.css";
@@ -59,7 +59,7 @@ function Message({ message }: { message: MessageView }) {
 }
 
 function Tool({ tool }: { tool: ToolView }) {
-  const result = tool.status === "running" ? tool.partial : tool.result;
+  const result = tool.output;
   return (
     <details class={`tool-card tool-${tool.status} ${tool.parentToolCallId ? "tool-nested" : ""}`} open={tool.status === "running"} data-tool-id={tool.id}>
       <summary>
@@ -69,7 +69,7 @@ function Tool({ tool }: { tool: ToolView }) {
       <div class="tool-body">
         {tool.parentToolCallId && <p class="subtle">嵌套调用 · {tool.parentToolCallId}</p>}
         <div class="tool-label">参数</div><pre>{outputText(tool.args)}</pre>
-        {result !== undefined && <><div class="tool-label">{tool.status === "running" ? "当前输出" : "结果"}</div><pre>{outputText(result)}</pre></>}
+        {result !== undefined && <><div class="tool-label">{tool.status === "running" ? "当前输出" : "结果"}{tool.outputTotal ? ` · 仅显示末尾，共 ${tool.outputTotal} 字符` : ""}</div><pre>{result}</pre></>}
       </div>
     </details>
   );
@@ -204,7 +204,7 @@ function App() {
       {!!host?.uiPrompts.length && <div class="terminal-notice" role="status"><strong>请在终端处理对话框</strong>{host.uiPrompts.map((prompt, i) => <span key={i}>{prompt.title || prompt.kind}</span>)}</div>}
       <div class="timeline" ref={feed} onScroll={handleScroll} aria-live="off" aria-label="当前分支会话历史">
         <div class="timeline-inner">
-          {snapshot?.session.historyTruncated && <div class="history-limit">M0 只展示最近的有界历史。更早的消息请查看终端。</div>}
+          {snapshot?.session.olderCursor && <div class="history-limit"><button type="button" disabled={state.historyLoading || !online} onClick={loadOlder}>{state.historyLoading ? "正在加载更早的消息…" : "加载更早的消息"}</button>{state.historyError && <span>{state.historyError}</span>}</div>}
           {!snapshot ? <div class="empty-state"><span class="empty-pi">π</span><h2>{connection === "switching" ? "等待新会话" : "连接当前会话"}</h2><p>在终端输入 /web 后，当前分支和正在生成的内容会显示在这里。</p></div> : !snapshot.session.messages.length && !host?.tools.length ? <div class="empty-state"><span class="empty-pi">π</span><h2>可以开始了</h2><p>终端与浏览器共享同一个会话。发送消息后，pi 的实际输出会出现在这里。</p></div> : null}
           {snapshot?.session.messages.map(message => <Message key={message.id} message={message} />)}
           {!!host?.tools.length && <div class="tools"><div class="section-label">工具执行</div>{host.tools.map(tool => <Tool key={tool.id} tool={tool} />)}</div>}

@@ -9,6 +9,7 @@ import { dirname, join, resolve } from "node:path";
 import { createInterface } from "node:readline";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import WebSocket from "ws";
+import { applyProjectionEvent } from "../dist/protocol/index.js";
 
 const project = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const pause = (ms) => new Promise((resolvePromise) => setTimeout(resolvePromise, ms));
@@ -142,8 +143,21 @@ export async function openClient(url, clientId) {
   };
   socket.on("close", () => { client.closed = true; });
   socket.on("error", () => {});
+  let assembling;
   socket.on("message", (data) => {
-    const frame = JSON.parse(data.toString());
+    let frame = JSON.parse(data.toString());
+    // Logical frames above 1 MiB arrive as contiguous frame_begin/frame_chunk/frame_end parts.
+    if (frame.t === "frame_begin") { assembling = { id: frame.id, parts: frame.parts, chunks: [] }; return; }
+    if (frame.t === "frame_chunk") {
+      if (!assembling || frame.id !== assembling.id || frame.index !== assembling.chunks.length) client.protocolErrors.push({ chunk: frame.index });
+      else assembling.chunks.push(frame.data);
+      return;
+    }
+    if (frame.t === "frame_end") {
+      const done = assembling; assembling = undefined;
+      if (!done || done.id !== frame.id || done.chunks.length !== done.parts) { client.protocolErrors.push({ chunkEnd: frame.id }); return; }
+      frame = JSON.parse(done.chunks.join(""));
+    }
     client.frames.push(frame);
     if (frame.t === "welcome") { client.clientId = frame.clientId; client.nextCommandNo = frame.nextCommandNo; }
     if (frame.t === "ack") client.nextCommandNo = Math.max(client.nextCommandNo, frame.nextCommandNo ?? 1);
@@ -155,19 +169,9 @@ export async function openClient(url, clientId) {
       client.protocolErrors.push({ expectedEpoch: state?.epoch, gotEpoch: frame.epoch, expectedSeq: (state?.seq ?? -1) + 1, gotSeq: frame.seq });
       return;
     }
-    state.seq = frame.seq;
-    const event = frame.ev;
-    if (event.message) {
-      const index = state.session.messages.findIndex((message) => message.id === event.message.id);
-      if (index === -1) state.session.messages.push(event.message); else state.session.messages[index] = event.message;
-    }
-    if (event.tool) {
-      const index = state.state.tools.findIndex((tool) => tool.id === event.tool.id);
-      if (index === -1) state.state.tools.push(event.tool); else state.state.tools[index] = event.tool;
-    }
-    if (event.type === "agent_state") state.state = event.state;
-    if (event.type === "session_meta") state.session.name = event.name;
-    if (event.type === "theme") state.theme = event.theme;
+    // The browser and the harness apply events through the same shared reducer.
+    try { client.snapshot = { ...applyProjectionEvent(state, frame.ev), seq: frame.seq }; }
+    catch (error) { client.protocolErrors.push({ seq: frame.seq, type: frame.ev?.type, error: String(error) }); }
   });
   await new Promise((resolvePromise, reject) => { socket.once("open", resolvePromise); socket.once("error", reject); });
   client.send({ t: "hello", ...(clientId ? { clientId } : {}) });
@@ -331,9 +335,9 @@ export async function runSmoke() {
     });
     await check("tool partial survives reconnect and completes", async () => {
       await client.command("prompt", { text: "M0_TOOL" });
-      await waitFor(() => client.snapshot.state.tools.some((tool) => tool.status === "running" && tool.partial), "streaming tool partial");
+      await waitFor(() => client.snapshot.state.tools.some((tool) => tool.status === "running" && tool.output), "streaming tool partial");
       const id = client.clientId; await client.close(); await connect(id);
-      assert.ok(client.snapshot.state.tools.some((tool) => tool.status === "running" && tool.partial));
+      assert.ok(client.snapshot.state.tools.some((tool) => tool.status === "running" && tool.output));
       await client.settled("M0_TOOL");
       assert.ok(client.snapshot.state.tools.some((tool) => tool.status === "complete"));
     });

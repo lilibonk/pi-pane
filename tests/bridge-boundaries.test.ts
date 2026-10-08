@@ -3,7 +3,7 @@ import test from "node:test";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Bridge, type BridgeOptions } from "../src/extension/bridge.js";
 import type { CommandResult, ProjectionEvent } from "../src/protocol/index.js";
-import { M0_MAX_MESSAGES } from "../src/protocol/index.js";
+import { LIMITS, applyProjectionEvent, type MessageView, type Snapshot } from "../src/protocol/index.js";
 
 const tick = () => new Promise<void>((resolve) => setImmediate(resolve));
 function fixture() {
@@ -17,7 +17,7 @@ function fixture() {
   const ctx = {
     cwd: "/fixture", model, isIdle: () => true, hasPendingMessages: () => false,
     abort: () => {}, compact: (callbacks: typeof compactCallbacks) => { compactCallbacks = callbacks; },
-    sessionManager: { getSessionId: () => "fixture", getBranch: () => entries, getLeafId: () => null, getSessionName: () => undefined },
+    sessionManager: { getSessionId: () => "fixture", getBranch: () => entries, getLeafId: () => (entries.at(-1) as { id?: string } | undefined)?.id ?? null, getSessionName: () => undefined },
     modelRegistry: { getAvailable: () => [model], find: () => model },
     ui: { theme: { appearance: "dark", colors: {} } },
   } as unknown as ExtensionContext;
@@ -116,26 +116,107 @@ test("internal empty system updates are omitted without hiding genuine system te
   } finally { f.bridge.dispose(); }
 });
 
-test("successful compaction publishes the same bounded history as resync and retains an active partial", () => {
+test("successful compaction replaces the attached window in one event and retains an active partial", () => {
   const f = fixture();
   try {
-    for (let index = 0; index < M0_MAX_MESSAGES + 2; index++) {
+    for (let index = 0; index < LIMITS.snapshotWindowMessages + 2; index++) {
       f.entries.push({ type: "message", id: `history-${index}`, message: { role: "user", content: `history ${index}` } });
     }
-    f.bridge.syncHistory();
+    f.bridge.snapshot();
     const partial = { role: "assistant", content: [{ type: "text", text: "still streaming" }] };
     f.bridge.handleEvent({ type: "message_start", message: partial });
     f.events.length = 0;
     f.entries.push({ type: "compaction", id: "compact-marker" });
     f.bridge.handleEvent({ type: "session_compact" });
     const snapshot = f.bridge.snapshot();
-    const published = f.events.flatMap((event) => "message" in event ? [event.message] : []);
-    assert.deepEqual(published, snapshot.session.messages);
-    assert.equal(published.length, M0_MAX_MESSAGES);
-    assert.equal(snapshot.session.historyTruncated, true);
-    assert.equal(new Set(published.map((message) => message.id)).size, published.length);
-    assert.ok(published.some((message) => message.entryId === "compact-marker"));
-    assert.equal(published.at(-1)?.status, "streaming");
-    assert.deepEqual(published.at(-1)?.content, [{ type: "text", text: "still streaming" }]);
+    const windows = f.events.filter((event) => event.type === "history_window");
+    assert.equal(windows.length, 1);
+    const window = windows[0] as Extract<ProjectionEvent, { type: "history_window" }>;
+    assert.deepEqual(window.messages, snapshot.session.messages);
+    assert.equal(window.olderCursor, snapshot.session.olderCursor);
+    assert.ok(window.olderCursor, "older history stays reachable through paging");
+    assert.equal(window.messages.length, LIMITS.snapshotWindowMessages + 1);
+    assert.equal(new Set(window.messages.map((message) => message.id)).size, window.messages.length);
+    assert.ok(window.messages.some((message) => message.entryId === "compact-marker"));
+    assert.equal(window.messages.at(-1)?.status, "streaming");
+    assert.deepEqual(window.messages.at(-1)?.content, [{ type: "text", text: "still streaming" }]);
+  } finally { f.bridge.dispose(); }
+});
+
+test("history pages walk the whole branch in order without duplicates", () => {
+  const f = fixture();
+  try {
+    const total = 600;
+    for (let index = 0; index < total; index++)
+      f.entries.push({ type: "message", id: `e${index}`, message: { role: index % 2 ? "assistant" : "user", content: [{ type: "text", text: `${index}:${"x".repeat(3000)}` }] } });
+    const snapshot = f.bridge.snapshot();
+    let bytes = 0;
+    for (const message of snapshot.session.messages) bytes += Buffer.byteLength(JSON.stringify(message));
+    assert.ok(bytes <= LIMITS.snapshotWindowBytes, "snapshot window respects its byte budget");
+    assert.ok(snapshot.session.olderCursor);
+    let messages = snapshot.session.messages;
+    let cursor: string | null = snapshot.session.olderCursor;
+    let pages = 0;
+    while (cursor) {
+      const page = f.bridge.historyPage(cursor, 0);
+      assert.ok(page.messages.length > 0);
+      messages = [...page.messages, ...messages];
+      cursor = page.olderCursor;
+      pages++;
+    }
+    assert.ok(pages >= 2);
+    assert.deepEqual(messages.map((message) => message.entryId), f.entries.map((entry) => (entry as { id: string }).id));
+    assert.throws(() => f.bridge.historyPage("missing", 0), /cursor/);
+    assert.throws(() => f.bridge.historyPage("e10", 1), /Refresh/);
+  } finally { f.bridge.dispose(); }
+});
+
+test("oversized blocks keep their index and are readable in full through content pages", () => {
+  const f = fixture();
+  try {
+    const long = "a".repeat(LIMITS.messageChars + 200_000) + "END";
+    f.entries.push({ type: "message", id: "big", message: { role: "toolResult", toolCallId: "t1", toolName: "edit", content: [{ type: "text", text: long }], details: { patch: "@@ -1 +1 @@\n-old\n+new\n" } } });
+    const message = f.bridge.snapshot().session.messages[0]!;
+    const block = message.content[0]!;
+    assert.equal(block.type, "text");
+    assert.equal(block.type === "text" && block.text.length, LIMITS.messageChars);
+    assert.equal(block.type === "text" && block.total, long.length);
+    const diff = message.content[1]!;
+    assert.equal(diff.type, "diff", "the edit patch is a separate block even when the budget is exhausted");
+    assert.equal(diff.type === "diff" && diff.text, "");
+    let text = "";
+    while (text.length < long.length) {
+      const page = f.bridge.contentPage(message.id, 0, text.length);
+      assert.equal(page.total, long.length);
+      assert.ok(page.final);
+      text += page.text;
+    }
+    assert.equal(text, long);
+    assert.equal(f.bridge.contentPage(message.id, 1, 0).text, "@@ -1 +1 @@\n-old\n+new\n");
+    assert.throws(() => f.bridge.contentPage("unknown", 0, 0), /no longer retained/);
+  } finally { f.bridge.dispose(); }
+});
+
+test("streaming updates coalesce into append-only deltas that rebuild the snapshot state", () => {
+  const f = fixture();
+  try {
+    const before = { t: "snapshot", epoch: "e", seq: 0, ...f.bridge.snapshot() } as Snapshot;
+    const message = { role: "assistant", content: [{ type: "text", text: "" }] };
+    f.bridge.handleEvent({ type: "message_start", message });
+    for (const piece of ["Hel", "lo", ", ", "world"]) {
+      message.content[0]!.text += piece;
+      f.bridge.handleEvent({ type: "message_update", message });
+    }
+    const deltasBeforeFlush = f.events.filter((event) => event.type === "msg_delta").length;
+    f.bridge.flush();
+    const deltas = f.events.filter((event) => event.type === "msg_delta");
+    assert.equal(deltasBeforeFlush, 0, "updates are coalesced until the flush window");
+    assert.equal(deltas.length, 1);
+    assert.deepEqual("ops" in deltas[0]! && deltas[0].ops, [{ i: 0, append: "Hello, world" }]);
+    let state: Snapshot = before;
+    for (const event of f.events) state = applyProjectionEvent(state, event);
+    const after = f.bridge.snapshot();
+    assert.deepEqual(state.session.messages, after.session.messages);
+    assert.equal((state.session.messages[0] as MessageView).status, "streaming");
   } finally { f.bridge.dispose(); }
 });

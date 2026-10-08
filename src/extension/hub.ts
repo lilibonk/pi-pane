@@ -6,8 +6,8 @@ import type { AddressInfo } from "node:net";
 import type { Duplex } from "node:stream";
 import { WebSocket, WebSocketServer, type RawData } from "ws";
 import {
-  PROTOCOL, WS_PATH, ProtocolError, parseClientMessage, toWireError,
-  type Ack, type CommandEnvelope, type CommandResult, type ProjectionEvent, type ServerMessage,
+  LIMITS, PROTOCOL, WS_PATH, ProtocolError, parseClientMessage, toWireError,
+  type Ack, type ClientMessage, type CommandEnvelope, type CommandResult, type ProjectionEvent, type ServerMessage,
 } from "../protocol/index.js";
 import type { Bridge } from "./bridge.js";
 
@@ -74,7 +74,7 @@ export class Hub {
 
   constructor(options: HubOptions) {
     const host = options.host ?? "127.0.0.1";
-    if (!["127.0.0.1", "localhost", "::1"].includes(host)) throw new ProtocolError("loopback_only", "M0 accepts loopback addresses only.");
+    if (!["127.0.0.1", "localhost", "::1"].includes(host)) throw new ProtocolError("loopback_only", "Only loopback addresses are accepted.");
     if (options.port !== undefined && (!Number.isInteger(options.port) || options.port < 0 || options.port > 65535)) throw new ProtocolError("invalid_port", "Port must be between 0 and 65535.");
     this.options = { ...options, host };
   }
@@ -173,7 +173,7 @@ export class Hub {
       response.end(request.method === "HEAD" ? undefined : await readFile(file));
     } catch {
       response.writeHead(404, { "Content-Type": "text/plain; charset=utf-8" });
-      response.end("Web assets unavailable. Build the M0 package first.");
+      response.end("Web assets unavailable. Build the package first.");
     }
   }
   private rejectUpgrade(socket: Duplex, code: number): void {
@@ -225,6 +225,7 @@ export class Hub {
     }
     const lease = this.validLease(peer);
     if (message.t === "resync") { this.sendSnapshot(peer); return; }
+    if (message.t === "history_page" || message.t === "content_page") { this.page(peer, message); return; }
     if (message.clientId !== lease.id) throw new ProtocolError("client_mismatch", "Command does not belong to this connection.");
     if (message.t === "receipt_query") {
       const prefix = `${lease.id}:`;
@@ -285,6 +286,22 @@ export class Hub {
     ackSent = true;
     if (receipt.result) this.send(peer, receipt.result);
   }
+  /** Directed read-only responses. They never consume seq and never call the host's write APIs. */
+  private page(peer: Peer, message: Extract<ClientMessage, { t: "history_page" | "content_page" }>): void {
+    const bridge = this.boundBridge;
+    try {
+      if (!bridge || this._switching || !bridge.isCurrent() || message.epoch !== this._epoch)
+        throw new ProtocolError("stale_session", "Refresh the session snapshot before reading history.");
+      if (message.t === "history_page") {
+        if (message.sessionId !== bridge.sessionId) throw new ProtocolError("stale_session", "Refresh the session snapshot before reading history.");
+        this.send(peer, { t: "history_page", reqId: message.reqId, epoch: this._epoch, ...bridge.historyPage(message.before, message.branchRevision) });
+      } else {
+        this.send(peer, { t: "content_page", reqId: message.reqId, epoch: this._epoch, ...bridge.contentPage(message.messageId, message.index, message.offset) });
+      }
+    } catch (error) {
+      this.send(peer, { t: "error", error: toWireError(error), reqId: message.reqId });
+    }
+  }
   private pruneLeases(): void {
     for (const [id, lease] of this.leases) if (lease.expiresAt <= Date.now()) {
       this.leases.delete(id);
@@ -294,19 +311,31 @@ export class Hub {
   private sendError(peer: Peer, error: unknown): void {
     this.send(peer, { t: "error", error: toWireError(error), ...(peer.lease ? { nextCommandNo: peer.lease.nextCommandNo } : {}) });
   }
+  /** Splits one logical frame; the parts are queued synchronously so nothing interleaves. */
+  private chunks(data: string): string[] {
+    const id = randomUUID();
+    const parts = Math.ceil(data.length / LIMITS.chunkChars);
+    const frames = [JSON.stringify({ t: "frame_begin", id, parts })];
+    for (let index = 0; index < parts; index++)
+      frames.push(JSON.stringify({ t: "frame_chunk", id, index, data: data.slice(index * LIMITS.chunkChars, (index + 1) * LIMITS.chunkChars) }));
+    frames.push(JSON.stringify({ t: "frame_end", id }));
+    return frames;
+  }
   private send(peer: Peer, message: ServerMessage): void {
     if (peer.socket.readyState !== WebSocket.OPEN) return;
     const data = JSON.stringify(message);
     const size = Buffer.byteLength(data);
-    if (size > 1024 * 1024) { peer.socket.close(1009, "spike_snapshot_limit"); return; }
-    if (peer.socket.bufferedAmount + size > (this.options.maxBufferedBytes ?? 2 * 1024 * 1024)) {
+    if (size > LIMITS.logicalFrameBytes) { peer.socket.close(1009, "frame_limit"); return; }
+    const frames = size <= LIMITS.frameBytes ? [data] : this.chunks(data);
+    const total = frames.length === 1 ? size : frames.reduce((sum, frame) => sum + Buffer.byteLength(frame), 0);
+    if (peer.socket.bufferedAmount + total > (this.options.maxBufferedBytes ?? LIMITS.sendBufferBytes)) {
       peer.socket.close(1013, "slow_client");
       // Do not retain a nonreading socket through an unbounded close handshake.
       const timer = setTimeout(() => peer.socket.terminate(), 1000);
       timer.unref?.();
       return;
     }
-    peer.socket.send(data, (error) => { if (error) peer.socket.terminate(); });
+    for (const frame of frames) peer.socket.send(frame, (error) => { if (error) peer.socket.terminate(); });
   }
   private broadcast(message: ServerMessage): void {
     for (const peer of this.peers) if (peer.lease) this.send(peer, message);
@@ -334,6 +363,8 @@ export class Hub {
   }
   private reset(reason: string): void {
     if (!this.boundBridge) return;
+    // Coalesced updates belong to the outgoing epoch.
+    try { this.boundBridge.flush(); } catch { /* stale */ }
     this._switching = false;
     this._epoch = randomUUID();
     this._seq = 0;

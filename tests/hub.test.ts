@@ -15,7 +15,7 @@ async function until<T>(predicate: () => T | undefined | false, label: string, t
   while (Date.now() < end) { const value = predicate(); if (value) return value; await delay(5); }
   throw new Error(`Timed out: ${label}`);
 }
-async function fixture(options: Partial<HubOptions> = {}) {
+async function fixture(options: Partial<HubOptions> = {}, overrides: Record<string, unknown> = {}) {
   const directory = await mkdtemp(join(tmpdir(), "pi-pane-hub-test-"));
   await writeFile(join(directory, "index.html"), "<!doctype html><title>test</title>");
   let calls = 0;
@@ -24,11 +24,13 @@ async function fixture(options: Partial<HubOptions> = {}) {
     sessionId: "fixture-session", branchRevision: 0, isCurrent: () => true,
     setObserver: (value: BridgeObserver | undefined) => { observer = value; },
     dispatch: () => { calls++; },
+    flush: () => {},
     snapshot: () => ({
-      session: { id: "fixture-session", cwd: "/fixture", leafId: null, branchRevision: 0, messages: [], historyTruncated: false },
+      session: { id: "fixture-session", cwd: "/fixture", leafId: null, branchRevision: 0, messages: [], olderCursor: null },
       state: { idle: true, running: false, compacting: false, hasPendingMessages: false, thinking: "off", models: [], tools: [], uiPrompts: [] },
-      theme: {}, caps: { commands: COMMANDS, images: false, promptReceipt: "dispatch_only", queueView: "boolean", terminalDialogs: true, history: "bounded_spike" },
+      theme: {}, caps: { commands: COMMANDS, images: false, promptReceipt: "dispatch_only", queueView: "boolean", terminalDialogs: true, history: "paged", content: "paged" },
     }),
+    ...overrides,
   } as unknown as Bridge;
   const hub = new Hub({ port: 0, webRoot: directory, ...options });
   await hub.start(); hub.bindBridge(bridge);
@@ -124,5 +126,63 @@ test("unauthenticated static file access remains confined to the built web root"
       req.on("error", reject); req.end();
     });
     assert.equal(wrongHost, 403);
+  } finally { await f.close(); }
+});
+
+test("frames above the transport limit are chunked contiguously and reassemble to the logical frame", async () => {
+  const big = "汉字🙂".repeat(160_000);
+  const f = await fixture({}, {
+    snapshot: () => ({
+      session: { id: "fixture-session", cwd: "/fixture", leafId: null, branchRevision: 0, olderCursor: null,
+        messages: [{ id: "m", role: "assistant", status: "complete", content: [{ type: "text", text: big }] }] },
+      state: { idle: true, running: false, compacting: false, hasPendingMessages: false, thinking: "off", models: [], tools: [], uiPrompts: [] },
+      theme: {}, caps: { commands: COMMANDS, images: false, promptReceipt: "dispatch_only", queueView: "boolean", terminalDialogs: true, history: "paged", content: "paged" },
+    }),
+  });
+  try {
+    const raw: string[] = [];
+    const socket = new WebSocket(`${f.hub.origin.replace("http:", "ws:")}/ws`, ["pi-pane.v1", `pi-pane.bearer.${f.hub.token}`], { origin: f.hub.origin });
+    socket.on("message", (data) => raw.push(data.toString()));
+    await new Promise<void>((resolve, reject) => { socket.once("open", resolve); socket.once("error", reject); });
+    socket.send(JSON.stringify({ t: "hello" }));
+    await until(() => raw.some((frame) => frame.includes('"frame_end"')), "chunked snapshot");
+    const frames = raw.map((frame) => JSON.parse(frame) as Record<string, unknown>);
+    const begin = frames.findIndex((frame) => frame.t === "frame_begin");
+    const end = frames.findIndex((frame) => frame.t === "frame_end");
+    const chunks = frames.slice(begin + 1, end);
+    assert.equal(chunks.length, frames[begin]!.parts);
+    assert.ok(chunks.every((chunk, index) => chunk.t === "frame_chunk" && chunk.index === index && chunk.id === frames[begin]!.id));
+    for (const frame of raw.slice(begin, end + 1)) assert.ok(Buffer.byteLength(frame) <= 1024 * 1024, "every transport frame stays within 1 MiB");
+    const snapshot = JSON.parse(chunks.map((chunk) => chunk.data).join("")) as { t: string; session: { messages: { content: { text: string }[] }[] } };
+    assert.equal(snapshot.t, "snapshot");
+    assert.equal(snapshot.session.messages[0]!.content[0]!.text, big);
+    socket.close();
+  } finally { await f.close(); }
+});
+
+test("history and content reads are directed, version-checked and never dispatch", async () => {
+  const requests: unknown[] = [];
+  const f = await fixture({}, {
+    historyPage: (before: string, revision: number) => { requests.push(["history", before, revision]); return { messages: [], olderCursor: null }; },
+    contentPage: (messageId: string) => { requests.push(["content", messageId]); throw new Error("gone"); },
+  });
+  try {
+    const c = await client(f.hub);
+    await c.wait("snapshot");
+    let from = c.frames.length;
+    c.send({ t: "history_page", reqId: "h1", epoch: f.hub.epoch, sessionId: "fixture-session", branchRevision: 0, before: "e1" });
+    const page = await c.wait("history_page", from);
+    assert.ok(page.t === "history_page"); assert.equal(page.reqId, "h1");
+    from = c.frames.length;
+    c.send({ t: "history_page", reqId: "h2", epoch: "old-epoch", sessionId: "fixture-session", branchRevision: 0, before: "e1" });
+    const stale = await c.wait("error", from);
+    assert.ok(stale.t === "error"); assert.equal(stale.reqId, "h2"); assert.equal(stale.error.code, "stale_session");
+    from = c.frames.length;
+    c.send({ t: "content_page", reqId: "c1", epoch: f.hub.epoch, messageId: "m", index: 0, offset: 0 });
+    const failed = await c.wait("error", from);
+    assert.ok(failed.t === "error"); assert.equal(failed.reqId, "c1");
+    assert.deepEqual(requests, [["history", "e1", 0], ["content", "m"]]);
+    assert.equal(f.calls(), 0);
+    assert.equal(f.hub.seq, 0, "directed reads do not consume broadcast sequence numbers");
   } finally { await f.close(); }
 });

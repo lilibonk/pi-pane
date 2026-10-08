@@ -9,7 +9,7 @@ export function readPaneSettings(settings: unknown): PaneSettings {
   const unknown = Object.keys(config).filter((key) => !["host", "port", "noOpen"].includes(key));
   if (unknown.length) throw new ProtocolError("invalid_config", `Unsupported piPane setting: ${unknown.join(", ")}`);
   if (config.host !== undefined && (typeof config.host !== "string" || !["127.0.0.1", "localhost", "::1"].includes(config.host)))
-    throw new ProtocolError("invalid_config", "piPane.host must be a loopback address in M0.");
+    throw new ProtocolError("invalid_config", "piPane.host must be a loopback address until external access is supported.");
   if (config.port !== undefined && (typeof config.port !== "number" || !Number.isInteger(config.port) || config.port < 1 || config.port > 65535))
     throw new ProtocolError("invalid_config", "piPane.port must be an integer between 1 and 65535.");
   if (config.noOpen !== undefined && typeof config.noOpen !== "boolean")

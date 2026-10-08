@@ -1,7 +1,7 @@
 import { createStore } from "zustand/vanilla";
-import type { CommandName, MessageView, ProjectionEvent, Snapshot, ToolView } from "../protocol/index.js";
-import { M0_MAX_MESSAGES, M0_MESSAGE_BYTES, M0_MAX_TOOLS, M0_RETAIN_COMPLETED_TOOLS } from "../protocol/index.js";
-export type { MessageView, Snapshot, ToolView } from "../protocol/index.js";
+import type { CommandName, MessageView, Snapshot } from "../protocol/index.js";
+import { LIMITS, applyProjectionEvent, boundedTools, encodedSize, isTextContent, mergeOlderPage } from "../protocol/index.js";
+export type { ContentView, MessageView, Snapshot, ToolView } from "../protocol/index.js";
 
 export type Connection = "connecting" | "online" | "resyncing" | "switching" | "disconnected" | "fatal";
 type ReceiptStatus = "sent" | "dispatched" | "rejected" | "unknown" | "completed" | "failed";
@@ -15,6 +15,8 @@ export interface Submission {
   at: number;
   explanation?: string;
 }
+/** Full text of a block read through content_page, keyed by `${messageId}#${index}`. */
+export interface Expansion { text: string; total: number; loading: boolean; error?: string; capped?: boolean }
 
 export interface WebState {
   connection: Connection;
@@ -25,6 +27,10 @@ export interface WebState {
   lastAppliedSeq: number;
   draft: string;
   submissions: Submission[];
+  /** Pending history_page request, if any. */
+  historyLoading: boolean;
+  historyError: string;
+  expansions: Record<string, Expansion>;
 }
 
 export const webStore = createStore<WebState>(() => ({
@@ -36,15 +42,24 @@ export const webStore = createStore<WebState>(() => ({
   lastAppliedSeq: 0,
   draft: "",
   submissions: [],
+  historyLoading: false,
+  historyError: "",
+  expansions: {},
 }));
 
 const TOKEN_KEY = "pi-pane.token";
 const CLIENT_KEY = "pi-pane.clientId";
+/** Upper bound for one block expanded in the browser. */
+const EXPANSION_CHARS = 4 * 1024 * 1024;
 let socket: WebSocket | null = null;
 let retryTimer: ReturnType<typeof setTimeout> | undefined;
 let attempt = 0;
 let stopped = false;
 let authToken = "";
+let requestNo = 0;
+let historyRequest: string | undefined;
+const contentRequests = new Map<string, string>();
+let assembling: { id: string; parts: number; chunks: string[] } | undefined;
 
 function readSession(key: string): string | null {
   try { return sessionStorage.getItem(key); } catch { return null; }
@@ -97,72 +112,32 @@ function send(frame: unknown): boolean {
 
 function resync(message: string) {
   if (webStore.getState().connection === "resyncing") return;
+  resetReads();
   webStore.setState({ connection: "resyncing", notice: message });
   send({ t: "resync" });
 }
 
-function upsert<T extends { id: string }>(items: T[], item: T): T[] {
-  const index = items.findIndex(existing => existing.id === item.id ||
-    ("entryId" in item && item.entryId && "entryId" in existing && existing.entryId === item.entryId));
-  if (index < 0) return [...items, item];
-  return items.map((existing, i) => i === index ? item : existing);
+/** Read requests belong to one epoch; a new snapshot discards their pending state. */
+function resetReads() {
+  historyRequest = undefined;
+  contentRequests.clear();
+  webStore.setState({ historyLoading: false, historyError: "", expansions: {} });
 }
 
-// M0 matches the Bridge's bounded spike window; full history paging is a later milestone.
-const encodedSizes = new WeakMap<MessageView, number>();
-const encoder = new TextEncoder();
-function boundedMessages(messages: MessageView[]): { messages: MessageView[]; truncated: boolean } {
-  const window = messages.slice(-M0_MAX_MESSAGES);
+/** Keeps the retained history within the browser cache by evicting the oldest persisted messages. */
+function capHistory(snapshot: Snapshot): Snapshot {
+  const messages = snapshot.session.messages;
   let bytes = 0;
-  let first = window.length;
-  for (let index = window.length - 1; index >= 0; index--) {
-    const message = window[index]!;
-    let size = encodedSizes.get(message);
-    if (size === undefined) { size = encoder.encode(JSON.stringify(message)).byteLength; encodedSizes.set(message, size); }
-    bytes += size;
-    if (bytes > M0_MESSAGE_BYTES) break;
-    first = index;
+  for (const message of messages) bytes += encodedSize(message);
+  if (bytes <= LIMITS.clientCacheBytes) return snapshot;
+  let first = 0;
+  while (first < messages.length - 1 && bytes > LIMITS.clientCacheBytes && messages[first]!.entryId) {
+    bytes -= encodedSize(messages[first]!);
+    first++;
   }
-  return { messages: window.slice(first), truncated: first > 0 || window.length < messages.length };
-}
-function boundedTools(tools: ToolView[], latestId?: string): ToolView[] {
-  const result = [...tools];
-  while (result.length > M0_RETAIN_COMPLETED_TOOLS) {
-    const index = result.findIndex(tool => tool.status !== "running" && tool.id !== latestId);
-    if (index < 0) break;
-    result.splice(index, 1);
-  }
-  return result.slice(-M0_MAX_TOOLS);
-}
-
-function applyEvent(ev: ProjectionEvent, snapshot: Snapshot): Snapshot {
-  const next = { ...snapshot, session: { ...snapshot.session }, state: { ...snapshot.state } };
-  switch (ev.type) {
-    case "msg_start": case "msg_delta": case "msg_end": {
-      const message = ev.message as MessageView | undefined;
-      if (!message || typeof message.id !== "string" || !Array.isArray(message.content)) throw new Error("message shape");
-      const window = boundedMessages(upsert(snapshot.session.messages, message));
-      next.session.messages = window.messages;
-      next.session.historyTruncated = snapshot.session.historyTruncated || window.truncated;
-      break;
-    }
-    case "tool_start": case "tool_update": case "tool_end": {
-      const tool = ev.tool as ToolView | undefined;
-      if (!tool || typeof tool.id !== "string") throw new Error("tool shape");
-      next.state.tools = boundedTools(upsert(snapshot.state.tools, tool), tool.id);
-      break;
-    }
-    case "agent_state":
-      next.state = { ...ev.state, tools: boundedTools(ev.state.tools) };
-      break;
-    case "session_meta":
-      next.session.name = typeof ev.name === "string" ? ev.name : undefined;
-      break;
-    case "theme":
-      if (ev.theme) next.theme = ev.theme as Record<string, string>;
-      break;
-  }
-  return next;
+  const kept = messages.slice(first);
+  const cursor = kept.find(message => message.entryId)?.entryId ?? snapshot.session.olderCursor;
+  return { ...snapshot, session: { ...snapshot.session, messages: kept, olderCursor: cursor } };
 }
 
 function handleFrame(raw: unknown) {
@@ -179,11 +154,9 @@ function handleFrame(raw: unknown) {
       if (typeof frame.epoch !== "string" || !Number.isSafeInteger(frame.seq) ||
         !frame.session || !Array.isArray(frame.session.messages) || !frame.state) throw new Error("snapshot shape");
       uncertainSubmissions(frame.epoch);
-      const window = boundedMessages(frame.session.messages);
-      const bounded = { ...frame, session: { ...frame.session, messages: window.messages,
-        historyTruncated: frame.session.historyTruncated || window.truncated },
-        state: { ...frame.state, tools: boundedTools(frame.state.tools) } } as Snapshot;
-      webStore.setState({ snapshot: bounded, lastAppliedSeq: frame.seq, connection: "online", notice: "" });
+      resetReads();
+      const snapshot = capHistory({ ...frame, state: { ...frame.state, tools: boundedTools(frame.state.tools) } } as Snapshot);
+      webStore.setState({ snapshot, lastAppliedSeq: frame.seq, connection: "online", notice: "" });
       attempt = 0;
       break;
     }
@@ -194,12 +167,46 @@ function handleFrame(raw: unknown) {
       if (!Number.isSafeInteger(frame.seq)) throw new Error("event seq");
       if (frame.seq <= current.lastAppliedSeq) return;
       if (frame.seq !== current.lastAppliedSeq + 1) { resync("检测到增量缺口，正在读取完整快照…"); return; }
-      const next = applyEvent(frame.ev, snapshot);
+      const next = capHistory(applyProjectionEvent(snapshot, frame.ev));
       webStore.setState({ snapshot: next, lastAppliedSeq: frame.seq });
+      break;
+    }
+    case "history_page": {
+      const snapshot = current.snapshot;
+      if (frame.reqId !== historyRequest) return;
+      historyRequest = undefined;
+      if (!snapshot || frame.epoch !== snapshot.epoch || !Array.isArray(frame.messages)) { webStore.setState({ historyLoading: false }); return; }
+      const messages = mergeOlderPage(snapshot.session.messages, frame.messages);
+      let bytes = 0;
+      for (const message of messages) bytes += encodedSize(message);
+      if (bytes > LIMITS.clientCacheBytes) {
+        webStore.setState({ historyLoading: false, historyError: "已达到浏览器保留历史的上限（16 MiB）。更早的内容请在终端查看。" });
+        return;
+      }
+      webStore.setState({ historyLoading: false, historyError: "",
+        snapshot: { ...snapshot, session: { ...snapshot.session, messages, olderCursor: frame.olderCursor ?? null } } });
+      break;
+    }
+    case "content_page": {
+      const key = contentRequests.get(frame.reqId);
+      if (!key) return;
+      contentRequests.delete(frame.reqId);
+      const expansion = current.expansions[key];
+      if (!expansion || frame.epoch !== current.snapshot?.epoch || typeof frame.text !== "string" ||
+          frame.offset !== expansion.text.length || !Number.isSafeInteger(frame.total)) {
+        setExpansion(key, { ...(expansion ?? { text: "", total: 0 }), loading: false, error: "内容已变化，请重试。" });
+        return;
+      }
+      const text = expansion.text + frame.text;
+      const capped = text.length >= EXPANSION_CHARS && text.length < frame.total;
+      const done = text.length >= frame.total || capped || !frame.text.length;
+      setExpansion(key, { text, total: frame.total, loading: !done, capped });
+      if (!done) requestContent(key, text.length);
       break;
     }
     case "session_reset":
       uncertainSubmissions(frame.epoch);
+      resetReads();
       webStore.setState({ snapshot: null, lastAppliedSeq: 0, connection: "switching", notice: "终端已切换会话或分支，等待新快照…" });
       break;
     case "switching":
@@ -223,6 +230,19 @@ function handleFrame(raw: unknown) {
     case "error": {
       const code = frame.error?.code;
       const message = frame.error?.message ?? "连接发生错误。";
+      if (typeof frame.reqId === "string") {
+        if (frame.reqId === historyRequest) {
+          historyRequest = undefined;
+          webStore.setState({ historyLoading: false, historyError: code === "stale_session" ? "会话已变化，请稍候重试。" : message });
+        }
+        const key = contentRequests.get(frame.reqId);
+        if (key) {
+          contentRequests.delete(frame.reqId);
+          const expansion = webStore.getState().expansions[key];
+          setExpansion(key, { ...(expansion ?? { text: "", total: 0 }), loading: false, error: message });
+        }
+        return;
+      }
       if (Number.isSafeInteger(frame.nextCommandNo)) webStore.setState({ nextCommandNo: frame.nextCommandNo });
       if (code === "client_expired" || code === "unauthorized" || code === "auth_failed") {
         stopped = true;
@@ -235,8 +255,32 @@ function handleFrame(raw: unknown) {
       }
       break;
     }
-    case "ping": send({ t: "pong" }); break;
   }
+}
+
+/** Reassembles frame_begin / frame_chunk / frame_end before handling the logical frame. */
+function receive(raw: unknown) {
+  const frame = raw as Record<string, any> | null;
+  if (frame?.t === "frame_begin") {
+    if (assembling || typeof frame.id !== "string" || !Number.isSafeInteger(frame.parts) || frame.parts < 1 ||
+        frame.parts > Math.ceil(LIMITS.logicalFrameBytes / 1024)) throw new Error("frame_begin");
+    assembling = { id: frame.id, parts: frame.parts, chunks: [] };
+    return;
+  }
+  if (frame?.t === "frame_chunk") {
+    if (!assembling || frame.id !== assembling.id || frame.index !== assembling.chunks.length || typeof frame.data !== "string") throw new Error("frame_chunk");
+    assembling.chunks.push(frame.data);
+    return;
+  }
+  if (frame?.t === "frame_end") {
+    const done = assembling;
+    assembling = undefined;
+    if (!done || frame.id !== done.id || done.chunks.length !== done.parts) throw new Error("frame_end");
+    handleFrame(JSON.parse(done.chunks.join("")));
+    return;
+  }
+  if (assembling) { assembling = undefined; throw new Error("interleaved frame"); }
+  handleFrame(raw);
 }
 
 function connect() {
@@ -251,18 +295,20 @@ function connect() {
   wsUrl.protocol = location.protocol === "https:" ? "wss:" : "ws:";
   const ws = new WebSocket(wsUrl, ["pi-pane.v1", `pi-pane.bearer.${authToken}`]);
   socket = ws;
+  assembling = undefined;
   ws.onopen = () => {
     if (socket !== ws) return;
     send({ t: "hello", ...(readSession(CLIENT_KEY) ? { clientId: readSession(CLIENT_KEY) } : {}) });
   };
   ws.onmessage = event => {
     if (socket !== ws) return;
-    try { handleFrame(JSON.parse(event.data)); }
-    catch { resync("收到无法识别的状态数据，正在重新同步…"); }
+    try { receive(JSON.parse(event.data)); }
+    catch { assembling = undefined; resync("收到无法识别的状态数据，正在重新同步…"); }
   };
   ws.onclose = event => {
     if (socket !== ws) return;
     socket = null;
+    assembling = undefined;
     uncertainSubmissions();
     if (stopped) return;
     if (event.reason === "connection_replaced" || event.reason === "client_expired") {
@@ -273,9 +319,9 @@ function connect() {
         : "客户端租约已过期。点击重新连接可创建新的身份；之前的提交结果仍需检查终端。" });
       return;
     }
-    if (event.reason === "spike_snapshot_limit") {
+    if (event.reason === "frame_limit") {
       stopped = true;
-      webStore.setState({ connection: "fatal", notice: "快照超过 M0 的资源上限，请在终端查看当前会话。" });
+      webStore.setState({ connection: "fatal", notice: "当前状态超过单帧资源上限，请在终端查看当前会话。" });
       return;
     }
     if (event.reason === "token_rotated") {
@@ -337,7 +383,7 @@ export function submitPrompt(mode: "followUp" | "steer") {
   const text = webStore.getState().draft;
   if (!text.trim()) return;
   if (new TextEncoder().encode(text).byteLength > 64 * 1024) {
-    webStore.setState({ notice: "文本超过 M0 的 64 KiB 上限，请缩短后提交。" });
+    webStore.setState({ notice: "文本超过 64 KiB 上限，请缩短后提交。" });
     return;
   }
   issueCommand("prompt", { text, mode }, text, mode);
@@ -350,4 +396,49 @@ export function queryReceipt(id: string) {
 
 export function forgetSubmission(id: string) {
   webStore.setState(state => ({ submissions: state.submissions.filter(item => item.id !== id) }));
+}
+
+/** Loads the page of history before the oldest retained message. Read-only; never calls the host. */
+export function loadOlder() {
+  const state = webStore.getState();
+  const snapshot = state.snapshot;
+  if (historyRequest || state.connection !== "online" || !snapshot?.session.olderCursor) return;
+  const reqId = `h${++requestNo}`;
+  if (!send({ t: "history_page", reqId, epoch: snapshot.epoch, sessionId: snapshot.session.id,
+    branchRevision: snapshot.session.branchRevision, before: snapshot.session.olderCursor })) return;
+  historyRequest = reqId;
+  webStore.setState({ historyLoading: true, historyError: "" });
+}
+
+function setExpansion(key: string, expansion: Expansion) {
+  webStore.setState(state => ({ expansions: { ...state.expansions, [key]: expansion } }));
+}
+function requestContent(key: string, offset: number) {
+  const snapshot = webStore.getState().snapshot;
+  const [messageId, index] = [key.slice(0, key.lastIndexOf("#")), Number(key.slice(key.lastIndexOf("#") + 1))];
+  const reqId = `c${++requestNo}`;
+  if (!snapshot || !send({ t: "content_page", reqId, epoch: snapshot.epoch, messageId, index, offset })) {
+    const expansion = webStore.getState().expansions[key];
+    setExpansion(key, { ...(expansion ?? { text: "", total: 0 }), loading: false, error: "连接不可用。" });
+    return;
+  }
+  contentRequests.set(reqId, key);
+}
+/** Reads the full text of a truncated block page by page. */
+export function expandContent(message: MessageView, index: number) {
+  const block = message.content[index];
+  if (!block || !isTextContent(block) || block.total === undefined) return;
+  const key = `${message.id}#${index}`;
+  const existing = webStore.getState().expansions[key];
+  if (existing?.loading) return;
+  setExpansion(key, { text: "", total: block.total, loading: true });
+  requestContent(key, 0);
+}
+export function collapseContent(message: MessageView, index: number) {
+  const key = `${message.id}#${index}`;
+  webStore.setState(state => {
+    const expansions = { ...state.expansions };
+    delete expansions[key];
+    return { expansions };
+  });
 }

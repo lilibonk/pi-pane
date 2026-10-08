@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { commandArgs, parseClientMessage, ProtocolError } from "../src/protocol/index.ts";
+import { applyDelta, applyProjectionEvent, commandArgs, diffMessage, mergeOlderPage, parseClientMessage, ProtocolError, type MessageView, type ProjectionState } from "../src/protocol/index.ts";
 
 test("wire validation rejects ambiguous identities and unsafe command counters", () => {
   const valid = { t: "command", clientId: "client", commandNo: 1, id: "client:1", epoch: "epoch", sessionId: "session", branchRevision: 0, command: "abort", args: {} };
@@ -10,7 +10,7 @@ test("wire validation rejects ambiguous identities and unsafe command counters",
   }
 });
 
-test("prompt limit counts UTF-8 bytes and M0 refuses unsupported uploads", () => {
+test("prompt limit counts UTF-8 bytes and refuses unsupported uploads", () => {
   assert.equal(commandArgs("prompt", { text: "汉".repeat(21_845), mode: "steer" }).mode, "steer");
   assert.throws(() => commandArgs("prompt", { text: "汉".repeat(21_846) }), ProtocolError);
   assert.throws(() => commandArgs("prompt", { text: "test", images: [] }), ProtocolError);
@@ -24,4 +24,40 @@ test("unknown commands and malformed control messages fail closed", () => {
   }
   assert.throws(() => commandArgs("shutdown", {}), /Unknown command/);
   assert.throws(() => commandArgs("abort", { other: true }), ProtocolError);
+});
+
+test("read requests validate their cursors and offsets", () => {
+  const page = { t: "history_page", reqId: "h1", epoch: "e", sessionId: "s", branchRevision: 0, before: "entry" };
+  assert.deepEqual(parseClientMessage(page), page);
+  const content = { t: "content_page", reqId: "c1", epoch: "e", messageId: "m", index: 2, offset: 0 };
+  assert.deepEqual(parseClientMessage(content), content);
+  for (const value of [{ ...page, before: "" }, { ...page, path: "/etc/passwd" }, { ...content, offset: -1 }, { ...content, index: 1.5 }, { ...content, index: 5000 }])
+    assert.throws(() => parseClientMessage(value), ProtocolError);
+});
+
+test("diffs are append-only for growing text and fall back to replacement otherwise", () => {
+  const base: MessageView = { id: "m", role: "assistant", status: "streaming", content: [{ type: "thinking", text: "plan" }, { type: "text", text: "Hel" }] };
+  const grown: MessageView = { ...base, content: [{ type: "thinking", text: "plan" }, { type: "text", text: "Hello" }, { type: "toolCall", id: "t", name: "bash", arguments: { command: "ls" } }] };
+  const ops = diffMessage(base, grown);
+  assert.deepEqual(ops, [{ i: 1, append: "lo" }, { i: 2, set: grown.content[2] }]);
+  assert.deepEqual(applyDelta(base, ops!), grown);
+  assert.equal(diffMessage(base, { ...grown, status: "complete" }), null, "status changes need the full message");
+  const rewritten: MessageView = { ...base, content: [{ type: "thinking", text: "plan" }, { type: "text", text: "Bye" }] };
+  assert.deepEqual(applyDelta(base, diffMessage(base, rewritten)!), rewritten);
+  const clipped: MessageView = { ...base, content: [{ type: "thinking", text: "plan" }, { type: "text", text: "Hello", total: 900 }] };
+  assert.deepEqual(applyDelta(base, diffMessage(base, clipped)!), clipped);
+  assert.throws(() => applyDelta(base, [{ i: 7, append: "x" }]));
+});
+
+test("the shared reducer keeps tools across agent_state and pages merge without duplicates", () => {
+  const state: ProjectionState = {
+    session: { id: "s", cwd: "/", leafId: null, branchRevision: 0, olderCursor: "e2", messages: [{ id: "entry:e2", entryId: "e2", role: "user", status: "complete", content: [] }] },
+    state: { idle: true, running: false, compacting: false, hasPendingMessages: false, thinking: "off", models: [], uiPrompts: [], tools: [{ id: "t", name: "bash", args: null, status: "running" }] },
+    theme: {},
+  };
+  const next = applyProjectionEvent(state, { type: "agent_state", state: { ...state.state, idle: false, running: true, tools: [] } });
+  assert.equal(next.state.tools.length, 1);
+  assert.throws(() => applyProjectionEvent(state, { type: "msg_delta", id: "missing", ops: [] }));
+  const merged = mergeOlderPage(state.session.messages, [{ id: "entry:e1", entryId: "e1", role: "user", status: "complete", content: [] }, { id: "entry:e2", entryId: "e2", role: "user", status: "complete", content: [] }]);
+  assert.deepEqual(merged.map((message) => message.entryId), ["e1", "e2"]);
 });

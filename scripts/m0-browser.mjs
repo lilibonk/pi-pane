@@ -147,7 +147,7 @@ try {
 
   await check("tool partial is visible and survives browser refresh with the same authenticated lease", async () => {
     await sendPrompt("M0_TOOL_BROWSER");
-    await waitFor(() => observer.snapshot.state.tools.some(tool => tool.status === "running" && tool.partial), "real tool partial");
+    await waitFor(() => observer.snapshot.state.tools.some(tool => tool.status === "running" && tool.output), "real tool partial");
     await page.locator(".tool-running pre").filter({ hasText: "M0_PARTIAL:" }).waitFor();
     await page.reload();
     await connected();

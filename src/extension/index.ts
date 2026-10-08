@@ -7,7 +7,7 @@ import { Bridge } from "./bridge.js";
 import { Hub } from "./hub.js";
 import { missingHostCapabilities, readPaneSettings } from "./config.js";
 
-export const IMPLEMENTATION_VERSION = "m0.1";
+export const IMPLEMENTATION_VERSION = "m1.0";
 export const PROCESS_STATE_KEY = Symbol.for("pi-pane.process.v1");
 export interface ProcessState {
   implementationVersion: string;
@@ -55,7 +55,7 @@ export default function piPane(pi: ExtensionAPI): void {
   let ownedContext: ExtensionContext | undefined;
   const webRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../../web-dist");
 
-  pi.registerFlag("web", { type: "boolean", default: false, description: "Mirror the current TUI session in a local browser (M0)." });
+  pi.registerFlag("web", { type: "boolean", default: false, description: "Mirror the current TUI session in a local browser." });
   pi.registerFlag("web-host", { type: "string", description: "Loopback listen address for pi-pane." });
   pi.registerFlag("web-port", { type: "string", description: "Explicit local port for pi-pane." });
   pi.registerFlag("web-no-open", { type: "boolean", description: "Start pi-pane without opening a browser." });
@@ -218,6 +218,6 @@ export default function piPane(pi: ExtensionAPI): void {
     "session_before_tree", "session_tree", "session_info_changed", "input",
   ]) observe(name, (event) => {
     try { ownedBridge?.handleEvent(event); }
-    catch { /* Projection failures must not interrupt the host agent. M0 tests exercise this boundary. */ }
+    catch { /* Projection failures must not interrupt the host agent. Integration tests exercise this boundary. */ }
   });
 }
