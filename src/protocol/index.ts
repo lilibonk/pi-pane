@@ -32,7 +32,21 @@ export const LIMITS = {
   /** Server-side coalescing windows. */
   messageFlushMs: 16,
   toolFlushMs: 50,
+  /** Prompt input: UTF-8 text, attached images and the command frame carrying them. */
+  promptBytes: 64 * 1024,
+  maxImages: 4,
+  imageBytes: 5 * 1024 * 1024,
+  imagesTotalBytes: 10 * 1024 * 1024,
+  imagePixels: 20_000_000,
+  commandFrameBytes: 16 * 1024 * 1024,
+  /** One image_page response (decoded bytes); larger history images are not sent. */
+  imageReadBytes: 5 * 1024 * 1024,
+  /** Browser-side cap for decoded history images held as object URLs. */
+  clientImageCacheBytes: 48 * 1024 * 1024,
 } as const;
+
+export const IMAGE_TYPES = ["image/png", "image/jpeg", "image/webp"] as const;
+export type ImageType = (typeof IMAGE_TYPES)[number];
 
 export const COMMANDS = ["prompt", "abort", "set_model", "set_thinking", "compact"] as const;
 export type CommandName = (typeof COMMANDS)[number];
@@ -42,7 +56,9 @@ export type ContentView =
   | { type: "text"; text: string; total?: number }
   | { type: "thinking"; text: string; total?: number }
   | { type: "diff"; text: string; total?: number }
-  | { type: "toolCall"; id: string; name: string; arguments: unknown; argsTruncated?: boolean };
+  | { type: "toolCall"; id: string; name: string; arguments: unknown; argsTruncated?: boolean }
+  /** Image metadata only; the bytes are read on demand through image_page. */
+  | { type: "image"; mimeType: string; bytes: number; width?: number; height?: number };
 export type TextContentView = Extract<ContentView, { text: string }>;
 export interface MessageView {
   id: string;
@@ -67,7 +83,7 @@ export interface ToolView {
   outputTotal?: number;
   status: "running" | "complete" | "error";
 }
-export interface ModelView { provider: string; id: string; name: string }
+export interface ModelView { provider: string; id: string; name: string; images?: boolean }
 export interface PromptView { kind: string; title?: string }
 export interface StateView {
   idle: boolean;
@@ -92,7 +108,8 @@ export interface SessionView {
 }
 export interface Caps {
   commands: readonly CommandName[];
-  images: false;
+  /** Prompt image upload and on-demand history images. */
+  images: boolean;
   promptReceipt: "dispatch_only";
   queueView: "boolean";
   terminalDialogs: true;
@@ -165,6 +182,23 @@ export interface ContentPageRequest {
   index: number;
   offset: number;
 }
+export interface ImagePageRequest {
+  t: "image_page";
+  reqId: string;
+  epoch: string;
+  messageId: string;
+  index: number;
+}
+export interface ImagePage {
+  t: "image_page";
+  reqId: string;
+  epoch: string;
+  messageId: string;
+  index: number;
+  mimeType: string;
+  /** Base64 image bytes. */
+  data: string;
+}
 export interface HistoryPage {
   t: "history_page";
   reqId: string;
@@ -190,6 +224,7 @@ export type ClientMessage =
   | { t: "receipt_query"; clientId: string; id: string }
   | HistoryPageRequest
   | ContentPageRequest
+  | ImagePageRequest
   | CommandEnvelope;
 export type ServerMessage =
   | { t: "welcome"; clientId: string; leaseExpiresAt: number; nextCommandNo: number }
@@ -202,7 +237,8 @@ export type ServerMessage =
   | Ack
   | CommandResult
   | HistoryPage
-  | ContentPage;
+  | ContentPage
+  | ImagePage;
 /** Transport framing for logical frames above LIMITS.frameBytes. Never interleaved with other frames. */
 export type ChunkFrame =
   | { t: "frame_begin"; id: string; parts: number }
@@ -237,6 +273,9 @@ export function parseClientMessage(value: unknown): ClientMessage {
   if (value.t === "content_page" && exactKeys(value, ["t", "reqId", "epoch", "messageId", "index", "offset"]) &&
       shortString(value.reqId, 64) && shortString(value.epoch) && shortString(value.messageId) &&
       nonNegativeInt(value.index) && (value.index as number) < 1024 && nonNegativeInt(value.offset)) return value as unknown as ContentPageRequest;
+  if (value.t === "image_page" && exactKeys(value, ["t", "reqId", "epoch", "messageId", "index"]) &&
+      shortString(value.reqId, 64) && shortString(value.epoch) && shortString(value.messageId) &&
+      nonNegativeInt(value.index) && (value.index as number) < 1024) return value as unknown as ImagePageRequest;
   if (value.t === "command" && exactKeys(value, ["t", "clientId", "commandNo", "id", "epoch", "sessionId", "branchRevision", "command", "args"]) &&
       shortString(value.clientId) && shortString(value.id) && shortString(value.epoch) && shortString(value.sessionId) &&
       shortString(value.command, 64) && Number.isSafeInteger(value.commandNo) && (value.commandNo as number) >= 1 &&
@@ -247,10 +286,11 @@ export function parseClientMessage(value: unknown): ClientMessage {
 export function commandArgs(command: string, value: unknown): Record<string, unknown> {
   if (!isRecord(value)) throw new ProtocolError("invalid_args", "Command args must be an object.");
   if (command === "prompt") {
-    if (!exactKeys(value, ["text", "mode"]) || !shortString(value.text, 65_536) ||
-      !value.text.trim() || new TextEncoder().encode(value.text).length > 65_536 ||
+    const images = value.images === undefined ? [] : validateImages(value.images);
+    if (!exactKeys(value, ["text", "mode", "images"]) || typeof value.text !== "string" || value.text.length > LIMITS.promptBytes ||
+      (!value.text.trim() && !images.length) || new TextEncoder().encode(value.text).length > LIMITS.promptBytes ||
       (value.mode !== undefined && value.mode !== "steer" && value.mode !== "followUp"))
-      throw new ProtocolError("invalid_args", "Provide nonempty text up to 64 KiB; image upload is not available yet.");
+      throw new ProtocolError("invalid_args", "Provide text up to 64 KiB, or at least one image.");
   } else if (command === "set_model") {
     if (!exactKeys(value, ["provider", "id"]) || !shortString(value.provider) || !shortString(value.id))
       throw new ProtocolError("invalid_args", "Provide a model provider and ID.");
@@ -262,6 +302,124 @@ export function commandArgs(command: string, value: unknown): Record<string, unk
   } else throw new ProtocolError("unknown_command", "Unknown command.");
   return value;
 }
+// ---------------------------------------------------------------------------
+// Images. Shared by the browser (before upload) and the extension (before dispatch).
+// ---------------------------------------------------------------------------
+
+export interface PromptImage { mimeType: ImageType; data: string }
+export interface ImageInfo { mimeType: ImageType; width: number; height: number }
+
+// A single character class scans linearly; grouped quantifiers overflow the stack on megabyte inputs.
+const NOT_BASE64 = /[^A-Za-z0-9+/]/;
+/** Decoded length of padded base64, or -1 when the text is not padded base64. */
+export function base64Length(data: string): number {
+  const padding = data.endsWith("==") ? 2 : data.endsWith("=") ? 1 : 0;
+  if (data.length % 4 !== 0 || NOT_BASE64.test(data.slice(0, data.length - padding))) return -1;
+  return data.length / 4 * 3 - padding;
+}
+export function decodeBase64(data: string, maxBytes = Infinity): Uint8Array {
+  const length = Math.min(base64Length(data), maxBytes);
+  const prefix = maxBytes === Infinity ? data : data.slice(0, Math.ceil(maxBytes / 3) * 4);
+  const globals = globalThis as { Buffer?: { from(text: string, encoding: string): Uint8Array } };
+  if (globals.Buffer) return globals.Buffer.from(prefix, "base64").subarray(0, length);
+  const binary = atob(prefix);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+  return bytes.subarray(0, length);
+}
+
+const CRC_TABLE = (() => {
+  const table = new Uint32Array(256);
+  for (let n = 0; n < 256; n++) {
+    let c = n;
+    for (let k = 0; k < 8; k++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1;
+    table[n] = c >>> 0;
+  }
+  return table;
+})();
+function crc32(bytes: Uint8Array, start: number, end: number): number {
+  let c = 0xffffffff;
+  for (let i = start; i < end; i++) c = CRC_TABLE[(c ^ bytes[i]!) & 0xff]! ^ (c >>> 8);
+  return (c ^ 0xffffffff) >>> 0;
+}
+const u16be = (b: Uint8Array, i: number) => (b[i]! << 8) | b[i + 1]!;
+const u32be = (b: Uint8Array, i: number) => ((b[i]! << 24) | (b[i + 1]! << 16) | (b[i + 2]! << 8) | b[i + 3]!) >>> 0;
+const u32le = (b: Uint8Array, i: number) => (b[i]! | (b[i + 1]! << 8) | (b[i + 2]! << 16) | (b[i + 3]! << 24)) >>> 0;
+const ascii = (b: Uint8Array, i: number, n: number) => String.fromCharCode(...b.subarray(i, i + n));
+
+/**
+ * Identifies PNG, JPEG or WebP from the file structure (not the declared type) and reads its dimensions.
+ * `complete` also checks the end of the file, so truncated uploads fail; header-only reads skip it.
+ */
+export function inspectImage(bytes: Uint8Array, complete = true): ImageInfo | null {
+  if (bytes.length >= 33 && u32be(bytes, 0) === 0x89504e47 && u32be(bytes, 4) === 0x0d0a1a0a) {
+    if (u32be(bytes, 8) !== 13 || ascii(bytes, 12, 4) !== "IHDR" || crc32(bytes, 12, 29) !== u32be(bytes, 29)) return null;
+    if (complete && (bytes.length < 45 || ascii(bytes, bytes.length - 8, 4) !== "IEND" || u32be(bytes, bytes.length - 12) !== 0)) return null;
+    return { mimeType: "image/png", width: u32be(bytes, 16), height: u32be(bytes, 20) };
+  }
+  if (bytes.length >= 4 && bytes[0] === 0xff && bytes[1] === 0xd8 && bytes[2] === 0xff) {
+    let i = 2;
+    while (i + 4 <= bytes.length) {
+      if (bytes[i] !== 0xff) return null;
+      const marker = bytes[i + 1]!;
+      if (marker === 0xff) { i++; continue; }
+      if (marker === 0xd8 || marker === 0x01 || (marker >= 0xd0 && marker <= 0xd7)) { i += 2; continue; }
+      if (marker === 0xd9 || marker === 0xda) return null; // Image data before any frame header.
+      const length = u16be(bytes, i + 2);
+      if (length < 2 || i + 2 + length > bytes.length) return null;
+      if (marker >= 0xc0 && marker <= 0xcf && marker !== 0xc4 && marker !== 0xc8 && marker !== 0xcc) {
+        if (length < 7) return null;
+        if (complete && !(bytes[bytes.length - 2] === 0xff && bytes[bytes.length - 1] === 0xd9) && !hasEoi(bytes)) return null;
+        return { mimeType: "image/jpeg", width: u16be(bytes, i + 7), height: u16be(bytes, i + 5) };
+      }
+      i += 2 + length;
+    }
+    return null;
+  }
+  if (bytes.length >= 30 && ascii(bytes, 0, 4) === "RIFF" && ascii(bytes, 8, 4) === "WEBP") {
+    if (complete && u32le(bytes, 4) + 8 !== bytes.length) return null;
+    const chunk = ascii(bytes, 12, 4);
+    if (chunk === "VP8 " && bytes[23] === 0x9d && bytes[24] === 0x01 && bytes[25] === 0x2a)
+      return { mimeType: "image/webp", width: (bytes[26]! | (bytes[27]! << 8)) & 0x3fff, height: (bytes[28]! | (bytes[29]! << 8)) & 0x3fff };
+    if (chunk === "VP8L" && bytes[20] === 0x2f) {
+      const bits = u32le(bytes, 21);
+      return { mimeType: "image/webp", width: (bits & 0x3fff) + 1, height: ((bits >>> 14) & 0x3fff) + 1 };
+    }
+    if (chunk === "VP8X")
+      return { mimeType: "image/webp", width: (bytes[24]! | (bytes[25]! << 8) | (bytes[26]! << 16)) + 1, height: (bytes[27]! | (bytes[28]! << 8) | (bytes[29]! << 16)) + 1 };
+    return null;
+  }
+  return null;
+}
+/** Some encoders append padding after the end-of-image marker. */
+function hasEoi(bytes: Uint8Array): boolean {
+  for (let i = bytes.length - 2; i >= Math.max(2, bytes.length - 4096); i--) if (bytes[i] === 0xff && bytes[i + 1] === 0xd9) return true;
+  return false;
+}
+
+/** Validates prompt images: count, type, canonical base64, size, structure and decoded pixel count. */
+export function validateImages(value: unknown): PromptImage[] {
+  if (!Array.isArray(value) || value.length > LIMITS.maxImages)
+    throw new ProtocolError("invalid_image", `Attach at most ${LIMITS.maxImages} images.`);
+  let total = 0;
+  return value.map((image, index) => {
+    const label = `Image ${index + 1}`;
+    if (!isRecord(image) || !exactKeys(image, ["mimeType", "data"]) || !IMAGE_TYPES.includes(image.mimeType as ImageType) || typeof image.data !== "string")
+      throw new ProtocolError("invalid_image", `${label}: only PNG, JPEG and WebP images are accepted.`);
+    const size = base64Length(image.data);
+    if (size <= 0) throw new ProtocolError("invalid_image", `${label}: the data is not valid base64.`);
+    if (size > LIMITS.imageBytes) throw new ProtocolError("image_too_large", `${label} exceeds 5 MiB.`);
+    total += size;
+    if (total > LIMITS.imagesTotalBytes) throw new ProtocolError("image_too_large", "Images exceed 10 MiB in total.");
+    const info = inspectImage(decodeBase64(image.data));
+    if (!info) throw new ProtocolError("invalid_image", `${label} is damaged or not a PNG, JPEG or WebP file.`);
+    if (info.mimeType !== image.mimeType) throw new ProtocolError("invalid_image", `${label} is ${info.mimeType}, not ${image.mimeType}.`);
+    if (!info.width || !info.height || info.width * info.height > LIMITS.imagePixels)
+      throw new ProtocolError("image_too_large", `${label} exceeds 20 million pixels.`);
+    return { mimeType: info.mimeType, data: image.data };
+  });
+}
+
 export function toWireError(error: unknown): WireError {
   return error instanceof ProtocolError
     ? { code: error.code, message: error.message }

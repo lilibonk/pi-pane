@@ -1,9 +1,10 @@
 import { render } from "preact";
-import { useEffect, useMemo, useRef, useState } from "preact/hooks";
+import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "preact/hooks";
 import type { JSX } from "preact";
+import { IMAGE_TYPES } from "../protocol/index.js";
 import {
-  forgetSubmission, issueCommand, loadOlder, queryReceipt, reconnect, setDraft, startConnection, submitPrompt,
-  webStore, type MessageView, type Submission, type ToolView, type WebState,
+  addImages, forgetSubmission, issueCommand, loadOlder, login, logout, queryReceipt, reconnect, removeAttachment, setDraft,
+  startConnection, submitPrompt, webStore, type Attachment, type MessageView, type Submission, type ToolView, type WebState,
 } from "./store.js";
 import { Message, ToolCard, type ToolContext } from "./messages.js";
 import "./style.css";
@@ -39,6 +40,7 @@ function Receipts({ items, online, onRecover }: { items: Submission[]; online: b
             <div class="receipt-header"><strong>{item.command === "prompt" ? item.mode === "steer" ? "steer" : "followUp" : item.command}</strong><span>{receiptLabel(item)}</span><time>{new Date(item.at).toLocaleTimeString("zh-CN", { hour12: false })}</time></div>
             {item.explanation && <p>{item.explanation}</p>}
             {item.text !== undefined && <pre>{item.text}</pre>}
+            {!!item.images?.length && <p class="subtle">附带图片：{item.images.join("、")}（图片不保留，恢复时需重新添加）</p>}
             <div class="receipt-actions">
               {item.text !== undefined && <button type="button" onClick={() => onRecover(item.text!)}>恢复到输入框</button>}
               {(item.status === "unknown" || item.status === "sent") && <button type="button" disabled={!online} onClick={() => queryReceipt(item.id)}>查询回执</button>}
@@ -52,7 +54,43 @@ function Receipts({ items, online, onRecover }: { items: Submission[]; online: b
   );
 }
 
-const labels = { connecting: "连接中", online: "已连接", resyncing: "同步中", switching: "切换中", disconnected: "已断开", fatal: "需重新连接" };
+const labels = { connecting: "连接中", login: "需要登录", online: "已连接", resyncing: "同步中", switching: "切换中", disconnected: "已断开", fatal: "需重新连接" };
+/** Messages kept in the DOM while following the latest output; older ones are mounted on demand. */
+const WINDOW = 200;
+const WINDOW_STEP = 100;
+/** Touch keyboards have no reliable Shift+Enter; Enter inserts a newline and the buttons submit. */
+const coarsePointer = typeof matchMedia === "function" && matchMedia("(pointer: coarse)").matches;
+
+function Login({ state }: { state: WebState }) {
+  const [password, setPassword] = useState("");
+  return (
+    <form class="login" onSubmit={event => { event.preventDefault(); if (password) void login(password); }}>
+      <span class="empty-pi">π</span>
+      <h2>登录 pi-pane</h2>
+      <p>此链接用于外部访问。请输入启动 pi 时设置的 PI_PANE_PASSWORD。密码不会保存在浏览器中。</p>
+      <input type="password" autocomplete="current-password" aria-label="访问密码" placeholder="访问密码" value={password}
+        onInput={event => setPassword(event.currentTarget.value)} disabled={state.loginBusy} />
+      <button type="submit" class="send-button" disabled={!password || state.loginBusy}>{state.loginBusy ? "正在登录…" : "登录"}</button>
+      {state.loginError && <p class="error-text" role="alert">{state.loginError}</p>}
+    </form>
+  );
+}
+
+function Attachments({ items, error }: { items: Attachment[]; error: string }) {
+  if (!items.length && !error) return null;
+  return (
+    <div class="attachments">
+      {items.map(item => (
+        <figure class="attachment" key={item.id} data-attachment-id={item.id}>
+          <img src={item.url} alt={item.name} />
+          <figcaption title={item.name}>{item.width}×{item.height}</figcaption>
+          <button type="button" aria-label={`移除 ${item.name}`} onClick={() => removeAttachment(item.id)}>×</button>
+        </figure>
+      ))}
+      {error && <p class="error-text attachment-error" role="alert">{error}</p>}
+    </div>
+  );
+}
 function hexLuminance(value: string): number | undefined {
   if (!/^#[0-9a-f]{6}$/i.test(value)) return undefined;
   const channels = [1, 3, 5].map(offset => {
@@ -66,7 +104,13 @@ function App() {
   const state = useWebState();
   const { snapshot, connection } = state;
   const textarea = useRef<HTMLTextAreaElement>(null);
+  const fileInput = useRef<HTMLInputElement>(null);
   const feed = useRef<HTMLDivElement>(null);
+  const feedInner = useRef<HTMLDivElement>(null);
+  const [windowSize, setWindowSize] = useState(WINDOW);
+  const [dragging, setDragging] = useState(false);
+  const previousCount = useRef(0);
+  const anchor = useRef<{ height: number; top: number } | null>(null);
   const pinned = useRef(true);
   const composing = useRef(false);
   const compositionEndedAt = useRef(0);
@@ -90,6 +134,32 @@ function App() {
     const orphans = (host?.tools ?? []).filter(tool => !called.has(tool.id) && !results.has(tool.id));
     return { tools: { results, live } as ToolContext, visible, orphans };
   }, [messages, host?.tools]);
+  // Windowed list: while following the latest output only the newest WINDOW messages stay mounted.
+  // When the reader scrolls up, or older history is loaded, the window grows so nothing moves underfoot.
+  useEffect(() => {
+    const grown = view.visible.length - previousCount.current;
+    previousCount.current = view.visible.length;
+    if (grown > 0 && !pinned.current) setWindowSize(size => size + grown);
+  }, [view.visible.length]);
+  useEffect(() => { setWindowSize(WINDOW); previousCount.current = 0; }, [snapshot?.epoch]);
+  const start = Math.max(0, view.visible.length - windowSize);
+  const shown = start ? view.visible.slice(start) : view.visible;
+  function showEarlier() {
+    if (feed.current) anchor.current = { height: feed.current.scrollHeight, top: feed.current.scrollTop };
+    setWindowSize(size => size + WINDOW_STEP);
+  }
+  useLayoutEffect(() => {
+    // Keep the reader's position when earlier messages are mounted above it.
+    if (!anchor.current || !feed.current) return;
+    feed.current.scrollTop = anchor.current.top + feed.current.scrollHeight - anchor.current.height;
+    anchor.current = null;
+  }, [windowSize]);
+  const attachImages = (files: readonly File[]) => {
+    const images = files.filter(file => IMAGE_TYPES.includes(file.type as never) || file.type.startsWith("image/"));
+    if (images.length) void addImages(images);
+    return images.length > 0;
+  };
+  const canAttach = canPrompt && !!snapshot?.caps.images;
 
   useEffect(() => { startConnection(); }, []);
   useEffect(() => {
@@ -131,22 +201,40 @@ function App() {
     if (!feed.current || !pinned.current) return;
     feed.current.scrollTop = feed.current.scrollHeight;
   }, [state.lastAppliedSeq, snapshot?.epoch]);
+  useEffect(() => {
+    // Off-screen messages start at an estimated size (content-visibility) and images settle later;
+    // a reader following the latest output stays at the bottom as the real sizes arrive.
+    const inner = feedInner.current;
+    if (!inner || typeof ResizeObserver === "undefined") return;
+    const observer = new ResizeObserver(() => { if (pinned.current && feed.current) feed.current.scrollTop = feed.current.scrollHeight; });
+    observer.observe(inner);
+    return () => observer.disconnect();
+  }, [connection === "login"]);
 
   function handleScroll() {
     const element = feed.current;
     if (!element) return;
     pinned.current = element.scrollHeight - element.scrollTop - element.clientHeight < 100;
     setShowLatest(!pinned.current);
+    if (pinned.current && windowSize > WINDOW) setWindowSize(WINDOW);
+    if (start > 0 && element.scrollTop < 200 && !anchor.current) showEarlier();
   }
   function goLatest() {
-    pinned.current = true; setShowLatest(false);
+    pinned.current = true; setShowLatest(false); setWindowSize(WINDOW);
     if (feed.current) feed.current.scrollTop = feed.current.scrollHeight;
+  }
+  function olderPage() {
+    // Mount the loaded page as well: the reader asked for it.
+    setWindowSize(size => Math.max(size, view.visible.length) + 1000);
+    pinned.current = false;
+    loadOlder();
   }
   function submit(mode: "followUp" | "steer") {
     if (!canPrompt || composing.current) return;
     submitPrompt(mode); goLatest(); textarea.current?.focus();
   }
   function onKeyDown(event: JSX.TargetedKeyboardEvent<HTMLTextAreaElement>) {
+    if (coarsePointer && !event.metaKey && !event.ctrlKey) return;
     if (event.key !== "Enter" || event.shiftKey || event.isComposing || event.keyCode === 229 || composing.current || Date.now() - compositionEndedAt.current < 80) return;
     event.preventDefault();
     submit(event.metaKey || event.ctrlKey ? "steer" : "followUp");
@@ -155,8 +243,11 @@ function App() {
   return (
     <div class="app-shell">
       <header class="topbar">
-        <div class="brand"><span class="brand-icon">π</span><span>pi-pane</span><span class="milestone">M1</span></div>
-        <div class="connection"><span class={`status-dot status-${connection}`} /><span>{labels[connection]}</span></div>
+        <div class="brand"><span class="brand-icon">π</span><span>pi-pane</span><span class="milestone">M2</span></div>
+        <div class="connection">
+          <span class={`status-dot status-${connection}`} /><span>{labels[connection]}</span>
+          {state.authMode === "password" && connection !== "login" && <button type="button" class="quiet logout-button" onClick={() => void logout()}>退出登录</button>}
+        </div>
       </header>
       <div class="session-bar">
         <div class="session-identity"><h1>{snapshot?.session.name || "当前 pi 会话"}</h1><p title={snapshot?.session.cwd}>{snapshot?.session.cwd || "在浏览器中继续当前终端会话"}</p></div>
@@ -166,13 +257,15 @@ function App() {
           {snapshot && <span class="mono">分支 {snapshot.session.branchRevision} · seq {state.lastAppliedSeq}</span>}
         </div>
       </div>
+      {connection === "login" ? <div class="timeline"><div class="timeline-inner"><Login state={state} />{state.notice && <p class="login-notice" role="status">{state.notice}</p>}</div></div> : <>
       {state.notice && <div class={`notice notice-${connection}`} role="status"><span>{state.notice}</span>{(connection === "disconnected" || connection === "fatal") && <button type="button" onClick={reconnect}>重新连接</button>}</div>}
       {!!host?.uiPrompts.length && <div class="terminal-notice" role="status"><strong>请在终端处理对话框</strong>{host.uiPrompts.map((prompt, i) => <span key={i}>{prompt.title || prompt.kind}</span>)}</div>}
       <div class="timeline" ref={feed} onScroll={handleScroll} aria-live="off" aria-label="当前分支会话历史">
-        <div class="timeline-inner">
-          {snapshot?.session.olderCursor && <div class="history-limit"><button type="button" disabled={state.historyLoading || !online} onClick={loadOlder}>{state.historyLoading ? "正在加载更早的消息…" : "加载更早的消息"}</button>{state.historyError && <span>{state.historyError}</span>}</div>}
+        <div class="timeline-inner" ref={feedInner}>
+          {start > 0 && <div class="history-limit"><button type="button" onClick={showEarlier}>显示更早的 {Math.min(start, WINDOW_STEP)} 条（已在浏览器中）</button></div>}
+          {!start && snapshot?.session.olderCursor && <div class="history-limit"><button type="button" disabled={state.historyLoading || !online} onClick={olderPage}>{state.historyLoading ? "正在加载更早的消息…" : "加载更早的消息"}</button>{state.historyError && <span>{state.historyError}</span>}</div>}
           {!snapshot ? <div class="empty-state"><span class="empty-pi">π</span><h2>{connection === "switching" ? "等待新会话" : "连接当前会话"}</h2><p>在终端输入 /web 后，当前分支和正在生成的内容会显示在这里。</p></div> : !snapshot.session.messages.length && !host?.tools.length ? <div class="empty-state"><span class="empty-pi">π</span><h2>可以开始了</h2><p>终端与浏览器共享同一个会话。发送消息后，pi 的实际输出会出现在这里。</p></div> : null}
-          {view.visible.map(message => <Message key={message.id} message={message} tools={view.tools} expansions={state.expansions} />)}
+          {shown.map(message => <Message key={message.id} message={message} tools={view.tools} expansions={state.expansions} />)}
           {!!view.orphans.length && <div class="tools"><div class="section-label">工具执行</div>{view.orphans.map(tool => <ToolCard key={tool.id} live={tool} expansions={state.expansions} />)}</div>}
           {host?.running && <div class="running-line"><span class="running-indicator" />pi 正在运行</div>}
         </div>
@@ -185,14 +278,22 @@ function App() {
             <label><span>thinking</span><select aria-label="thinking 等级" value={host?.thinking ?? "off"} disabled={!canConfigure || !snapshot?.caps.commands.includes("set_thinking")} onChange={event => issueCommand("set_thinking", { level: event.currentTarget.value })}>{["off", "minimal", "low", "medium", "high", "xhigh", "max"].map(level => <option value={level} key={level}>{level}</option>)}</select></label>
             <button type="button" class="compact-button" disabled={!canConfigure || !!host?.hasPendingMessages || !snapshot?.caps.commands.includes("compact")} onClick={() => issueCommand("compact")}>压缩上下文</button>
           </div>
-          <div class={`composer ${!canPrompt ? "composer-disabled" : ""}`}>
-            <textarea ref={textarea} aria-label="消息" rows={3} placeholder={host?.running ? "补充下一步… Enter 请求 followUp；⌘ / Ctrl + Enter 请求 steer" : "给 pi 发送消息…"} value={state.draft} onInput={event => setDraft(event.currentTarget.value)} onKeyDown={onKeyDown} />
-            <div class="composer-actions"><span class="input-hint">Enter 发送 · Shift + Enter 换行</span><div class="action-buttons">{host && !host.idle && <button type="button" class="abort-button" disabled={!online || !snapshot?.caps.commands.includes("abort")} onClick={() => issueCommand("abort")}>■ 中止</button>}<button type="button" class="steer-button" disabled={!canPrompt || !state.draft.trim()} onClick={() => submit("steer")} title="⌘ / Ctrl + Enter">steer</button><button type="button" class="send-button" disabled={!canPrompt || !state.draft.trim()} onClick={() => submit("followUp")}>{host?.running ? "请求 followUp ↗" : "发送 ↗"}</button></div></div>
+          <div class={`composer ${!canPrompt ? "composer-disabled" : ""} ${dragging ? "composer-dragging" : ""}`}
+            onDragOver={event => { if (canAttach && event.dataTransfer?.types.includes("Files")) { event.preventDefault(); setDragging(true); } }}
+            onDragLeave={() => setDragging(false)}
+            onDrop={event => { setDragging(false); if (!canAttach || !event.dataTransfer?.files.length) return; event.preventDefault(); attachImages([...event.dataTransfer.files]); }}>
+            <Attachments items={state.attachments} error={state.attachmentError} />
+            {!!state.attachments.length && host?.model?.images === false && <p class="warn-text">当前模型未声明支持图片输入，pi 可能会忽略这些图片。</p>}
+            <textarea ref={textarea} aria-label="消息" rows={3} placeholder={host?.running ? coarsePointer ? "补充下一步…" : "补充下一步… Enter 请求 followUp；⌘ / Ctrl + Enter 请求 steer" : "给 pi 发送消息…"} value={state.draft} onInput={event => setDraft(event.currentTarget.value)} onKeyDown={onKeyDown}
+              onPaste={event => { if (canAttach && event.clipboardData?.files.length && attachImages([...event.clipboardData.files])) event.preventDefault(); }} />
+            <input ref={fileInput} type="file" accept={IMAGE_TYPES.join(",")} multiple hidden onChange={event => { attachImages([...(event.currentTarget.files ?? [])]); event.currentTarget.value = ""; }} />
+            <div class="composer-actions"><span class="input-hint">{coarsePointer ? "Enter 换行 · 按钮发送" : "Enter 发送 · Shift + Enter 换行 · 可粘贴或拖入图片"}</span><div class="action-buttons"><button type="button" class="attach-button" disabled={!canAttach || state.attachments.length >= 4} onClick={() => fileInput.current?.click()} aria-label="添加图片">图片</button>{host && !host.idle && <button type="button" class="abort-button" disabled={!online || !snapshot?.caps.commands.includes("abort")} onClick={() => issueCommand("abort")}>■ 中止</button>}<button type="button" class="steer-button" disabled={!canPrompt || (!state.draft.trim() && !state.attachments.length)} onClick={() => submit("steer")} title="⌘ / Ctrl + Enter">steer</button><button type="button" class="send-button" disabled={!canPrompt || (!state.draft.trim() && !state.attachments.length)} onClick={() => submit("followUp")}>{host?.running ? "请求 followUp ↗" : "发送 ↗"}</button></div></div>
           </div>
           <p class="scope-note">网页按原文提交，不执行 slash 命令，也不展开模板 / skill。回执只确认已交给 pi。</p>
           <Receipts items={state.submissions} online={online} onRecover={text => { setDraft(text); textarea.current?.focus(); }} />
         </div>
       </footer>
+      </>}
     </div>
   );
 }

@@ -38,7 +38,7 @@ async function freePort() {
 export async function startFixture({ autoWeb = true, extraExtensions = [], settings = {}, envOverrides = {}, disablePane = false,
   provider = "pi-pane-m0", model = "deterministic" } = {}) {
   if (process.platform === "win32") throw new Error("The M0 real-TUI harness requires a POSIX PTY (macOS or Linux).");
-  for (const key of Object.keys(envOverrides)) if (!key.startsWith("PI_M0_")) throw new Error(`Fixture env override is not allowed: ${key}`);
+  for (const key of Object.keys(envOverrides)) if (!key.startsWith("PI_M0_") && key !== "PI_PANE_PASSWORD") throw new Error(`Fixture env override is not allowed: ${key}`);
   const cli = process.env.PI_M0_CLI || join(dirname(fileURLToPath(import.meta.resolve("@earendil-works/pi-coding-agent"))), "cli.js");
   const extension = resolve(process.env.PI_M0_EXTENSION || join(project, "src/extension/index.ts"));
   const directory = await mkdtemp(join(tmpdir(), "pi-pane-m0-"));
@@ -90,6 +90,8 @@ export async function startFixture({ autoWeb = true, extraExtensions = [], setti
       fixture.terminal = (fixture.terminal + item.data).slice(-1_000_000);
       const urls = [...stripAnsi(fixture.terminal).matchAll(/http:\/\/127\.0\.0\.1:\d+\/#t=[A-Za-z0-9_-]+/g)];
       if (urls.length) fixture.url = urls.at(-1)[0];
+      const external = [...stripAnsi(fixture.terminal).matchAll(/https:\/\/[A-Za-z0-9.-]+(?::\d+)?\/#t=[A-Za-z0-9_-]{43}/g)];
+      if (external.length) fixture.publicUrl = external.at(-1)[0];
       // Answer terminal capability queries so TUI startup does not depend on a real emulator.
       if (item.data.includes("\u001b[6n")) fixture.write("\u001b[1;1R");
     } else if (item.type === "exit") fixture.exitCode = item.code;

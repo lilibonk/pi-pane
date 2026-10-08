@@ -2,8 +2,8 @@ import { randomUUID } from "node:crypto";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { colorToHex } from "@earendil-works/pi-tui";
 import {
-  COMMANDS, LIMITS, ProtocolError, commandArgs, diffMessage, encodedSize, isRecord, toWireError,
-  type CommandResult, type ContentPage, type ContentView, type HistoryPage, type MessageView, type ModelView,
+  COMMANDS, LIMITS, ProtocolError, base64Length, commandArgs, decodeBase64, diffMessage, encodedSize, inspectImage, isRecord, toWireError,
+  type CommandResult, type ContentPage, type ContentView, type HistoryPage, type ImagePage, type MessageView, type ModelView, type PromptImage,
   type ProjectionEvent, type Snapshot, type StateView, type ToolView,
 } from "../protocol/index.js";
 
@@ -29,12 +29,15 @@ type SnapshotBody = Omit<Snapshot, "t" | "epoch" | "seq">;
 type Completion = (result: Pick<CommandResult, "status" | "value" | "error">) => void;
 type RawBlock =
   | { type: "text" | "thinking" | "diff"; text: string }
-  | { type: "toolCall"; id: string; name: string; arguments: unknown };
+  | { type: "toolCall"; id: string; name: string; arguments: unknown }
+  | { type: "image"; mimeType: string; data: string };
 interface BranchItem { entryId: string; id: string; source: Record<string, unknown> }
 
 const MAX_BLOCKS = 128;
 const CANONICAL_TAIL = 32;
 const SENT_FINAL_LIMIT = 512;
+/** Enough of an image to read its dimensions without decoding the whole file. */
+const IMAGE_HEADER_BYTES = 256 * 1024;
 
 function textOf(value: unknown): string {
   if (typeof value === "string") return value;
@@ -205,9 +208,12 @@ export class Bridge {
       if (part.type === "text") text(String(part.text ?? ""));
       else if (part.type === "thinking") text(String(part.thinking ?? part.text ?? ""), "thinking");
       else if (part.type === "toolCall") blocks.push({ type: "toolCall", id: String(part.id ?? "").slice(0, 256), name: String(part.name ?? "tool").slice(0, 256), arguments: part.arguments });
-      else if (part.type === "image") text("[Image — not shown in the browser yet]");
+      else if (part.type === "image") {
+        if (typeof part.data === "string" && typeof part.mimeType === "string") blocks.push({ type: "image", mimeType: part.mimeType.slice(0, 64), data: part.data });
+        else text("[Image unavailable]");
+      }
     }
-    const hasBody = blocks.some((block) => block.type === "toolCall" || block.text.length > 0);
+    const hasBody = blocks.some((block) => block.type === "toolCall" || block.type === "image" || block.text.length > 0);
     if ((!parts.length || !hasBody || message.role === "bashExecution") && typeof message.output === "string") text(message.output);
     if (typeof message.errorMessage === "string") text(message.errorMessage);
     // Whitelisted structured details: the unified patch of pi's edit tool.
@@ -222,6 +228,13 @@ export class Bridge {
       return { arguments: JSON.parse(json) as unknown };
     } catch { return { arguments: { unavailable: true } }; }
   }
+  /** Metadata only: the bytes stay in the host and are read through image_page. */
+  private imageView(block: Extract<RawBlock, { type: "image" }>): ContentView {
+    const bytes = Math.max(0, base64Length(block.data));
+    let info: ReturnType<typeof inspectImage> = null;
+    try { if (bytes) info = inspectImage(decodeBase64(block.data, IMAGE_HEADER_BYTES), false); } catch { /* metadata is optional */ }
+    return { type: "image", mimeType: info?.mimeType ?? block.mimeType, bytes, ...(info ? { width: info.width, height: info.height } : {}) };
+  }
   private normalize(message: unknown, id: string, complete: boolean, entryId?: string): MessageView | undefined {
     if (!isRecord(message)) return undefined;
     if (message.role === "custom" && message.display !== true) return undefined;
@@ -234,13 +247,14 @@ export class Bridge {
         remaining = Math.max(0, remaining - Math.min(remaining, JSON.stringify(preview.arguments).length));
         return { type: "toolCall", id: block.id, name: block.name, ...preview };
       }
+      if (block.type === "image") return this.imageView(block);
       const text = block.text.slice(0, remaining);
       remaining -= text.length;
       return { type: block.type, text, ...(block.text.length > text.length ? { total: block.text.length } : {}) };
     });
     // Pi records structured prompt/tool updates as system messages with content="".
     // Native TUI skips these internal updates; retain genuine nonempty system content.
-    if (message.role === "system" && !content.some((part) => part.type === "toolCall" || part.text.trim().length > 0 || part.total)) return undefined;
+    if (message.role === "system" && !content.some((part) => part.type === "toolCall" || part.type === "image" || part.text.trim().length > 0 || part.total)) return undefined;
     return {
       id, ...(entryId ? { entryId } : {}), role: String(message.role ?? "custom"), content,
       status: complete ? "complete" : "streaming",
@@ -469,8 +483,8 @@ export class Bridge {
     this.refreshBranch();
     this.observer?.reset(reason);
   }
-  private modelView(model: { provider: string; id: string; name: string }): ModelView {
-    return { provider: model.provider, id: model.id, name: model.name };
+  private modelView(model: { provider: string; id: string; name: string; input?: readonly string[] }): ModelView {
+    return { provider: model.provider, id: model.id, name: model.name, ...(Array.isArray(model.input) ? { images: model.input.includes("image") } : {}) };
   }
   private state(): StateView {
     const ctx = this.options.ctx;
@@ -525,7 +539,7 @@ export class Bridge {
         messages: window.messages, olderCursor: window.olderCursor,
       },
       state: this.state(), theme: this.theme(),
-      caps: { commands: COMMANDS, images: false, promptReceipt: "dispatch_only", queueView: "boolean", terminalDialogs: true, history: "paged", content: "paged" },
+      caps: { commands: COMMANDS, images: true, promptReceipt: "dispatch_only", queueView: "boolean", terminalDialogs: true, history: "paged", content: "paged" },
     });
   }
   /** Older persisted messages strictly before `before`, newest page first in budget, returned in order. */
@@ -559,12 +573,28 @@ export class Bridge {
     const source = branchIndex !== undefined ? this.branch[branchIndex]!.source : live?.source;
     if (!source) throw new ProtocolError("content_unavailable", "The message is no longer retained by this session view.");
     const block = this.rawBlocks(source).blocks[index];
-    if (!block || block.type === "toolCall") throw new ProtocolError("content_unavailable", "This block has no readable text.");
+    if (!block || block.type === "toolCall" || block.type === "image") throw new ProtocolError("content_unavailable", "This block has no readable text.");
     if (offset > block.text.length) throw new ProtocolError("invalid_args", "Offset is beyond the end of the block.");
     return {
       messageId, index, offset, text: block.text.slice(offset, offset + LIMITS.contentPageChars), total: block.text.length,
       final: branchIndex !== undefined || live?.view.status === "complete",
     };
+  }
+  /** The bytes of one image block. Never accepts file paths. */
+  imagePage(messageId: string, index: number): Omit<ImagePage, "t" | "reqId" | "epoch"> {
+    this.assertCurrent();
+    this.refreshBranch();
+    const branchIndex = this.branchById.get(messageId);
+    const source = branchIndex !== undefined ? this.branch[branchIndex]!.source : this.live.get(messageId)?.source;
+    if (!source) throw new ProtocolError("content_unavailable", "The message is no longer retained by this session view.");
+    const block = this.rawBlocks(source).blocks[index];
+    if (!block || block.type !== "image") throw new ProtocolError("content_unavailable", "This block is not an image.");
+    const bytes = base64Length(block.data);
+    if (bytes <= 0) throw new ProtocolError("invalid_image", "The stored image data is not valid base64.");
+    if (bytes > LIMITS.imageReadBytes) throw new ProtocolError("image_too_large", "The image exceeds the browser transfer limit; view it in the terminal.");
+    const info = inspectImage(decodeBase64(block.data, IMAGE_HEADER_BYTES), false);
+    if (!info) throw new ProtocolError("invalid_image", "The stored image is not a PNG, JPEG or WebP file.");
+    return { messageId, index, mimeType: info.mimeType, data: block.data };
   }
   /** Validation / host dispatch is synchronous. Never waits for a model turn. */
   dispatch(command: string, input: unknown, complete: Completion): void {
@@ -581,7 +611,11 @@ export class Bridge {
       if (this.isCurrent() && revision === this.branchRevision) complete(result);
     };
     if (command === "prompt") {
-      pi.sendUserMessage(args.text as string, { deliverAs: (args.mode ?? "followUp") as "steer" | "followUp", expandPromptTemplates: false });
+      const images = (args.images ?? []) as PromptImage[];
+      const text = args.text as string;
+      const options = { deliverAs: (args.mode ?? "followUp") as "steer" | "followUp", expandPromptTemplates: false };
+      if (!images.length) pi.sendUserMessage(text, options);
+      else pi.sendUserMessage([...(text ? [{ type: "text" as const, text }] : []), ...images.map((image) => ({ type: "image" as const, ...image }))], options);
     } else if (command === "abort") {
       ctx.abort();
     } else if (command === "set_model") {

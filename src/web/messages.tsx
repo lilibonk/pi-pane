@@ -1,12 +1,14 @@
+import { memo } from "preact/compat";
 import { useEffect, useRef, useState } from "preact/hooks";
 import type { ContentView, MessageView, ToolView } from "../protocol/index.js";
 import { highlight, languageForPath } from "./highlight.js";
 import { renderMarkdown } from "./markdown.js";
-import { collapseContent, expandContent, type Expansion } from "./store.js";
+import { collapseContent, expandContent, requestImage, retryImage, webStore, type Expansion, type LoadedImage } from "./store.js";
 
 export type Expansions = Record<string, Expansion>;
 type ToolCall = Extract<ContentView, { type: "toolCall" }>;
-type TextBlock = Exclude<ContentView, ToolCall>;
+type ImageContent = Extract<ContentView, { type: "image" }>;
+type TextBlock = Exclude<ContentView, ToolCall | ImageContent>;
 
 export const COMPACTION_MARKER = "[Context compacted]";
 
@@ -49,6 +51,51 @@ function Clipped({ message, index, expansions }: { message: MessageView; index: 
       </button>
       {expansion?.error && <span class="error-text">{expansion.error}</span>}
     </p>
+  );
+}
+
+function formatBytes(bytes: number): string {
+  return bytes >= 1024 * 1024 ? `${(bytes / 1024 / 1024).toFixed(1)} MiB` : `${Math.max(1, Math.round(bytes / 1024))} KiB`;
+}
+function useImage(key: string): LoadedImage | undefined {
+  const [value, setValue] = useState(() => webStore.getState().images[key]);
+  useEffect(() => {
+    setValue(webStore.getState().images[key]);
+    return webStore.subscribe(state => setValue(state.images[key]));
+  }, [key]);
+  return value;
+}
+/** A history image: metadata arrives with the message, bytes are read only when it nears the viewport. */
+export function ImageBlock({ message, index }: { message: MessageView; index: number }) {
+  const block = message.content[index] as ImageContent;
+  const image = useImage(`${message.id}#${index}`);
+  const ref = useRef<HTMLDivElement>(null);
+  const [visible, setVisible] = useState(false);
+  useEffect(() => {
+    const element = ref.current;
+    if (!element || typeof IntersectionObserver === "undefined") { setVisible(true); return; }
+    // The timeline is the scroll container; with the viewport as root its clipping would cancel the margin.
+    const observer = new IntersectionObserver(entries => setVisible(entries.some(entry => entry.isIntersecting)),
+      { root: element.closest(".timeline"), rootMargin: "600px 0px" });
+    observer.observe(element);
+    return () => observer.disconnect();
+  }, []);
+  useEffect(() => {
+    if (visible && (!image || image.status === "ready")) requestImage(message.id, index);
+  }, [visible, image?.status, message.id, index]);
+  const label = `${block.mimeType.replace("image/", "").toUpperCase()}${block.width ? ` · ${block.width}×${block.height}` : ""} · ${formatBytes(block.bytes)}`;
+  const ratio = block.width && block.height ? `${block.width} / ${block.height}` : undefined;
+  return (
+    <figure class="image-block" ref={ref} data-image-key={`${message.id}#${index}`} data-image-status={image?.status ?? "idle"}>
+      {image?.status === "ready"
+        ? <a href={image.url} target="_blank" rel="noopener noreferrer"><img src={image.url} alt={`图片 ${index + 1}`} style={ratio ? { aspectRatio: ratio, width: `min(${block.width}px, 100%)` } : undefined} decoding="async" /></a>
+        : <div class="image-placeholder" style={ratio ? { aspectRatio: ratio, width: `min(${block.width}px, 100%)` } : undefined}>
+            {image?.status === "error"
+              ? <span class="error-text">{image.error}<button type="button" class="link-button" onClick={() => retryImage(message.id, index)}>重试</button></span>
+              : <span>{image?.status === "loading" ? "正在加载图片…" : "图片"}</span>}
+          </div>}
+      <figcaption>{label}</figcaption>
+    </figure>
   );
 }
 
@@ -161,6 +208,7 @@ export function ToolCard({ call, result, live, expansions }: { call?: ToolCall; 
           </>
         )}
         {name === "edit" && status === "error" && output && <pre class="tool-output error-text">{output}</pre>}
+        {result && result.content.map((block, index) => block.type === "image" ? <ImageBlock key={`image-${index}`} message={result} index={index} /> : null)}
         {result && textIndexes.map((index) => <Clipped key={index} message={result} index={index} expansions={expansions} />)}
         {result && diffIndex >= 0 && <Clipped message={result} index={diffIndex} expansions={expansions} />}
       </div>
@@ -173,7 +221,14 @@ export interface ToolContext {
   live: Map<string, ToolView>;
 }
 
-export function Message({ message, tools, expansions }: { message: MessageView; tools: ToolContext; expansions: Expansions }) {
+function usesTools(message: MessageView): boolean {
+  return message.role === "toolResult" || message.content.some(block => block.type === "toolCall");
+}
+/** Messages are immutable projections; a message re-renders only when it, its tools or expansions change. */
+export const Message = memo(MessageView_, (prev, next) =>
+  prev.message === next.message && prev.expansions === next.expansions && (prev.tools === next.tools || !usesTools(next.message)));
+
+function MessageView_({ message, tools, expansions }: { message: MessageView; tools: ToolContext; expansions: Expansions }) {
   const final = message.status === "complete";
   if (message.role === "system" && message.content.length === 1 && message.content[0]!.type === "text" && message.content[0]!.text === COMPACTION_MARKER)
     return <div class="compaction-marker" data-message-id={message.id}><span>上下文已压缩</span></div>;
@@ -188,6 +243,7 @@ export function Message({ message, tools, expansions }: { message: MessageView; 
         {message.content.map((content, index) => {
           if (content.type === "toolCall")
             return <ToolCard key={index} call={content} result={tools.results.get(content.id)} live={tools.live.get(content.id)} expansions={expansions} />;
+          if (content.type === "image") return <ImageBlock key={index} message={message} index={index} />;
           const text = blockText(message, index, expansions);
           if (!text && content.total === undefined) return null;
           if (content.type === "thinking") return (

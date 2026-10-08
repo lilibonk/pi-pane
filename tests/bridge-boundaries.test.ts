@@ -220,3 +220,29 @@ test("streaming updates coalesce into append-only deltas that rebuild the snapsh
     assert.equal((state.session.messages[0] as MessageView).status, "streaming");
   } finally { f.bridge.dispose(); }
 });
+
+test("images project as metadata, are read by block index, and prompts carry validated images", async () => {
+  const { png } = await import("./fixtures/images.ts");
+  const f = fixture();
+  try {
+    const data = png(6, 4).toString("base64");
+    f.entries.push(
+      { type: "message", id: "u1", message: { role: "user", content: [{ type: "text", text: "look" }, { type: "image", mimeType: "image/png", data }] } },
+      { type: "message", id: "r1", message: { role: "toolResult", toolCallId: "t1", toolName: "read", content: [{ type: "text", text: "Read image file" }, { type: "image", mimeType: "image/png", data: "@@not-base64" }] } },
+    );
+    const [user, result] = f.bridge.snapshot().session.messages;
+    assert.deepEqual(user!.content[1], { type: "image", mimeType: "image/png", bytes: Buffer.from(data, "base64").length, width: 6, height: 4 });
+    assert.ok(!JSON.stringify(user).includes(data.slice(0, 32)), "snapshots never inline image bytes");
+    assert.deepEqual(f.bridge.imagePage(user!.id, 1), { messageId: user!.id, index: 1, mimeType: "image/png", data });
+    assert.throws(() => f.bridge.imagePage(user!.id, 0), /not an image/);
+    assert.throws(() => f.bridge.imagePage(result!.id, 1), /not valid base64/);
+    assert.throws(() => f.bridge.contentPage(user!.id, 1, 0), /no readable text/);
+
+    f.bridge.dispatch("prompt", { text: "", images: [{ mimeType: "image/png", data }], mode: "steer" }, () => {});
+    f.bridge.dispatch("prompt", { text: "with text", images: [{ mimeType: "image/png", data }] }, () => {});
+    assert.deepEqual(f.sent[0], { text: [{ type: "image", mimeType: "image/png", data }], options: { deliverAs: "steer", expandPromptTemplates: false } });
+    assert.deepEqual((f.sent[1]!.text as unknown[])[0], { type: "text", text: "with text" });
+    assert.throws(() => f.bridge.dispatch("prompt", { text: "x", images: [{ mimeType: "image/jpeg", data }] }, () => {}), /not image\/jpeg/);
+    assert.equal(f.sent.length, 2, "invalid images never reach the host");
+  } finally { f.bridge.dispose(); }
+});

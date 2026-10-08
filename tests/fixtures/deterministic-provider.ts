@@ -10,6 +10,11 @@ function evidence(event: string, data: Record<string, unknown> = {}) {
   if (path) appendFileSync(path, `${JSON.stringify({ at: Date.now(), event, ...data })}\n`, { mode: 0o600 });
 }
 const pause = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
+function userImages(context: TranscriptContext): Array<{ mimeType: string; bytes: number }> {
+  const user = [...context.messages].reverse().find((message) => message.role === "user");
+  if (!user || typeof user.content === "string") return [];
+  return user.content.flatMap((part) => part.type === "image" ? [{ mimeType: part.mimeType, bytes: Buffer.from(part.data, "base64").length }] : []);
+}
 function userText(context: TranscriptContext): string {
   const user = [...context.messages].reverse().find((message) => message.role === "user");
   if (!user) return "";
@@ -32,7 +37,7 @@ export function deterministicStream(model: Model<Api>, context: TranscriptContex
     stopReason: useTool ? "toolUse" : "stop", timestamp: Date.now(),
   };
   void (async () => {
-    evidence("provider_call", { input, useTool, control, summarization });
+    evidence("provider_call", { input, useTool, control, summarization, images: userImages(context) });
     try {
       // This provider has no HTTP request/response; no onResponse callback is fabricated.
       await options?.onPayload?.({ testProvider: true, input }, model);
@@ -98,7 +103,7 @@ export function deterministicStream(model: Model<Api>, context: TranscriptContex
 export default function deterministicProvider(pi: ExtensionAPI) {
   if (process.env.PI_M0_NO_PROVIDER !== "1") pi.registerProvider("pi-pane-m0", {
     baseUrl: "http://does-not-exist.invalid", apiKey: "m0-local-fixture-not-a-secret", api: "pi-pane-m0-api",
-    models: [false, true].map((reasoning) => ({ id: reasoning ? "deterministic-thinking" : "deterministic", name: `M0 deterministic local fixture${reasoning ? " (thinking)" : ""}`, reasoning, input: ["text"],
+    models: [false, true].map((reasoning) => ({ id: reasoning ? "deterministic-thinking" : "deterministic", name: `M0 deterministic local fixture${reasoning ? " (thinking)" : ""}`, reasoning, input: ["text", "image"],
       cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 16_384, maxTokens: 2_048 })),
     streamSimple: deterministicStream,
   });

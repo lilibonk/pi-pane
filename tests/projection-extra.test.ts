@@ -2,10 +2,10 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Bridge, type BridgeOptions } from "../src/extension/bridge.js";
-import type { MessageView, ProjectionEvent } from "../src/protocol/index.js";
+import { isTextContent, type MessageView, type ProjectionEvent } from "../src/protocol/index.js";
 
 const pause = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
-const textOf = (message: MessageView) => message.content.filter((part) => part.type !== "toolCall").map((part) => part.text).join("");
+const textOf = (message: MessageView) => message.content.filter(isTextContent).map((part) => part.text).join("");
 function fixture(pollMs = 20) {
   const entries: Record<string, unknown>[] = [];
   const events: ProjectionEvent[] = [];
@@ -82,7 +82,7 @@ test("body, error and bash output share the single-message character budget and 
     const [error, bash, hostTruncated] = f.bridge.snapshot().session.messages;
     for (const message of [error!, bash!]) {
       assert.equal(textOf(message).length, 32_768);
-      assert.ok(message.content.some((part) => part.type !== "toolCall" && part.total !== undefined), "clipped blocks advertise their full length");
+      assert.ok(message.content.some((part) => isTextContent(part) && part.total !== undefined), "clipped blocks advertise their full length");
     }
     assert.equal(textOf(error!).slice(-8), "eeeeeeee");
     assert.match(textOf(hostTruncated!), /Cancelled/); assert.equal(hostTruncated!.truncated, true);

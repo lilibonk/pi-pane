@@ -13,7 +13,8 @@ test("wire validation rejects ambiguous identities and unsafe command counters",
 test("prompt limit counts UTF-8 bytes and refuses unsupported uploads", () => {
   assert.equal(commandArgs("prompt", { text: "汉".repeat(21_845), mode: "steer" }).mode, "steer");
   assert.throws(() => commandArgs("prompt", { text: "汉".repeat(21_846) }), ProtocolError);
-  assert.throws(() => commandArgs("prompt", { text: "test", images: [] }), ProtocolError);
+  assert.equal(commandArgs("prompt", { text: "test", images: [] }).text, "test");
+  assert.throws(() => commandArgs("prompt", { text: "", images: [] }), ProtocolError);
   assert.throws(() => commandArgs("prompt", { text: "   " }), ProtocolError);
   assert.throws(() => commandArgs("prompt", { text: "test", mode: "immediate" }), ProtocolError);
 });

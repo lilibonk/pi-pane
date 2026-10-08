@@ -1,5 +1,6 @@
 import { createHash, randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
+import { createServer as createHttpsServer } from "node:https";
 import { readFile, realpath, stat } from "node:fs/promises";
 import { extname, resolve, sep } from "node:path";
 import type { AddressInfo } from "node:net";
@@ -11,27 +12,45 @@ import {
 } from "../protocol/index.js";
 import type { Bridge } from "./bridge.js";
 
+/**
+ * External access (§9.1). Requires a public HTTPS origin, a password, and either direct TLS or a
+ * same-machine TLS proxy in front of a loopback listener. Without it the Hub is loopback-only.
+ */
+export interface ExternalAccess {
+  publicOrigin: string;
+  password: string;
+  tls?: { cert: string | Buffer; key: string | Buffer };
+  proxy?: boolean;
+  /** Absolute lifetime of a login session. */
+  authTtlMs?: number;
+}
 export interface HubOptions {
   host?: string;
   port?: number;
   webRoot: string;
+  external?: ExternalAccess;
   /** Tests can shorten leases and limits without modifying production defaults. */
   leaseMs?: number;
   receiptLimit?: number;
   maxClients?: number;
   maxBufferedBytes?: number;
   helloTimeoutMs?: number;
+  maxLoginSessions?: number;
   onConnectionCount?: (count: number) => void;
 }
+/** A password login. Only the token digest is retained. */
+interface AuthSession { digest: string; expiresAt: number; timer?: ReturnType<typeof setTimeout> }
 interface Receipt { digest: string; ack: Ack; result?: CommandResult }
 interface Lease {
   id: string;
+  auth?: AuthSession;
   expiresAt: number;
   nextCommandNo: number;
   receipts: Map<number, Receipt>;
 }
 interface Peer {
   socket: WebSocket;
+  auth?: AuthSession;
   lease?: Lease;
   alive: boolean;
   helloTimer: ReturnType<typeof setTimeout>;
@@ -47,6 +66,20 @@ function safeEqual(left: string, right: string): boolean {
   const a = Buffer.from(left);
   const b = Buffer.from(right);
   return a.length === b.length && timingSafeEqual(a, b);
+}
+const LOOPBACK = ["127.0.0.1", "localhost", "::1"];
+const AUTH_TTL_MS = 8 * 60 * 60_000;
+/** Close code for an expired or revoked login; the page asks for the password again. */
+export const AUTH_EXPIRED = 4401;
+function digestOf(token: string): string { return createHash("sha256").update(token).digest("hex"); }
+/** Validates the public origin of external access: https, no path, query, fragment or credentials. */
+export function parsePublicOrigin(value: string): URL {
+  let url: URL;
+  try { url = new URL(value); } catch { throw new ProtocolError("invalid_origin", "The public origin must be an https:// URL."); }
+  if (url.protocol !== "https:" || url.username || url.password || url.search || url.hash || (url.pathname !== "/" && url.pathname !== "") || value.endsWith("/"))
+    throw new ProtocolError("invalid_origin", "The public origin must be https://host[:port] without a path.");
+  if (url.hostname === "0.0.0.0" || url.hostname === "[::]") throw new ProtocolError("invalid_origin", "A wildcard address cannot be a public origin.");
+  return url;
 }
 const MIME: Record<string, string> = {
   ".html": "text/html; charset=utf-8", ".js": "text/javascript; charset=utf-8", ".css": "text/css; charset=utf-8",
@@ -71,11 +104,29 @@ export class Hub {
   private closePromise?: Promise<void>;
   private upgradeRate = { start: Date.now(), count: 0 };
   private commandRate = { start: Date.now(), count: 0 };
+  private loginRate = { start: Date.now(), count: 0 };
+  private loginFailures = new Map<string, { start: number; count: number }>();
+  private authSessions = new Map<string, AuthSession>();
+  private readonly publicUrl?: URL;
+  private readonly password?: Buffer;
 
   constructor(options: HubOptions) {
     const host = options.host ?? "127.0.0.1";
-    if (!["127.0.0.1", "localhost", "::1"].includes(host)) throw new ProtocolError("loopback_only", "Only loopback addresses are accepted.");
     if (options.port !== undefined && (!Number.isInteger(options.port) || options.port < 0 || options.port > 65535)) throw new ProtocolError("invalid_port", "Port must be between 0 and 65535.");
+    const external = options.external;
+    if (!external) {
+      if (!LOOPBACK.includes(host))
+        throw new ProtocolError("loopback_only", "Non-loopback access needs a public HTTPS origin, PI_PANE_PASSWORD, and TLS or a TLS proxy.");
+    } else {
+      this.publicUrl = parsePublicOrigin(external.publicOrigin);
+      if (typeof external.password !== "string" || external.password.length < 12)
+        throw new ProtocolError("password_required", "External access needs PI_PANE_PASSWORD with at least 12 characters.");
+      if (!!external.tls === !!external.proxy)
+        throw new ProtocolError("transport_required", "External access needs exactly one of TLS certificate/key or proxy mode; plain HTTP is refused.");
+      if (external.proxy && !LOOPBACK.includes(host))
+        throw new ProtocolError("loopback_only", "In proxy mode the service listens on loopback only; the proxy provides HTTPS.");
+      this.password = createHash("sha256").update(external.password).digest();
+    }
     this.options = { ...options, host };
   }
   get token(): string { return this._token; }
@@ -83,10 +134,18 @@ export class Hub {
   get seq(): number { return this._seq; }
   get port(): number { return this._port; }
   get host(): string { return this.options.host!; }
+  /** "local": loopback with the link token; "password": external access with login sessions. */
+  get mode(): "local" | "password" { return this.publicUrl ? "password" : "local"; }
+  get listenAddress(): string {
+    const host = this.options.host!.includes(":") ? `[${this.options.host}]` : this.options.host;
+    return `${this.options.external?.tls ? "https" : "http"}://${host}:${this._port}`;
+  }
   get origin(): string {
+    if (this.publicUrl) return this.publicUrl.origin;
     const host = this.options.host === "::1" ? "[::1]" : this.options.host;
     return `http://${host}:${this._port}`;
   }
+  get loginCount(): number { this.pruneAuth(); return this.authSessions.size; }
   get url(): string { return `${this.origin}/#t=${this._token}`; }
   get connectionCount(): number { return [...this.peers].filter((peer) => peer.lease).length; }
   get running(): boolean { return !!this.server?.listening && !this.closePromise; }
@@ -96,30 +155,35 @@ export class Hub {
   async start(): Promise<void> {
     if (this.running) return;
     if (this.closePromise) throw new ProtocolError("hub_closed", "Create a new Hub after stopping it.");
-    this.server = createServer((request, response) => {
+    const handler = (request: IncomingMessage, response: ServerResponse) => {
       void this.handleHttp(request, response).catch(() => {
         if (!response.headersSent) { response.writeHead(500); response.end("Request failed"); }
         else response.destroy();
       });
-    });
+    };
+    const tls = this.options.external?.tls;
+    this.server = tls ? createHttpsServer({ cert: tls.cert, key: tls.key, minVersion: "TLSv1.2" }, handler) : createServer(handler);
+    this.server.maxConnections = 64;
     this.server.requestTimeout = 10_000;
     this.server.headersTimeout = 5_000;
     this.server.keepAliveTimeout = 3_000;
     this.server.maxHeadersCount = 32;
-    this.wss = new WebSocketServer({ noServer: true, maxPayload: 128 * 1024, perMessageDeflate: false,
+    this.wss = new WebSocketServer({ noServer: true, maxPayload: LIMITS.commandFrameBytes, perMessageDeflate: false,
       handleProtocols: (protocols) => protocols.has(PROTOCOL) ? PROTOCOL : false });
     this.server.on("upgrade", (request, socket, head) => {
       try {
         if (!this.allowRate(this.upgradeRate, 40, 10_000)) return this.rejectUpgrade(socket, 429);
         if (request.url !== WS_PATH || !this.validHost(request.headers.host)) return this.rejectUpgrade(socket, 403);
-        const origin = request.headers.origin;
-        if (typeof origin !== "string" || origin !== `http://${request.headers.host}`) return this.rejectUpgrade(socket, 403);
+        if (!this.validOrigin(request.headers.origin, request.headers.host)) return this.rejectUpgrade(socket, 403);
         const protocols = String(request.headers["sec-websocket-protocol"] ?? "").split(",").map((value) => value.trim());
         const bearer = protocols.filter((value) => value.startsWith("pi-pane.bearer."));
-        if (!protocols.includes(PROTOCOL) || bearer.length !== 1 || !safeEqual(bearer[0]!.slice("pi-pane.bearer.".length), this._token))
-          return this.rejectUpgrade(socket, 401);
+        if (!protocols.includes(PROTOCOL) || bearer.length !== 1) return this.rejectUpgrade(socket, 401);
+        const token = bearer[0]!.slice("pi-pane.bearer.".length);
+        // External access accepts only login sessions; the bootstrap link token cannot upgrade.
+        const auth = this.publicUrl ? this.authSession(token) : undefined;
+        if (this.publicUrl ? !auth : !this._token || !safeEqual(token, this._token)) return this.rejectUpgrade(socket, 401);
         if (this.peers.size >= (this.options.maxClients ?? 8) * 2) return this.rejectUpgrade(socket, 429);
-        this.wss!.handleUpgrade(request, socket, head, (ws) => this.accept(ws));
+        this.wss!.handleUpgrade(request, socket, head, (ws) => this.accept(ws, auth));
       } catch { this.rejectUpgrade(socket, 400); }
     });
     await new Promise<void>((accept, reject) => {
@@ -132,6 +196,7 @@ export class Hub {
     this.server.on("error", () => { /* Errors stay inside the extension boundary. */ });
     this._port = (this.server.address() as AddressInfo).port;
     this.heartbeat = setInterval(() => {
+      this.pruneAuth();
       this.pruneLeases();
       for (const peer of this.peers) {
         if (!peer.alive) { peer.socket.terminate(); continue; }
@@ -141,19 +206,36 @@ export class Hub {
     }, 15_000);
     this.heartbeat.unref?.();
   }
+  private loopbackHosts(): string[] { return [`127.0.0.1:${this._port}`, `localhost:${this._port}`, `[::1]:${this._port}`]; }
+  /** Exact Host values. A proxy may also forward to the actual loopback upstream address. */
   private validHost(host: string | undefined): boolean {
     if (!host) return false;
-    return [`127.0.0.1:${this._port}`, `localhost:${this._port}`, `[::1]:${this._port}`].includes(host);
+    if (!this.publicUrl) return this.loopbackHosts().includes(host);
+    return host === this.publicUrl.host || (!!this.options.external?.proxy && this.loopbackHosts().includes(host));
+  }
+  /** Exact Origin: the public origin in external mode, never a forwarded or wildcard value. */
+  private validOrigin(origin: string | undefined, host: string | undefined): boolean {
+    if (typeof origin !== "string") return false;
+    return this.publicUrl ? origin === this.publicUrl.origin : origin === `http://${host}`;
   }
   private headers(response: ServerResponse): void {
     response.setHeader("X-Content-Type-Options", "nosniff");
     response.setHeader("Referrer-Policy", "no-referrer");
     response.setHeader("Cache-Control", "no-store");
-    response.setHeader("Content-Security-Policy", `default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; connect-src 'self' ws://127.0.0.1:${this._port} ws://localhost:${this._port} ws://[::1]:${this._port}; object-src 'none'; base-uri 'none'; frame-ancestors 'none'`);
+    const sockets = this.publicUrl ? `wss://${this.publicUrl.host}` : this.loopbackHosts().map((host) => `ws://${host}`).join(" ");
+    response.setHeader("Content-Security-Policy", `default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; connect-src 'self' ${sockets}; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'none'`);
+  }
+  private json(response: ServerResponse, status: number, body: unknown): void {
+    const data = JSON.stringify(body);
+    response.writeHead(status, { "Content-Type": "application/json; charset=utf-8", "Content-Length": Buffer.byteLength(data) });
+    response.end(data);
   }
   private async handleHttp(request: IncomingMessage, response: ServerResponse): Promise<void> {
     this.headers(response);
     if (!this.validHost(request.headers.host)) { response.writeHead(403); response.end("Forbidden host"); return; }
+    const route = (request.url ?? "/").split("?")[0];
+    if (route === "/auth/info" && request.method === "GET") { this.json(response, 200, { mode: this.mode }); return; }
+    if (route === "/auth/session") { await this.handleAuth(request, response); return; }
     if (request.method !== "GET" && request.method !== "HEAD") { response.writeHead(405); response.end(); return; }
     if (request.url === "/healthz") { response.writeHead(200, { "Content-Type": "application/json" }); response.end(request.method === "HEAD" ? undefined : '{"ok":true}'); return; }
     let path: string;
@@ -183,20 +265,108 @@ export class Hub {
     if (Date.now() - bucket.start >= windowMs) { bucket.start = Date.now(); bucket.count = 0; }
     return ++bucket.count <= limit;
   }
-  private accept(socket: WebSocket): void {
-    const peer: Peer = { socket, alive: true, rateStart: Date.now(), rateCount: 0,
+  // -------------------------------------------------------------------------
+  // External-access login (§9.2). Only digests of session tokens are kept.
+  // -------------------------------------------------------------------------
+  private authSession(token: string): AuthSession | undefined {
+    if (!/^[A-Za-z0-9_-]{43}$/.test(token)) return undefined;
+    const session = this.authSessions.get(digestOf(token));
+    return session && session.expiresAt > Date.now() ? session : undefined;
+  }
+  private bearerOf(request: IncomingMessage): string {
+    const header = request.headers.authorization;
+    return typeof header === "string" && header.startsWith("Bearer ") ? header.slice(7).trim() : "";
+  }
+  private async readJson(request: IncomingMessage, limit: number): Promise<unknown> {
+    const chunks: Buffer[] = [];
+    let size = 0;
+    for await (const chunk of request) {
+      size += (chunk as Buffer).length;
+      if (size > limit) throw new ProtocolError("body_too_large", "Request body is too large.");
+      chunks.push(chunk as Buffer);
+    }
+    return JSON.parse(Buffer.concat(chunks).toString("utf8"));
+  }
+  private async handleAuth(request: IncomingMessage, response: ServerResponse): Promise<void> {
+    if (!this.publicUrl || !this.password) { response.writeHead(404); response.end(); return; }
+    if (!this.validOrigin(request.headers.origin, request.headers.host)) { this.json(response, 403, { error: "forbidden_origin" }); return; }
+    if (request.method === "GET" || request.method === "DELETE") {
+      const session = this.authSession(this.bearerOf(request));
+      if (!session) { this.json(response, 401, { error: "login_required" }); return; }
+      if (request.method === "DELETE") this.revoke(session, "logged_out");
+      this.json(response, 200, request.method === "GET" ? { expiresAt: session.expiresAt } : { ok: true });
+      return;
+    }
+    if (request.method !== "POST") { response.writeHead(405); response.end(); return; }
+    if (!String(request.headers["content-type"] ?? "").toLowerCase().startsWith("application/json")) { this.json(response, 415, { error: "json_required" }); return; }
+    // A proxy makes every request come from loopback; the global limit always applies.
+    const source = this.options.external?.proxy ? "proxy" : request.socket.remoteAddress ?? "unknown";
+    const failures = this.loginFailures.get(source);
+    if (failures && Date.now() - failures.start > 5 * 60_000) this.loginFailures.delete(source);
+    if (!this.allowRate(this.loginRate, 20, 60_000) || (this.loginFailures.get(source)?.count ?? 0) >= 10) {
+      this.json(response, 429, { error: "rate_limited", message: "登录尝试过多，请稍后再试。" }); return;
+    }
+    let body: unknown;
+    try { body = await this.readJson(request, 8192); } catch { this.json(response, 400, { error: "invalid_request" }); return; }
+    const value = body as Record<string, unknown> | null;
+    const valid = !!value && typeof value === "object" && Object.keys(value).sort().join(",") === "bootstrapToken,password" &&
+      typeof value.bootstrapToken === "string" && typeof value.password === "string" && value.password.length <= 1024 &&
+      !!this._token && safeEqual(value.bootstrapToken, this._token) &&
+      timingSafeEqual(createHash("sha256").update(value.password).digest(), this.password);
+    if (!valid) {
+      const record = this.loginFailures.get(source) ?? { start: Date.now(), count: 0 };
+      record.count++;
+      this.loginFailures.set(source, record);
+      // One message for every failure: never reveal which credential was wrong.
+      this.json(response, 401, { error: "login_failed", message: "链接或密码不正确，或链接已失效。" });
+      return;
+    }
+    this.loginFailures.delete(source);
+    this.pruneAuth();
+    while (this.authSessions.size >= (this.options.maxLoginSessions ?? 16)) this.revoke(this.authSessions.values().next().value!, "login_evicted");
+    const token = randomBytes(32).toString("base64url");
+    const session: AuthSession = { digest: digestOf(token), expiresAt: Date.now() + (this.options.external?.authTtlMs ?? AUTH_TTL_MS) };
+    this.authSessions.set(session.digest, session);
+    // Expiry closes the session's connections on time, not at the next heartbeat.
+    session.timer = setTimeout(() => this.revoke(session, "auth_expired"), session.expiresAt - Date.now());
+    session.timer.unref?.();
+    this.json(response, 200, { sessionToken: token, expiresAt: session.expiresAt });
+  }
+  private revoke(session: AuthSession, reason: string): void {
+    clearTimeout(session.timer);
+    this.authSessions.delete(session.digest);
+    for (const [id, lease] of this.leases) if (lease.auth === session) this.leases.delete(id);
+    for (const peer of this.peers) if (peer.auth === session) { peer.socket.close(AUTH_EXPIRED, reason); this.terminateLater(peer); }
+  }
+  private pruneAuth(): void {
+    for (const session of [...this.authSessions.values()]) if (session.expiresAt <= Date.now()) this.revoke(session, "auth_expired");
+  }
+  private terminateLater(peer: Peer): void {
+    const timer = setTimeout(() => peer.socket.terminate(), 1000);
+    timer.unref?.();
+  }
+  private accept(socket: WebSocket, auth?: AuthSession): void {
+    const peer: Peer = { socket, auth, alive: true, rateStart: Date.now(), rateCount: 0,
       helloTimer: setTimeout(() => socket.close(1008, "hello_timeout"), this.options.helloTimeoutMs ?? 5000) };
     peer.helloTimer.unref?.();
     this.peers.add(peer);
     socket.on("error", () => { /* ws handles close; do not leak event errors into TUI. */ });
     socket.on("close", () => { clearTimeout(peer.helloTimer); this.peers.delete(peer); this.notifyCount(); });
-    socket.on("pong", () => { peer.alive = true; if (peer.lease) peer.lease.expiresAt = Date.now() + (this.options.leaseMs ?? 30 * 60_000); });
+    socket.on("pong", () => { peer.alive = true; if (peer.lease) peer.lease.expiresAt = this.leaseUntil(peer); });
     socket.on("message", (raw, binary) => {
       try { this.receive(peer, raw, binary); } catch (error) { this.sendError(peer, error); }
     });
   }
   private notifyCount(): void { try { this.options.onConnectionCount?.(this.connectionCount); } catch { /* stale UI */ } }
+  /** A lease never outlives the login that created it. */
+  private leaseUntil(peer: Peer): number {
+    const until = Date.now() + (this.options.leaseMs ?? 30 * 60_000);
+    return peer.auth ? Math.min(until, peer.auth.expiresAt) : until;
+  }
   private receive(peer: Peer, raw: RawData, binary: boolean): void {
+    if (peer.auth && (peer.auth.expiresAt <= Date.now() || !this.authSessions.has(peer.auth.digest))) {
+      peer.socket.close(AUTH_EXPIRED, "auth_expired"); this.terminateLater(peer); return;
+    }
     if (binary) throw new ProtocolError("invalid_frame", "Only JSON text frames are accepted.");
     if (Date.now() - peer.rateStart > 1000) { peer.rateStart = Date.now(); peer.rateCount = 0; }
     if (++peer.rateCount > 60 || !this.allowRate(this.commandRate, 240)) { peer.socket.close(1008, "rate_limited"); return; }
@@ -208,15 +378,16 @@ export class Hub {
       if (peer.lease) throw new ProtocolError("already_initialized", "This connection already completed hello.");
       this.pruneLeases();
       let lease = message.clientId ? this.leases.get(message.clientId) : undefined;
+      if (lease && lease.auth !== peer.auth) lease = undefined;
       if (message.clientId && !lease) throw new ProtocolError("client_expired", "Client lease is unknown or expired. Previous command results are unknown.");
       if (!lease) {
         if (this.leases.size >= (this.options.maxClients ?? 8)) throw new ProtocolError("client_limit", "Client lease capacity reached.");
-        lease = { id: randomUUID(), expiresAt: Date.now() + (this.options.leaseMs ?? 30 * 60_000), nextCommandNo: 1, receipts: new Map() };
+        lease = { id: randomUUID(), auth: peer.auth, expiresAt: this.leaseUntil(peer), nextCommandNo: 1, receipts: new Map() };
         this.leases.set(lease.id, lease);
       }
       for (const other of this.peers) if (other !== peer && other.lease === lease) other.socket.close(1000, "connection_replaced");
       peer.lease = lease;
-      lease.expiresAt = Date.now() + (this.options.leaseMs ?? 30 * 60_000);
+      lease.expiresAt = this.leaseUntil(peer);
       clearTimeout(peer.helloTimer);
       this.send(peer, { t: "welcome", clientId: lease.id, leaseExpiresAt: lease.expiresAt, nextCommandNo: lease.nextCommandNo });
       this.sendSnapshot(peer);
@@ -225,7 +396,7 @@ export class Hub {
     }
     const lease = this.validLease(peer);
     if (message.t === "resync") { this.sendSnapshot(peer); return; }
-    if (message.t === "history_page" || message.t === "content_page") { this.page(peer, message); return; }
+    if (message.t === "history_page" || message.t === "content_page" || message.t === "image_page") { this.page(peer, message); return; }
     if (message.clientId !== lease.id) throw new ProtocolError("client_mismatch", "Command does not belong to this connection.");
     if (message.t === "receipt_query") {
       const prefix = `${lease.id}:`;
@@ -249,7 +420,7 @@ export class Hub {
     const lease = peer.lease;
     if (!lease) throw new ProtocolError("hello_required", "Send hello before commands.");
     if (lease.expiresAt <= Date.now() || this.leases.get(lease.id) !== lease) throw new ProtocolError("client_expired", "Client lease expired; operation results may be unknown.");
-    lease.expiresAt = Date.now() + (this.options.leaseMs ?? 30 * 60_000);
+    lease.expiresAt = this.leaseUntil(peer);
     return lease;
   }
   private command(peer: Peer, lease: Lease, command: CommandEnvelope): void {
@@ -287,7 +458,7 @@ export class Hub {
     if (receipt.result) this.send(peer, receipt.result);
   }
   /** Directed read-only responses. They never consume seq and never call the host's write APIs. */
-  private page(peer: Peer, message: Extract<ClientMessage, { t: "history_page" | "content_page" }>): void {
+  private page(peer: Peer, message: Extract<ClientMessage, { t: "history_page" | "content_page" | "image_page" }>): void {
     const bridge = this.boundBridge;
     try {
       if (!bridge || this._switching || !bridge.isCurrent() || message.epoch !== this._epoch)
@@ -295,8 +466,10 @@ export class Hub {
       if (message.t === "history_page") {
         if (message.sessionId !== bridge.sessionId) throw new ProtocolError("stale_session", "Refresh the session snapshot before reading history.");
         this.send(peer, { t: "history_page", reqId: message.reqId, epoch: this._epoch, ...bridge.historyPage(message.before, message.branchRevision) });
-      } else {
+      } else if (message.t === "content_page") {
         this.send(peer, { t: "content_page", reqId: message.reqId, epoch: this._epoch, ...bridge.contentPage(message.messageId, message.index, message.offset) });
+      } else {
+        this.send(peer, { t: "image_page", reqId: message.reqId, epoch: this._epoch, ...bridge.imagePage(message.messageId, message.index) });
       }
     } catch (error) {
       this.send(peer, { t: "error", error: toWireError(error), reqId: message.reqId });
@@ -331,8 +504,7 @@ export class Hub {
     if (peer.socket.bufferedAmount + total > (this.options.maxBufferedBytes ?? LIMITS.sendBufferBytes)) {
       peer.socket.close(1013, "slow_client");
       // Do not retain a nonreading socket through an unbounded close handshake.
-      const timer = setTimeout(() => peer.socket.terminate(), 1000);
-      timer.unref?.();
+      this.terminateLater(peer);
       return;
     }
     for (const frame of frames) peer.socket.send(frame, (error) => { if (error) peer.socket.terminate(); });
@@ -388,8 +560,11 @@ export class Hub {
     }, timeoutMs);
     this.rebindTimer.unref?.();
   }
+  /** Revokes the link token, every login session and every connection. */
   rotateToken(): void {
     this._token = randomBytes(32).toString("base64url");
+    for (const session of this.authSessions.values()) clearTimeout(session.timer);
+    this.authSessions.clear();
     this.leases.clear();
     for (const peer of this.peers) { peer.socket.close(1008, "token_rotated"); peer.socket.terminate(); }
   }
@@ -400,6 +575,8 @@ export class Hub {
     if (this.rebindTimer) clearTimeout(this.rebindTimer);
     if (this.heartbeat) clearInterval(this.heartbeat);
     this._token = "";
+    for (const session of this.authSessions.values()) clearTimeout(session.timer);
+    this.authSessions.clear();
     this.leases.clear();
     for (const peer of this.peers) { clearTimeout(peer.helloTimer); peer.socket.terminate(); }
     this.closePromise = new Promise<void>((done) => {

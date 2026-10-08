@@ -221,7 +221,7 @@ async function configurationAndPorts() {
     const deniedPort = await freePort();
     const denied = await startReal({ expectUrl: false, omitPortFlag: true, settings: { piPane: { host: "0.0.0.0", port: deniedPort, noOpen: true } } });
     try {
-      await waitFor(() => stripAnsi(denied.terminal).includes("piPane.host must be a loopback"), "config rejection is visible");
+      await waitFor(() => stripAnsi(denied.terminal).includes("piPane.host may be non-loopback only"), "config rejection is visible");
       assert.equal(await health(deniedPort), false); assert.equal(denied.url, undefined);
     } finally { await denied.close("config-denied"); }
     return { configuredPortWorks: true, nonloopbackRejected: true };

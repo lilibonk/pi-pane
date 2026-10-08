@@ -1,13 +1,17 @@
 import { spawn } from "node:child_process";
+import { readFile } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { ProtocolError } from "../protocol/index.js";
 import { Bridge } from "./bridge.js";
-import { Hub } from "./hub.js";
+import { Hub, type ExternalAccess } from "./hub.js";
 import { missingHostCapabilities, readPaneSettings } from "./config.js";
+import { qrLines } from "./qr.js";
 
-export const IMPLEMENTATION_VERSION = "m1.0";
+export const IMPLEMENTATION_VERSION = "m2.0";
+const QR_WIDGET = "pi-pane-qr";
+const QR_VISIBLE_MS = 120_000;
 export const PROCESS_STATE_KEY = Symbol.for("pi-pane.process.v1");
 export interface ProcessState {
   implementationVersion: string;
@@ -26,27 +30,63 @@ export function getProcessState(): ProcessState {
   };
 }
 
-interface WebArgs { action: "start" | "stop" | "status" | "rotate"; host?: string; port?: number; noOpen: boolean }
+interface WebArgs {
+  action: "start" | "stop" | "status" | "rotate" | "qr";
+  host?: string;
+  port?: number;
+  noOpen: boolean;
+  publicOrigin?: string;
+  tlsCert?: string;
+  tlsKey?: string;
+  proxy?: boolean;
+}
+const ADDRESS_KEYS = ["host", "port", "publicOrigin", "tlsCert", "tlsKey", "proxy"] as const;
 export function parseWebArgs(text: string): WebArgs {
   const parts = text.trim() ? text.trim().split(/\s+/) : [];
   const args: WebArgs = { action: "start", noOpen: false };
-  if (["stop", "status"].includes(parts[0] ?? "")) args.action = parts.shift() as "stop" | "status";
+  if (["stop", "status", "qr"].includes(parts[0] ?? "")) args.action = parts.shift() as "stop" | "status" | "qr";
+  const value = (name: string, index: number): string => {
+    const next = parts[index];
+    if (!next || next.startsWith("--")) throw new ProtocolError("invalid_args", `${name} needs a value.`);
+    return next;
+  };
   for (let i = 0; i < parts.length; i++) {
     const part = parts[i];
     if (part === "--no-open") args.noOpen = true;
     else if (part === "--rotate") args.action = "rotate";
-    else if (part === "--host") {
-      args.host = parts[++i];
-      if (!args.host) throw new ProtocolError("invalid_args", "--host needs an address.");
-    } else if (part === "--port") {
+    else if (part === "--proxy") args.proxy = true;
+    else if (part === "--host") args.host = value(part, ++i);
+    else if (part === "--public-origin") args.publicOrigin = value(part, ++i);
+    else if (part === "--tls-cert") args.tlsCert = value(part, ++i);
+    else if (part === "--tls-key") args.tlsKey = value(part, ++i);
+    else if (part === "--port") {
       const value = parts[++i];
       if (!value || !/^\d+$/.test(value)) throw new ProtocolError("invalid_args", "--port needs an integer.");
       args.port = Number(value);
       if (args.port < 1 || args.port > 65535) throw new ProtocolError("invalid_args", "Port must be between 1 and 65535.");
     } else throw new ProtocolError("invalid_args", `Unknown /web argument: ${part}`);
   }
-  if (args.action !== "start" && (args.host || args.port)) throw new ProtocolError("invalid_args", "Host/port options apply only when starting the service.");
+  if (args.action !== "start" && ADDRESS_KEYS.some((key) => args[key] !== undefined))
+    throw new ProtocolError("invalid_args", "Address options apply only when starting the service.");
   return args;
+}
+/** The password is read from the environment only: never from arguments, flags or settings. */
+async function externalAccess(args: WebArgs, cwd: string): Promise<ExternalAccess | undefined> {
+  if (!args.publicOrigin) {
+    if (args.tlsCert || args.tlsKey || args.proxy) throw new ProtocolError("invalid_args", "TLS and proxy options need --public-origin https://host[:port].");
+    return undefined;
+  }
+  const password = process.env.PI_PANE_PASSWORD;
+  if (!password) throw new ProtocolError("password_required", "External access needs the PI_PANE_PASSWORD environment variable (at least 12 characters).");
+  if (!!args.tlsCert !== !!args.tlsKey) throw new ProtocolError("invalid_args", "Provide both --tls-cert and --tls-key.");
+  if (!args.tlsCert && !args.proxy) throw new ProtocolError("transport_required", "External access needs --tls-cert/--tls-key or --proxy; plain HTTP is refused.");
+  if (args.tlsCert && args.proxy) throw new ProtocolError("invalid_args", "Choose either direct TLS or proxy mode.");
+  let tls: ExternalAccess["tls"];
+  if (args.tlsCert) {
+    try { tls = { cert: await readFile(resolve(cwd, args.tlsCert)), key: await readFile(resolve(cwd, args.tlsKey!)) }; }
+    catch { throw new ProtocolError("tls_unavailable", "The TLS certificate or key could not be read."); }
+  }
+  return { publicOrigin: args.publicOrigin, password, ...(tls ? { tls } : { proxy: true }) };
 }
 
 export default function piPane(pi: ExtensionAPI): void {
@@ -56,9 +96,13 @@ export default function piPane(pi: ExtensionAPI): void {
   const webRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../../web-dist");
 
   pi.registerFlag("web", { type: "boolean", default: false, description: "Mirror the current TUI session in a local browser." });
-  pi.registerFlag("web-host", { type: "string", description: "Loopback listen address for pi-pane." });
+  pi.registerFlag("web-host", { type: "string", description: "Listen address for pi-pane (loopback unless external access is configured)." });
   pi.registerFlag("web-port", { type: "string", description: "Explicit local port for pi-pane." });
   pi.registerFlag("web-no-open", { type: "boolean", description: "Start pi-pane without opening a browser." });
+  pi.registerFlag("web-public-origin", { type: "string", description: "External access: https://host[:port]; needs PI_PANE_PASSWORD." });
+  pi.registerFlag("web-tls-cert", { type: "string", description: "External access: TLS certificate file." });
+  pi.registerFlag("web-tls-key", { type: "string", description: "External access: TLS private key file." });
+  pi.registerFlag("web-proxy", { type: "boolean", description: "External access through a same-machine TLS proxy." });
 
   const notify = (ctx: ExtensionContext, text: string, error = false): void => {
     if (ctx.mode === "tui") ctx.ui.notify(text, error ? "error" : "info");
@@ -68,7 +112,13 @@ export default function piPane(pi: ExtensionAPI): void {
     if (!ownedContext || !ownedBridge?.isCurrent()) return;
     try { ownedContext.ui.setStatus("pi-pane", state.hub?.running ? `🌐 web: ${state.hub.connectionCount} viewer${state.hub.connectionCount === 1 ? "" : "s"}` : undefined); } catch { /* stale UI */ }
   };
+  let qrTimer: ReturnType<typeof setTimeout> | undefined;
+  const hideQr = (): void => {
+    if (qrTimer) { clearTimeout(qrTimer); qrTimer = undefined; }
+    try { if (ownedBridge?.isCurrent()) ownedContext?.ui.setWidget(QR_WIDGET, undefined); } catch { /* stale UI */ }
+  };
   const stop = async (): Promise<void> => {
+    hideQr();
     state.desiredRunning = false;
     const hub = state.hub;
     state.hub = undefined;
@@ -78,10 +128,15 @@ export default function piPane(pi: ExtensionAPI): void {
   const flagArgs = (): WebArgs => {
     const config = readPaneSettings(pi.getSettings());
     const port = pi.getFlag("web-port");
-    const host = pi.getFlag("web-host");
     const noOpen = pi.getFlag("web-no-open");
     const parsed = parseWebArgs(port === undefined ? "" : `--port ${String(port)}`);
-    return { ...config, ...parsed, ...(typeof host === "string" ? { host } : {}),
+    const strings: Partial<WebArgs> = {};
+    for (const [flag, key] of [["web-host", "host"], ["web-public-origin", "publicOrigin"], ["web-tls-cert", "tlsCert"], ["web-tls-key", "tlsKey"]] as const) {
+      const value = pi.getFlag(flag);
+      if (typeof value === "string" && value) strings[key] = value;
+    }
+    const proxy = pi.getFlag("web-proxy");
+    return { ...config, ...parsed, ...strings, ...(proxy === true ? { proxy: true } : {}),
       noOpen: typeof noOpen === "boolean" ? noOpen : config.noOpen ?? false };
   };
   const openBrowser = (url: string, ctx: ExtensionContext): void => {
@@ -96,18 +151,22 @@ export default function piPane(pi: ExtensionAPI): void {
     const bridge = ownedBridge;
     if (!bridge?.isCurrent() || state.bridge !== bridge) throw new ProtocolError("stale_session", "Session is not ready. Run /web after it finishes loading.");
     if (state.hub?.running) {
-      if ((args.port !== undefined && args.port !== state.hub.port) || (args.host !== undefined && args.host !== state.hub.host))
+      if ((args.port !== undefined && args.port !== state.hub.port) || (args.host !== undefined && args.host !== state.hub.host) ||
+          (args.publicOrigin !== undefined && new URL(args.publicOrigin).origin !== state.hub.origin))
         throw new ProtocolError("already_running", "Stop the current service before changing its address.");
       return state.hub;
     }
     if (state.starting) return state.starting;
+    const external = await externalAccess(args, ctx.cwd);
+    // Fail before listening: wrong combinations never fall back to a weaker mode.
+    new Hub({ host: args.host ?? "127.0.0.1", port: args.port ?? 7878, webRoot, ...(external ? { external } : {}) });
     state.desiredRunning = true;
     const generation = state.generation;
     state.starting = (async () => {
       const maxAttempts = args.port === undefined ? 20 : 1;
       let lastError: unknown;
       for (let attempt = 0; attempt < maxAttempts; attempt++) {
-        const hub = new Hub({ host: args.host ?? "127.0.0.1", port: args.port ?? 7878 + attempt, webRoot, onConnectionCount: updateStatus });
+        const hub = new Hub({ host: args.host ?? "127.0.0.1", port: args.port ?? 7878 + attempt, webRoot, onConnectionCount: updateStatus, ...(external ? { external } : {}) });
         try {
           await hub.start();
           if (state.generation !== generation || !state.desiredRunning || !bridge.isCurrent()) {
@@ -130,24 +189,38 @@ export default function piPane(pi: ExtensionAPI): void {
     try { return await state.starting; } finally { state.starting = undefined; }
   };
   const showUrl = (ctx: ExtensionContext, hub: Hub, noOpen: boolean): void => {
-    notify(ctx, `pi-pane: ${hub.url}${noOpen ? "" : " (opening browser)"}`);
+    const login = hub.mode === "password" ? ` · login with PI_PANE_PASSWORD · listening on ${hub.listenAddress}` : "";
+    notify(ctx, `pi-pane: ${hub.url}${login}${noOpen ? "" : " (opening browser)"}`);
     if (!noOpen) openBrowser(hub.url, ctx);
+  };
+  const showQr = (ctx: ExtensionContext, hub: Hub): void => {
+    if (hub.mode !== "password") throw new ProtocolError("qr_local", "The QR code is for external access. Start with --public-origin and TLS or --proxy; local links only work on this machine.");
+    hideQr();
+    ctx.ui.setWidget(QR_WIDGET, [...qrLines(hub.url), `pi-pane: scan to open ${hub.origin} · the password is entered separately · hides in 2 minutes`]);
+    qrTimer = setTimeout(hideQr, QR_VISIBLE_MS);
+    qrTimer.unref?.();
   };
 
   pi.registerCommand("web", {
-    description: "Mirror this TUI in a local browser. /web [--no-open], stop, status, --rotate.",
+    description: "Mirror this TUI in a browser. /web [--no-open], stop, status, qr, --rotate; external access: --public-origin with --tls-cert/--tls-key or --proxy.",
     handler: async (text, ctx) => {
       try {
         if (ctx.mode !== "tui") throw new ProtocolError("unsupported_mode", "/web is available only in TUI mode; no service was started.");
         const explicit = parseWebArgs(text);
         // Revocation and status must remain available even when startup settings are invalid.
         if (explicit.action === "stop") { await stop(); notify(ctx, "pi-pane stopped."); }
-        else if (explicit.action === "status") notify(ctx, state.hub?.running ? `pi-pane: ${state.hub.url} · ${state.hub.connectionCount} viewer(s)${state.hub.switching ? " · switching" : ""}` : "pi-pane stopped.");
+        else if (explicit.action === "status") notify(ctx, state.hub?.running
+          ? `pi-pane: ${state.hub.url} · ${state.hub.connectionCount} viewer(s)${state.hub.mode === "password" ? ` · ${state.hub.loginCount} login(s) · listening on ${state.hub.listenAddress}` : ""}${state.hub.switching ? " · switching" : ""}`
+          : "pi-pane stopped.");
         else if (explicit.action === "rotate") {
           if (!state.hub?.running) throw new ProtocolError("not_running", "pi-pane is stopped. Run /web first.");
           let noOpen = true;
           try { noOpen = explicit.noOpen || flagArgs().noOpen; } catch { /* Invalid startup config cannot block revocation. */ }
+          hideQr();
           state.hub.rotateToken(); showUrl(ctx, state.hub, noOpen);
+        } else if (explicit.action === "qr") {
+          if (!state.hub?.running) throw new ProtocolError("not_running", "pi-pane is stopped. Run /web first.");
+          showQr(ctx, state.hub);
         } else {
           const defaults = flagArgs();
           const args = { ...defaults, ...explicit, noOpen: explicit.noOpen || defaults.noOpen };
@@ -191,6 +264,7 @@ export default function piPane(pi: ExtensionAPI): void {
     updateStatus();
   });
   pi.on("session_shutdown", async (event) => {
+    hideQr();
     const bridge = ownedBridge;
     if (!bridge || state.bridge !== bridge) { bridge?.dispose(); return; }
     state.generation++;
