@@ -129,8 +129,80 @@ summary { cursor: pointer; }
 .receipt-actions button { padding: 4px 7px; font-size: 10px; }
 .receipt-actions .quiet { border-color: transparent; color: var(--fg-muted); }
 .retry-warning { color: var(--warn); font-size: 10px; }
+/* pi theme tokens (published as --pi-*) feed the semantic variables below. */
+:root {
+  --tool-pending-bg: var(--pi-tool-pending-bg, #20272c);
+  --tool-success-bg: var(--pi-tool-success-bg, #1d2325);
+  --tool-error-bg: var(--pi-tool-error-bg, #2c2325);
+  --diff-add: var(--pi-tool-diff-added, #97cba8);
+  --diff-del: var(--pi-tool-diff-removed, #df9b99);
+  --diff-context: var(--pi-tool-diff-context, var(--fg-muted));
+  --md-heading: var(--pi-md-heading, var(--fg));
+  --md-link: var(--pi-md-link, var(--accent));
+  --md-code: var(--pi-md-code, var(--accent));
+  --md-quote: var(--pi-md-quote, var(--fg-muted));
+  --md-quote-border: var(--pi-md-quote-border, var(--border));
+  --md-hr: var(--pi-md-hr, var(--border));
+  --md-bullet: var(--pi-md-list-bullet, var(--fg-muted));
+  --code-bg: color-mix(in srgb, var(--fg) 4%, var(--bg));
+  --shiki-foreground: var(--fg);
+  --shiki-background: transparent;
+  --shiki-token-constant: var(--pi-syntax-number, #d19a66);
+  --shiki-token-string: var(--pi-syntax-string, #98c379);
+  --shiki-token-string-expression: var(--pi-syntax-string, #98c379);
+  --shiki-token-comment: var(--pi-syntax-comment, #7f848e);
+  --shiki-token-keyword: var(--pi-syntax-keyword, #c678dd);
+  --shiki-token-parameter: var(--pi-syntax-variable, #e06c75);
+  --shiki-token-function: var(--pi-syntax-function, #61afef);
+  --shiki-token-punctuation: var(--pi-syntax-punctuation, var(--fg-muted));
+  --shiki-token-link: var(--md-link);
+  --shiki-token-inserted: var(--diff-add);
+  --shiki-token-deleted: var(--diff-del);
+  --shiki-token-changed: var(--warn);
+}
+/* Long sessions: off-screen messages skip layout and paint. */
+.message, .compaction-marker { content-visibility: auto; contain-intrinsic-size: auto 120px; }
+.markdown { font-size: 14px; line-height: 1.75; overflow-wrap: anywhere; }
+.markdown > :first-child { margin-top: 0; }
+.markdown > :last-child { margin-bottom: 0; }
+.markdown p, .markdown ul, .markdown ol, .markdown blockquote, .markdown table, .markdown pre { margin: 0 0 12px; }
+.markdown h1, .markdown h2, .markdown h3, .markdown h4, .markdown h5, .markdown h6 { color: var(--md-heading); font-size: 15px; font-weight: 650; margin: 18px 0 8px; }
+.markdown h1 { font-size: 17px; }
+.markdown a { color: var(--md-link); text-underline-offset: 2px; }
+.markdown ul, .markdown ol { padding-left: 22px; }
+.markdown li::marker { color: var(--md-bullet); }
+.markdown blockquote { color: var(--md-quote); border-left: 2px solid var(--md-quote-border); padding-left: 12px; }
+.markdown hr { border: 0; border-top: 1px solid var(--md-hr); margin: 16px 0; }
+.markdown code { font: 12.5px ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace; color: var(--md-code); }
+.markdown pre, .code-block { background: var(--code-bg); border: 1px solid var(--border); border-radius: 7px; padding: 10px 12px; overflow-x: auto; }
+.markdown pre code, .code-block code { color: var(--fg); font-size: 12.5px; }
+.markdown table { border-collapse: collapse; display: block; overflow-x: auto; font-size: 13px; }
+.markdown th, .markdown td { border: 1px solid var(--border); padding: 5px 9px; text-align: left; }
+.code-block pre { margin: 0; padding: 0; border: 0; background: transparent; white-space: pre; }
+div.code-block > pre.shiki { white-space: pre; }
+.tool-body .code-block { max-height: 320px; overflow: auto; }
+.diff { background: var(--code-bg); border: 1px solid var(--border); border-radius: 7px; padding: 8px 0; max-height: 420px; overflow: auto; font-size: 12px; white-space: pre; }
+.diff > div { padding: 0 12px; min-width: max-content; }
+.diff-add { color: var(--diff-add); background: color-mix(in srgb, var(--diff-add) 10%, transparent); }
+.diff-del { color: var(--diff-del); background: color-mix(in srgb, var(--diff-del) 10%, transparent); }
+.diff-hunk { color: var(--accent); }
+.diff-meta { color: var(--fg-dim); }
+.diff-context { color: var(--diff-context); }
+.diff + .diff { margin-top: 8px; }
+.message-body > div + div, .message-body > div + details, .message-body > details + div { margin-top: 10px; }
+.message-toolResult { padding-bottom: 12px; }
+.tool-summary { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: min(640px, 70vw); }
+.tool-name-bash .tool-symbol { color: var(--accent); }
+.tool-output.error-text, .error-text { color: var(--err); }
+.link-button { border: 0; padding: 0 0 0 8px; color: var(--accent); font-size: 12px; text-decoration: underline; text-underline-offset: 2px; background: none; }
+.link-button:hover:not(:disabled) { background: none; }
+.compaction-marker { display: flex; align-items: center; gap: 12px; color: var(--fg-dim); font-size: 11px; margin: 4px 0 26px; }
+.compaction-marker::before, .compaction-marker::after { content: ""; flex: 1; border-top: 1px dashed var(--border); }
+.history-limit button { font-size: 12px; }
+.history-limit span { display: block; margin-top: 6px; }
 @media (max-width: 650px) {
   .topbar { padding: 0 16px; min-height: 48px; }
+  .tool-summary { max-width: 58vw; }
   .session-bar { padding: 14px 16px; gap: 12px; }
   .session-details { font-size: 9px; }
   .session-details .mono { display: none; }

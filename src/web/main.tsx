@@ -1,10 +1,11 @@
 import { render } from "preact";
-import { useEffect, useRef, useState } from "preact/hooks";
+import { useEffect, useMemo, useRef, useState } from "preact/hooks";
 import type { JSX } from "preact";
 import {
   forgetSubmission, issueCommand, loadOlder, queryReceipt, reconnect, setDraft, startConnection, submitPrompt,
   webStore, type MessageView, type Submission, type ToolView, type WebState,
 } from "./store.js";
+import { Message, ToolCard, type ToolContext } from "./messages.js";
 import "./style.css";
 
 function useWebState(): WebState {
@@ -18,61 +19,6 @@ function useWebState(): WebState {
     return () => { unsubscribe(); cancelAnimationFrame(pending); };
   }, []);
   return state;
-}
-
-function outputText(value: unknown): string {
-  if (typeof value === "string") return value;
-  if (value === undefined || value === null) return "";
-  if (typeof value === "object" && "content" in value && Array.isArray(value.content)) {
-    return value.content.map((part: unknown) => {
-      if (part && typeof part === "object" && "text" in part && typeof part.text === "string") return part.text;
-      if (part && typeof part === "object" && "type" in part && part.type === "image") return "[图片：M0 暂不展示]";
-      return "";
-    }).filter(Boolean).join("\n");
-  }
-  try { return JSON.stringify(value, null, 2); } catch { return "[无法展示的结果]"; }
-}
-
-function Message({ message }: { message: MessageView }) {
-  const role = message.role === "user" ? "你" : message.role === "assistant" ? "pi" :
-    message.role === "toolResult" ? message.toolName ?? "工具结果" : message.role;
-  return (
-    <article class={`message message-${message.role} ${message.isError ? "message-error" : ""}`} data-message-id={message.id}>
-      <div class="message-meta"><span class="role">{role}</span>{message.status === "streaming" && <span class="streaming">正在生成</span>}</div>
-      <div class="message-body">
-        {message.content.map((content, index) => content.type === "thinking" ? (
-          <details class="thinking" key={index}>
-            <summary>思考过程{message.status === "streaming" ? " · 生成中" : ""}</summary>
-            <pre>{content.text}</pre>
-          </details>
-        ) : content.type === "toolCall" ? (
-          <details class="tool-call" key={index}>
-            <summary><span class="mono">{content.name}</span><span>工具调用</span></summary>
-            <pre>{outputText(content.arguments)}</pre>
-          </details>
-        ) : <pre class="message-text" key={index}>{content.text}</pre>)}
-        {!message.content.length && <span class="empty-content">等待内容…</span>}
-        {message.truncated && <p class="truncation">内容已截断。M0 保留有界预览，完整内容请查看终端。</p>}
-      </div>
-    </article>
-  );
-}
-
-function Tool({ tool }: { tool: ToolView }) {
-  const result = tool.output;
-  return (
-    <details class={`tool-card tool-${tool.status} ${tool.parentToolCallId ? "tool-nested" : ""}`} open={tool.status === "running"} data-tool-id={tool.id}>
-      <summary>
-        <span class="tool-title"><span class="tool-symbol">⌘</span><span class="mono">{tool.name}</span></span>
-        <span class="tool-status">{tool.status === "running" ? "执行中" : tool.status === "error" ? "执行失败" : "已结束"}</span>
-      </summary>
-      <div class="tool-body">
-        {tool.parentToolCallId && <p class="subtle">嵌套调用 · {tool.parentToolCallId}</p>}
-        <div class="tool-label">参数</div><pre>{outputText(tool.args)}</pre>
-        {result !== undefined && <><div class="tool-label">{tool.status === "running" ? "当前输出" : "结果"}{tool.outputTotal ? ` · 仅显示末尾，共 ${tool.outputTotal} 字符` : ""}</div><pre>{result}</pre></>}
-      </div>
-    </details>
-  );
 }
 
 function receiptLabel(item: Submission): string {
@@ -130,6 +76,20 @@ function App() {
   const host = snapshot?.state;
   const canPrompt = online && !!snapshot?.caps.commands.includes("prompt") && !host?.compacting && !host?.uiPrompts.length;
   const canConfigure = online && !!host?.idle && !host.compacting && !host.uiPrompts.length;
+  const messages = snapshot?.session.messages;
+  // Pair each tool call with its result and live progress; paired results render inside the call.
+  const view = useMemo(() => {
+    const results = new Map<string, MessageView>();
+    const called = new Set<string>();
+    for (const message of messages ?? []) {
+      if (message.role === "toolResult" && message.toolCallId) results.set(message.toolCallId, message);
+      for (const block of message.content) if (block.type === "toolCall") called.add(block.id);
+    }
+    const live = new Map<string, ToolView>((host?.tools ?? []).map(tool => [tool.id, tool]));
+    const visible = (messages ?? []).filter(message => !(message.role === "toolResult" && message.toolCallId && called.has(message.toolCallId)));
+    const orphans = (host?.tools ?? []).filter(tool => !called.has(tool.id) && !results.has(tool.id));
+    return { tools: { results, live } as ToolContext, visible, orphans };
+  }, [messages, host?.tools]);
 
   useEffect(() => { startConnection(); }, []);
   useEffect(() => {
@@ -189,7 +149,7 @@ function App() {
   return (
     <div class="app-shell">
       <header class="topbar">
-        <div class="brand"><span class="brand-icon">π</span><span>pi-pane</span><span class="milestone">M0</span></div>
+        <div class="brand"><span class="brand-icon">π</span><span>pi-pane</span><span class="milestone">M1</span></div>
         <div class="connection"><span class={`status-dot status-${connection}`} /><span>{labels[connection]}</span></div>
       </header>
       <div class="session-bar">
@@ -206,8 +166,8 @@ function App() {
         <div class="timeline-inner">
           {snapshot?.session.olderCursor && <div class="history-limit"><button type="button" disabled={state.historyLoading || !online} onClick={loadOlder}>{state.historyLoading ? "正在加载更早的消息…" : "加载更早的消息"}</button>{state.historyError && <span>{state.historyError}</span>}</div>}
           {!snapshot ? <div class="empty-state"><span class="empty-pi">π</span><h2>{connection === "switching" ? "等待新会话" : "连接当前会话"}</h2><p>在终端输入 /web 后，当前分支和正在生成的内容会显示在这里。</p></div> : !snapshot.session.messages.length && !host?.tools.length ? <div class="empty-state"><span class="empty-pi">π</span><h2>可以开始了</h2><p>终端与浏览器共享同一个会话。发送消息后，pi 的实际输出会出现在这里。</p></div> : null}
-          {snapshot?.session.messages.map(message => <Message key={message.id} message={message} />)}
-          {!!host?.tools.length && <div class="tools"><div class="section-label">工具执行</div>{host.tools.map(tool => <Tool key={tool.id} tool={tool} />)}</div>}
+          {view.visible.map(message => <Message key={message.id} message={message} tools={view.tools} expansions={state.expansions} />)}
+          {!!view.orphans.length && <div class="tools"><div class="section-label">工具执行</div>{view.orphans.map(tool => <ToolCard key={tool.id} live={tool} expansions={state.expansions} />)}</div>}
           {host?.running && <div class="running-line"><span class="running-indicator" />pi 正在运行</div>}
         </div>
       </div>
@@ -223,7 +183,7 @@ function App() {
             <textarea ref={textarea} aria-label="消息" rows={3} placeholder={host?.running ? "补充下一步… Enter 请求 followUp；⌘ / Ctrl + Enter 请求 steer" : "给 pi 发送消息…"} value={state.draft} onInput={event => setDraft(event.currentTarget.value)} onKeyDown={onKeyDown} />
             <div class="composer-actions"><span class="input-hint">Enter 发送 · Shift + Enter 换行</span><div class="action-buttons">{host && !host.idle && <button type="button" class="abort-button" disabled={!online || !snapshot?.caps.commands.includes("abort")} onClick={() => issueCommand("abort")}>■ 中止</button>}<button type="button" class="steer-button" disabled={!canPrompt || !state.draft.trim()} onClick={() => submit("steer")} title="⌘ / Ctrl + Enter">steer</button><button type="button" class="send-button" disabled={!canPrompt || !state.draft.trim()} onClick={() => submit("followUp")}>{host?.running ? "请求 followUp ↗" : "发送 ↗"}</button></div></div>
           </div>
-          <p class="scope-note">M0 以纯文本提交；不会执行网页中的 slash 命令或自动展开模板 / skill。消息提交仅确认已调用 pi。</p>
+          <p class="scope-note">网页按原文提交，不执行 slash 命令，也不展开模板 / skill。回执只确认已交给 pi。</p>
           <Receipts items={state.submissions} online={online} onRecover={text => { setDraft(text); textarea.current?.focus(); }} />
         </div>
       </footer>

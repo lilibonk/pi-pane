@@ -1,9 +1,9 @@
 {
   "name": "pi-pane",
-  "version": "0.0.0-m0",
+  "version": "0.0.0-m1",
   "private": true,
   "type": "module",
-  "description": "M0 spike for mirroring a live pi TUI session in a browser",
+  "description": "Mirror a live pi TUI session in a local browser",
   "keywords": [
     "pi-package"
   ],
@@ -22,7 +22,8 @@
     "m0:lifecycle": "node scripts/m0-lifecycle.mjs",
     "m0:boundaries": "node scripts/m0-boundaries.mjs",
     "m0:projection": "node scripts/m0-projection-extra.mjs",
-    "m0:performance": "node scripts/m0-performance.mjs"
+    "m0:performance": "node scripts/m0-performance.mjs",
+    "m1:render": "node scripts/m1-render.mjs"
   },
   "peerDependencies": {
     "@earendil-works/pi-ai": "*",
@@ -34,10 +35,14 @@
   "devDependencies": {
     "@earendil-works/pi-ai": "1.0.4",
     "@earendil-works/pi-coding-agent": "1.0.4",
+    "@shikijs/langs": "4.5.0",
     "@types/node": "24.7.0",
     "@types/ws": "8.18.1",
+    "dompurify": "3.4.16",
+    "marked": "18.1.0",
     "playwright": "1.55.1",
     "preact": "10.29.8",
+    "shiki": "4.5.0",
     "tsx": "4.20.6",
     "typescript": "5.9.3",
     "vite": "7.3.7",
