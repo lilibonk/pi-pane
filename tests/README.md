@@ -1,145 +1,115 @@
 # Verification
 
-`npm test` exercises runtime schema validation, Hub leases and command deduplication, transport sequencing, lifecycle cleanup and Bridge boundaries. The Hub tests open short-lived loopback listeners with synthetic session state; they do not run a model.
+Current source is the unreleased **0.2.0 foreground handoff** on pi/pi-ai 1.1.0. All current end-to-end fixtures follow **real TUI → `/web` → foreground Hub + one public RPC child → browser/WebSocket operations**. There is no parallel TUI writer, private RPC extension channel, internal command gateway, or mirror mode.
 
-`npm run m0:smoke` runs the selected pi CLI in a real POSIX PTY and connects real WebSocket clients. Current development dependencies use pi 1.1.0; the original M0/M1 reports used 1.0.4. It needs Node.js, Python 3 and a built project. The fixture provider emits deterministic local text and a local streaming echo tool; it has no network request implementation. `PI_OFFLINE=1`, an environment allowlist, a task-owned HOME, working directory and `PI_CODING_AGENT_DIR` keep the run separate from user packages, sessions and authentication.
+The published 0.1.0 M0–M2 reports and the saved M3 workbench commit `6196c7b` remain historical evidence. Their old passing counts do not verify this backend. Current execution results, unresolved failures and cleanup are recorded in [M3 status](../docs/m3-status.md); current reports default to `build-artifacts/m3/handoff/`.
+
+## Isolation and prerequisites
+
+Node.js, Python 3, a POSIX PTY, project-local pi 1.1.0, and built output are required. Browser scripts use local Chrome through the existing Playwright harness; new M3 desktop/mobile QA uses CUA against the real UI.
+
+Deterministic fixtures use a task-owned temporary HOME, `PI_CODING_AGENT_DIR`, session directory and workspace, `PI_OFFLINE=1`, and an environment allowlist. The local deterministic provider has no network request implementation. Skills/templates/test extensions are created only in those temporary directories. Git fixtures avoid user configuration/hooks/filters. The deterministic matrix does not read daily credentials or replace the daily installed pi-pane.
 
 ```sh
+npm ci
+npm run typecheck
+npm test
 npm run build
-npm run m0:smoke
-PI_M0_EXTENSION=./dist/extension/index.js PI_M0_REPORT_DIR=./build-artifacts/m0-dist npm run m0:smoke
+PI_M0_EXTENSION=./dist/extension/index.js npm run m0:smoke
 ```
 
-Optional `PI_M0_CLI` selects an explicit `pi-coding-agent/dist/cli.js`. `PI_M0_EXTENSION` selects the source or built extension. `PI_M0_REPORT_DIR` selects the evidence directory. Defaults use project-local dependencies and `src/extension/index.ts`.
+`PI_M0_CLI` selects an explicit CLI; `PI_M0_EXTENSION` selects source or built extension. `PI_M0_REPORT_DIR` and script-specific report variables change evidence directories. Integration assertions record the actual selected host version. `m3:workbench` requires 1.1.0. The package requires coding-agent ≥1.1.0 <2; only 1.1.0 is currently tested.
 
-The selected CLI's package supplies the actual host version. Fixture settings, lifecycle consumer installation and A11 package installation follow that selection. `PI_M0_CLI` can select a different explicit host; the install command and installed-package startup use the same CLI. M3 workbench acceptance specifically asserts pi 1.1.0.
+Reports contain synthetic inputs, JSON events and redacted terminal transcripts. Private access files are 0600 and removed with fixtures. Tokens are used in memory and redacted from logs. Each harness closes sockets/listeners/processes and removes task-owned temporary resources. Windows handoff is rejected; macOS and Linux implementation support does not imply both were exercised in every report.
 
-The smoke report lists each executed check and explicit uncovered branches. A passing report means those checks passed; it does not mean all M0 questions or M1 acceptance criteria are complete. The test covers TUI text entry, preservation of an unsent draft, multiple browser clients, prompt/steer/followUp, partial text and tool snapshots, reconnect, abort, tree cancellation/navigation, runtime reload/new/fork/resume, stale commands, duplicate IDs, local handshake checks, stop/restart and token rotation. Fork/resume/tree targets are selected through fixture commands that call the real command-context APIs; their built-in selection dialogs are not automated.
-
-The focused integration scripts use the same isolation rules:
+## Current regression matrix
 
 ```sh
+npm run m0:smoke
+npm run m0:browser
 npm run m0:lifecycle
 npm run m0:boundaries
 npm run m0:projection
 npm run m0:performance
-```
-
-`m0:lifecycle` tests actual extension removal, syntax errors, a 12-second extension factory delay against the real 10-second rebind deadline, settings precedence, concurrent official settings writers, port conflicts, multiple pi instances and an independent npm consumer of the packed extension. The consumer pins pi and pi-ai to the selected CLI's version; this does not verify pnpm's isolated dependency layout or npm publication. The extension reads settings only; preservation by the host's locked merge writer does not prove crash-atomic saving.
-
-`m0:boundaries` loads another real extension to consume/transform inputs, discover a template and a skill, replace a finalized message, open a terminal dialog and fail local summarization. It also checks thinking/tool-argument reconnects, positive TUI template/skill expansion controls, TUI queue consumption/dequeue, unread receipt recovery, and session replacement while input/model hooks or compaction are pending. The compact-success check compares the attached client's history with a fresh canonical snapshot, including the compaction marker. No-model and missing-authentication checks use isolated host preflight; the controlled provider error has no outbound network request.
-
-`m0:projection` checks visible custom messages added by an idle extension and actual TUI `!printf` output. Connected viewers receive the changes without a model turn or resync; hidden custom messages and opaque entry data remain absent. Reconnected snapshots retain the same message IDs and epoch. Unit regressions also cover combined text/error/output limits.
-
-`m0:performance` compares a fixed workload with no pane, Bridge only, Hub with no viewers, and four/eight WebSocket viewers. Measurements are taken inside the host process. Provider generation, browser application latency, host process memory and pane cache bounds are distinct metrics. Three rounds are an exploratory comparison, not a production P95 claim. Theme tests use public `setTheme`, same-name file rewrites and PTY terminal-color responses; they do not verify a desktop OS theme switch.
-
-Reports contain synthetic fixture messages, a redacted terminal transcript and JSON event evidence. Browser tokens are used only in memory for the test connection and are redacted before writing terminal logs. Processes, sockets and temporary test configuration are closed on completion. The PTY harness currently supports macOS/Linux; Windows PTY behavior is not verified.
-
-Prompt receipts are dispatch-only even when a hook consumes input or the host later fails preflight. Race checks prove stale-command rejection and that old completions do not enter a replacement epoch; they do not claim to undo host operations that already began. Lease expiration and receipt-cache eviction use the existing short-TTL Hub integration tests instead of waiting 30 minutes in the TUI harness. All fake-provider calls remain local; no real authentication credentials or model service is used.
-
-## M1 additions
-
-The M0 harnesses remain the regression suite and now speak the M1 protocol: their WebSocket clients reassemble `frame_begin`/`frame_chunk`/`frame_end` and apply events through the shared `applyProjectionEvent` reducer from `dist/protocol`, the same code the browser uses. Build before running them.
-
-```sh
-npm run build
 npm run m1:render
 npm run m1:a6
-node scripts/m0-performance.mjs --skip-overload
-```
-
-`m1:render` starts a real Hub on the built `web-dist` with a stub Bridge holding a fixed transcript (no pi process). It checks Markdown, Shiki highlighting, typed tool cards and diffs, `content_page` expansion, `history_page` loading and the 390px layout, and the content-safety part of A8: raw HTML stays text, `javascript:`/`data:` links are removed, Markdown images become links and nothing remote is requested.
-
-`m1:a6` runs the real TUI with the performance fixture, adds 1,000 visible custom messages of 912 characters (≈0.91 MB of normalized text, no images) and reloads one Chrome tab 20 times. Each sample is the time between the page's `pi-pane:ws-open` and `pi-pane:snapshot-rendered` performance marks (the latter is set one animation frame after the snapshot commit). It reports P50/P95/max, navigation-to-rendered separately, and then pages the whole dataset into the same tab.
-
-`m0-performance` (A5) now verifies the 8 MiB send-buffer recycle of a paused peer, reads a 2 MiB tool result in full through `content_page`, and pages more than 1,000 history messages back to the branch root with every transport frame at most 1 MiB. `--skip-overload` skips the 4 MiB CPU-profile diagnostic, whose earlier non-completion is a host/fixture limitation.
-
-## M2 additions
-
-The fixture provider now declares image input and records the images it receives (`provider_call.images`). `tests/fixtures/image-history.ts` appends displayed custom messages that carry noisy PNGs without a model turn. `startFixture` accepts `PI_PANE_PASSWORD` as an environment override, captures external `https://…/#t=` links as `publicUrl`, and supports `packaged: true` with `prepareAgentDir` to load pi-pane from an installed package instead of `-e`.
-
-```sh
-npm run build
-PI_M0_EXTENSION=./dist/extension/index.js npm run m2:images
-PI_M0_EXTENSION=./dist/extension/index.js npm run m2:external
+npm run m2:images
+npm run m2:external
 npm run m2:install
+npm run m3:handoff
+npm run m3:workbench
 ```
 
-`m2:images` (A9) attaches Chrome-encoded PNG/JPEG/WebP by paste, drop and picker and checks they reach the provider; rejects damaged, oversized, mislabeled, over-pixel, unsupported, undecodable and fifth images in the browser and the same classes again over a raw WebSocket; loads 160 history images lazily while scrolling with the browser image cache at most 48 MiB; and shows an explicit error for a 6 MiB history image.
+| Script | Handoff coverage |
+|---|---|
+| `m0:smoke` | Actual TUI seed and idle handoff, prompt/steer/followUp/abort, text/thinking/tool partial snapshots and reconnect, multiple browser clients, RPC new/switch/fork, stale scope, deduplication and handshake errors |
+| `m0:browser` | Actual browser replies, IME/draft behavior, prompt/control receipts, refresh/reconnect and model/thinking/compact controls through the RPC writer |
+| `m0:lifecycle` | Public settings writer behavior, no listener before explicit `/web`, command/flag/settings precedence, invalid configuration, port conflicts and multiple foreground services, latest-session Ctrl+C recovery |
+| `m0:boundaries` | Real fixture input consume/transform, RPC extension/skill/template expansion, no-model/auth/provider/compaction errors, thinking/tool arguments, queue behavior, lost receipt querying, serial scope rejection, dialog forwarding |
+| `m0:projection` | Displayed custom messages, hidden extension data exclusion, bash output and stable reconnect projection identities without relying on a live TUI viewer |
+| `m0:performance` | Writer telemetry, fixed generation workload, 4/8 viewers, bounded history/content pages, send-buffer backpressure and explicit slow-client recycle; Hub host and RPC writer are separate processes |
+| `m1:render` | Fixed safe transcript on a real Hub: Markdown/Shiki/tool cards/diff/thinking, pagination/content expansion, hostile HTML/URLs and 390px layout; no pi model process needed for this rendering test |
+| `m1:a6` | 1,000-message reference data set, 20 actual browser samples from WS open to snapshot-rendered, P50/P95/max and complete paging; navigation time separately recorded |
+| `m2:images` | Paste/drop/picker upload PNG/JPEG/WebP, browser/server rejection classes, provider receipt of image data, 160 history images lazy loading and 48-MiB cache, oversize history error |
+| `m2:external` | TLS and same-machine proxy, password/bootstrap distinction, login/logout/revoke, handoff banner QR, direct TLS, mobile followUp/steer and proxy-cut reconnect |
+| `m2:install` | `npm run build` then `npm pack --ignore-scripts` prebuilt assets/themes/CSS, clean HOME/agent/npm cache install, installed TUI `/web` handoff, browser submit/refresh; local tarball is not publication |
+| `m3:handoff` | Real TUI shutdown, one RPC writer, four extension dialogs, cancellation/timeout/late answers, reconnect UI state, rename/clone/current marker, session lock, Ctrl+C/SIGHUP/SIGKILL/child crash and unexpected external file changes |
+| `m3:workbench` | Session/commands/resources reads, file confinement and real Git diff, extension once-only dispatch, RPC slash/template/skill expansion, new/cancel/scope queue, discovered-ID resume, cross-cwd roots, user-entry fork draft, receipt dedup and slow-stream reconnect |
 
-`m2:external` (A10, A11 mobile) generates a test certificate with `openssl`, maps a public host name to loopback with Chrome's host resolver rules and accepts the certificate with `ignoreHTTPSErrors`. A local TLS reverse proxy preserving Host, Origin and the WebSocket subprotocol stands in for a same-machine proxy such as Tailscale Serve. It covers refusals, login, bootstrap-only upgrades, logout, `/web qr`, rotation, direct TLS, and a Pixel 7 touch viewport including reconnect after the proxy cuts every connection.
+Script definitions are not passing results. The current deterministic matrix passed 122/122 checks across 14 suites (including 3 performance and 2 initial-theme checks), recorded in `build-artifacts/m3/handoff/regression-matrix.json`; 121/121 unit tests, typecheck and production build also passed. Actual results remain in [M3 status](../docs/m3-status.md). The historical slow-reconnect timeout is tracked again under handoff; subsequent passes cannot prove its old cause. Failure reports retain terminal/provider/client diagnostics before fixture cleanup, and reruns retain the first failure.
 
-`m2:install` (A11) runs `npm pack` (which rebuilds through `prepack`), checks the tarball, serves it from a local registry that proxies other packages to npmjs, runs `pi install npm:@lilibonk/pi-pane@<version>` into a clean agent directory and npm cache, and starts the installed package with `--web`. It needs network access for the runtime dependencies. Publication and gallery listing are not covered.
+## Retired mirror checks and replacements
 
-For a published version, set `PI_M2_PUBLISHED_TARBALL` to the absolute path of the frozen release tarball. This skips pack/prepack, verifies the public registry's version and integrity, and installs from `https://registry.npmjs.org/` with empty npm configuration, a fresh HOME, agent directory and cache. The npm lock must record that public source and the same integrity. The browser checks also cover refresh, restored history and a new prompt after reconnect; gallery and real-provider conversations remain separate checks.
+- **Parallel TUI + browser writes** are removed. Multi-browser serial commands, scope fences, RPC queue/disposition and unique-writer lifecycle replace them.
+- **Runtime extension rebind/removal/import-delay after `/web`** no longer governs the network host. TUI stage has no Hub; child crash/exit, host signals and EOF cleanup cover failure shutdown. Rebind and `/web stop/status` assertions are retired explicitly.
+- **`--web` auto-start**, `/web qr` widget and TUI `/web --rotate` are removed. Explicit idle handoff/no-listener configuration, banner QR and browser credential rotation replace them.
+- **TUI tree navigation and tree cancellation** have no public RPC command. Read-only tree via `get_entries`, native user-entry `fork`, draft recovery and a disabled reason replace navigation; no private channel is added.
+- **Live TUI theme switching/same-name theme rewrite after handoff** is retired. Initial theme snapshot, packaged themes and custom CSS remain covered. A rendering helper test may verify CSS derivation without claiming a live RPC theme API.
+- **Terminal custom components** cannot run in RPC. Standard select/confirm/input/editor and supported one-way extension UI are adapted and checked; arbitrary custom TUI rendering is excluded.
 
-```sh
-PI_M0_CLI=/path/to/pi-coding-agent/dist/cli.js \
-PI_M2_PUBLISHED_TARBALL=/absolute/path/lilibonk-pi-pane-0.1.0.tgz \
-PI_M2_REPORT_DIR=./build-artifacts/m2/npm-release/install-published npm run m2:install
-```
+## Protocol and unit coverage
 
-Unit tests add image structure and limit validation (`images.test.ts`), external access with real HTTP/WS and HTTPS/WSS listeners (`external.test.ts`), and a QR round trip through jsQR (`qr.test.ts`).
+`npm test` validates runtime schema, leases/deduplication, contiguous projection sequencing, directed workbench reads and pre/post-read scope checks, bounds/backpressure, canonical message identities, encoding/path/symlink/filter boundaries, session sidecar lock, child argument filtering/exit takeover, public RPC host failures, and browser helpers. Synthetic Hub tests open short-lived loopback listeners without a model.
 
-## M1/M2 收尾
+Frontend helpers cover builtins while catalog loading, builtin-vs-extension name conflicts, Unicode command arguments, new-session RPC fork draft recovery in either receipt/snapshot order, preserving edited drafts and rejecting stale recovery. `EditorChangeGuard` ensures reconnect/status/widget snapshots do not repeatedly overwrite edited drafts; only new set_editor_text revisions apply. This concerns fork recovery and reconnecting the same loaded page; ordinary unsent drafts are not persisted across page reloads.
 
-`diff.test.ts` 验证按词 diff 的中文、emoji、空白、多行替换、文件头与内容区分以及计算预算；`theme.test.ts` 验证公开主题路径、`export.pageBg`/vars、OKLCH 派生、文件原子替换与异常降级、包内主题资源；`thinking.test.ts` 验证多段观测计时、重连快照、canonical 改写、未知历史、中断和生命周期清理。协议测试确认耗时变化走块级替换，共享 reducer 不丢字段。
+Projection/read frames do not consume client write counters or event seq. Commands are not automatically replayed after network loss. RPC `started`/`queued`/`handled` receipts are observed results, not a fabricated inference from model output. Old retained receipts can be queried without executing again; lease/cache expiry limits still apply.
 
-`m1:render` 新增词级范围、恶意 HTML diff 纯文本渲染与折叠思考耗时检查；`m0:boundaries` 验证真实 thinking 流在重连和落盘后保留耗时；`m0:performance` 的主题部分新增仅修改 export 背景及其派生颜色的热更新检查；`m2:install` 检查 tarball 中的主题与覆盖 CSS，并在干净安装后切换两个包内主题、直接修改 CSS 后刷新验证生效。安装夹具显式设置 `loadThemes: true`；其他夹具默认仍使用 `--no-themes`。
+## Performance and content checks
 
-这轮完整回归命令与结果见 [M1/M2 收尾验收记录](../docs/m2-followup-status.md)。`m2:install` 的 prepack 会重新构建，仍须最后单独运行。
+`m1:a6` uses 1,000 visible messages around 0.91 MiB normalized text with no images, measures 20 browser reloads, and records OS/Node/pi/CPU. The ≤1s P95 goal applies to WS-open → snapshot-rendered for that dataset, not browser launch, large images or slow networks. `m0:performance` explores deterministic RPC-writer telemetry and bounded caches. The current run used `--quick`: one observation per configuration, with 0/4/8 viewers yielding about 307/312/305 ms for 256 KiB and writer event-loop P95 about 10.84–10.96 ms. CPU/RSS/event-loop readings exclude the independent web host; TUI-versus-RPC ratios do not isolate pi-pane overhead. These are local engineering guards, not reliable production tail latency or a long-term leak soak. The 20-second overload profile was not run. Use `--skip-overload` only when recording that diagnostic exclusion. The separate 20-sample A6 run passed with WS-open → snapshot-rendered P95 47.8 ms for the stated dataset.
 
-## 真实模型试用
+`m1:render` checks raw HTML as text, sanitized unsafe links, model images as links with no remote fetch, hostile diff text, typed cards, thinking timing and mobile layout. The shared reducer and transport chunk assembler are the same built code the SPA uses.
 
-`m2:real-model` 与上述夹具分开，只有显式设置 `PI_PANE_REAL_MODEL` 才会运行。它使用现有 pi 登录和日常安装的 pi-pane，在临时工作目录和会话目录中发送三条合成输入；不加载项目上下文、skills、模板或 MCP。真实模型可使用内置 read/bash/write/edit，系统说明将操作限制在临时目录。
+## External access and installation
 
-```sh
-PI_M0_CLI=/path/to/pi-coding-agent/dist/cli.js \
-PI_PANE_REAL_PROVIDER=qwen-token-plan-cn PI_PANE_REAL_MODEL=qwen3.7-max \
-PI_M2_REPORT_DIR=./build-artifacts/m2/pi-1.1-trial/real-model npm run m2:real-model
-```
+`m2:external` uses an OpenSSL test certificate, loopback hostname mapping and a local TLS reverse proxy preserving Host/Origin/subprotocol. Test browser certificate acceptance does not assert a real device trusts that certificate. It exercises the deployment contract, not a real Tailscale Serve installation.
 
-脚本检查 TUI `/web`、终端与网页各一轮真实回复、真实 bash 的执行计数、工具运行时刷新和同租约重连，以及 fresh snapshot 与共享 reducer 的一致性。每轮最长 3 分钟，总上限 10 分钟；结束时清理临时目录和子进程，报告与终端日志脱敏。`submittedPrompts` 是提交数，不能当作 provider 请求数或账单调用数。一次通过不代表日常一周稳定性，发布后的正式 registry 安装仍须另外验证。
+`m2:install` expects prebuilt output (`npm run build`), runs `npm pack --ignore-scripts`, serves the tarball via a local test registry for the package, proxies runtime dependency fetches to npm, installs into a clean isolated agent/npm directory, then starts a real TUI and invokes `/web`. Network access is needed for package dependencies; fixture model calls remain local. Build after final source changes before running it; the isolated pack step does not run prepack. Published-version integrity mode only applies to an explicitly frozen release tarball; 0.1.0 results remain historical and do not validate new 0.2.0 behavior.
 
-## M3 工作台
+## Actual browser M3 QA
 
-```sh
-npm run typecheck
-npm test
-npm run build
-PI_M0_EXTENSION=./dist/extension/index.js npm run m3:workbench
-```
-
-`m3:workbench` 启动真实 pi 1.1.0 TUI，并用两个真实 WebSocket 客户端检查首批工作台协议。`scripts/m3-fixture.mjs` 在临时 HOME / agent 目录创建独立 skill、模板、测试扩展、Git 工作区及另一 cwd 的会话；`startFixture` 的 `loadSkills` / `loadPromptTemplates` 仅在本夹具显式启用，其他夹具保持默认禁用。不会加载日常资源或认证，本地 provider 不实现网络请求，远程模型调用为 0。
-
-15 项集成场景包括：
-
-1. workbench 能力、会话目录、命令与资源发现。
-2. 文件发现、有界预览及工作区路径边界。
-3. 实际 Git 状态、已跟踪与未跟踪文件的 diff。
-4. 注册扩展命令明确分派一次，重复命令不再调用宿主，也不触发模型回合。
-5. 普通 prompt 中的 slash 仍为字面文本。
-6. 明确选择的模板经真实宿主展开。
-7. 明确选择的 skill 经真实宿主展开。
-8. 新建同步两个客户端，并拒绝旧会话命令。
-9. 宿主取消保留当前会话，后续读取仍可用。
-10. 通过目录 ID 恢复会话，使用 fresh command context，拒绝未发现目标。
-11. 跨工作区恢复后 cwd、文件查询和命令网关一致，再回到原工作区。
-12. 真实 fork/tree，用户消息导航到父节点并返回文本草稿。
-13. epoch 替换后会话操作仍去重，重连可查询保留的旧 epoch 结果。
-14. 运行中拒绝会话切换，同时流式消息、租约重连和双端投影保持一致。
-15. 真实宿主延迟会话切换 500 ms，另一客户端的竞争 prompt 被 busy 拒绝，provider 调用不增加，并验证切换结束后的后续操作。
-
-报告默认写到 `build-artifacts/m3/workbench/report.json`，可用 `PI_M3_REPORT_DIR` 改目录。它记录实际运行结果与未覆盖范围；测试定义 15 项不表示全部通过。第 15 项来自浏览器发现的 new→prompt 竞态：跨 Bridge 写屏障与 `StateView.mutating` 必须同时证明宿主拒绝及所有客户端禁用提交/保留草稿。桌面、移动端、焦点、抽屉、文件引用、命令菜单与刷新等 UI 操作通过 CUA 在真实界面另验收，截图和浏览器记录保存在同一目录。完整状态见 [M3 验收记录](../docs/m3-status.md)。
-
-2026-10-09 最终源码类型/构建通过，单测 92/92、真实 TUI/WS 15/15、smoke 21/21、CUA 22 项通过。此前一轮并行复跑的 slow reconnect settled 等待超时保留为 `report-reconnect-first.json`，缺少足够原始证据，原因待定位；不能凭随后独立复跑与实际浏览器刷新通过将其归因为负载。脚本已增加失败时终端、provider events 和 client 状态落盘，供后续再现；已通过的本批验收不等于长期稳定。
+CUA separately verifies desktop/mobile workbench actions, current session marker refresh, rename/clone/fork, original draft preservation, builtins that open pickers or explain unavailable capabilities, real file quotation and Git diff, extension dialog focus/cancel/expiry/reconnect, one-way UI, credential rotation and midstream reload. A passing WS report does not imply the corresponding UI interaction passed. Screenshots, widths, console errors and teardown are saved under `build-artifacts/m3/handoff/`; `cleanup.json` confirms the CUA preview and original failed fixture processes, listener, private access and locks were removed. The current final CUA report has 19/19 passing checks at 1280/390px and zero console errors: `browser-report.json`, `browser-desktop.png`, `browser-mobile.png` and `browser-mobile-dialog.png`. The first empty-fork clone failure remains in `browser-clone-first.png`/`.txt` and `cua-empty-fork-clone-failure/`; the native failed result now leaves the service usable, with workbench check 16 and actual CUA reruns covering both failed empty-branch clone and successful persisted-branch clone.
 
 ```sh
 PI_M0_EXTENSION=./dist/extension/index.js node scripts/m3-workbench.mjs --serve
 ```
 
-`--serve` 在集成通过后保留临时 TUI 供浏览器操作，写入权限 0600 的 `access.json`；访问链接不输出到报告。结束进程会清理客户端、监听、临时 HOME/agent/工作区及访问文件，不修改日常 npm 来源。此模式用于人工或 CUA 验收，不新增浏览器自动化断言。
+`--serve` preserves the isolated foreground host after checks for human/CUA use and creates a private `access.json` with the visit link. Normal/signal cleanup closes owned resources and removes it. It does not change the daily npm installation.
 
-`workbench.test.ts` 检查严格的读/写 schema、目录/资源投影、自定义会话目录与跨工作区恢复、nonce 只消费一次、生命周期取消、fresh context、主机同步失败后释放控制锁、普通输入/明确展开区分、内建名称冲突与 Unicode 命令。`workspace.test.ts` 检查路径与符号链接边界、文本编码/上限，以及实际 Git 状态/diff 和禁用仓库过滤器；`web-draft-recovery.test.ts` 验证现场树导航在快照与结果任意顺序下仅恢复一次，不用旧回执覆写新草稿。Hub 测试另覆盖在途读取上限、定向响应和会话替换后的迟到结果。
+## Real-provider trial
 
-资源写入、标准对话框/审批、Plan/Goal/Agent 语义和后台交接属于后续 M3-C/D，不能由本批确定性检查推定已完成；新增 M3 也尚未作真实远程 provider 全链路试用或 npm 发布。
+The real-provider script is a separate explicit opt-in flow; its results are recorded separately from the deterministic matrix. Both `PI_PANE_REAL_MODEL` and `PI_PANE_REAL_AGENT_DIR` must be explicitly provided. The agent directory must resolve under the OS temporary directory and be task-owned; the maintainer prepares/login authenticates it separately. The harness never reads or copies authentication content, rejects daily agent directories, creates a new temporary HOME/workspace/session directory, and passes only allowed environment variables. It does not inherit daily API keys or packages.
+
+For a trial explicitly authorized by the user to reuse existing local authentication, the temporary agent may contain an `auth.json` symlink. This additionally requires `PI_PANE_REAL_AUTH_SYMLINK_TARGET` to name the exact authorized absolute target; the report records `user-authorized-existing-auth-via-symlink`. The model process accesses that authentication for the trial, while the harness neither reads nor copies its content. This authorization applies to that trial only and does not enable daily-credential use in deterministic regressions.
+
+```sh
+PI_M0_EXTENSION=./dist/extension/index.js \
+PI_PANE_REAL_PROVIDER=<provider> PI_PANE_REAL_MODEL=<model> \
+PI_PANE_REAL_AGENT_DIR=/absolute/os-temp/task-owned-agent \
+npm run m2:real-model
+```
+
+The initial TUI trial reply completes before `/web`. Browser replies and one builtin bash tool then execute in the RPC child, with refresh/reconnect and final canonical projection checks. There are no parallel-terminal assertions. Each turn is limited to 3 minutes, total 10 minutes; temporary resources are cleaned and transcripts redacted. submittedPrompts is not a provider-call/billing count. A successful short trial does not prove weekly stability. npm publishing remains the maintainer's action.
+
+The 2026-10-10 separately authorized source trial passed 5/5 on pi 1.1.0 with `qwen-token-plan-cn/qwen3.7-max`: three short prompts, one builtin bash execution, refresh during the tool and matching fresh canonical snapshots, with zero page/protocol errors. Evidence: `build-artifacts/m3/handoff/m2/real-model/report.json` and `browser.png`. It used the explicitly authorized symlink mode; the temporary agent/reference was removed afterward and the original credential retained mode 0600. Deterministic regressions still have zero remote model calls.

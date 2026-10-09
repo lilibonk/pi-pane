@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { missingHostCapabilities, readPaneSettings } from "../src/extension/config.js";
+import { readPaneSettings } from "../src/extension/config.js";
 
 test("piPane reads validated settings without mutating the host's effective snapshot", () => {
   const settings = { piPane: { host: "127.0.0.1", port: 8123, noOpen: true }, theme: "light" };
@@ -16,9 +16,7 @@ test("unsupported or nonloopback persistent options fail closed", () => {
     assert.throws(() => readPaneSettings({ piPane }), /piPane|Unsupported/);
 });
 
-test("missing host capabilities are described before runtime resources start", () => {
-  const missing = missingHostCapabilities({}, {});
-  assert.ok(missing.includes("pi.getSettings"));
-  assert.ok(missing.includes("ctx.sessionManager.getBranch"));
-  assert.ok(missing.includes("ctx.ui.theme.colors/appearance"));
+test("web startup is not a persistent option in handoff mode", () => {
+  assert.throws(() => readPaneSettings({ piPane: { web: true } }), /Unsupported|piPane/);
+  assert.throws(() => readPaneSettings({ piPane: { mirror: true } }), /Unsupported|piPane/);
 });

@@ -1,9 +1,9 @@
 #!/usr/bin/env node
-/** Opt-in real-model trial against the user's installed pi-pane and existing pi authentication. */
+/** Opt-in real-model trial with explicit task-owned authentication and a temporary HOME. */
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { randomBytes } from "node:crypto";
-import { mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
+import { lstat, mkdir, mkdtemp, readFile, readlink, realpath, rm, writeFile } from "node:fs/promises";
 import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
@@ -14,13 +14,15 @@ import { chromium } from "playwright";
 import { openClient, readPiHost, textOf } from "./m0-smoke.mjs";
 
 const model = process.env.PI_PANE_REAL_MODEL?.trim();
-if (!model) {
-  console.error("Real model trial is disabled. Set PI_PANE_REAL_MODEL explicitly to a model already authenticated in pi.");
+const selectedAgentDir = process.env.PI_PANE_REAL_AGENT_DIR?.trim();
+const authorizedAuthLinkTarget = process.env.PI_PANE_REAL_AUTH_SYMLINK_TARGET?.trim();
+if (!model || !selectedAgentDir) {
+  console.error("Real model trial is disabled. Set PI_PANE_REAL_MODEL and PI_PANE_REAL_AGENT_DIR to an explicitly authenticated task-owned agent directory under the OS temporary directory. Existing credentials require an explicitly authorized auth.json link and PI_PANE_REAL_AUTH_SYMLINK_TARGET; no credentials are read or copied by this harness.");
   process.exit(2);
 }
 if (process.platform === "win32") throw new Error("This real-TUI trial requires a POSIX PTY (macOS or Linux).");
 const project = resolve(dirname(fileURLToPath(import.meta.url)), "..");
-const outputDir = resolve(process.env.PI_M2_REPORT_DIR || join(project, "build-artifacts/m2/real-model"));
+const outputDir = resolve(process.env.PI_M2_REPORT_DIR || join(project, "build-artifacts/m3/handoff/m2/real-model"));
 const TURN_TIMEOUT_MS = 180_000;
 const TOTAL_TIMEOUT_MS = 600_000;
 const pause = ms => new Promise(done => setTimeout(done, ms));
@@ -46,8 +48,9 @@ const toolPrompt = `In the current temporary directory, run the builtin bash too
 const prompts = [tuiPrompt, webPrompt, toolPrompt];
 const report = {
   startedAt: new Date().toISOString(), realTui: true, realModel: true, submittedPrompts: 0,
-  scope: "pi 1.1.0, installed pi-pane, terminal/web conversation, builtin bash, refresh/reconnect",
-  isolation: "Empty temporary cwd and session directory; existing pi authentication and installed packages; no context files, skills, templates or MCP",
+  scope: "pi 1.1.0, source pi-pane, saved TUI history → foreground /web RPC, builtin bash, refresh/reconnect",
+  isolation: "Temporary HOME, cwd and session directory; explicitly selected task-owned temporary agent; no daily settings/models or pi installation; harness does not read or copy credential content",
+  authenticationMode: authorizedAuthLinkTarget ? "user-authorized-existing-auth-via-symlink" : "explicit-task-owned-authentication",
   limits: { turnTimeoutMs: TURN_TIMEOUT_MS, totalTimeoutMs: TOTAL_TIMEOUT_MS },
   checks: [], status: "running",
   notCovered: ["Daily-use stability beyond this trial", "External HTTPS access and mobile devices", "Exact provider request count, billing or retries"],
@@ -144,12 +147,29 @@ async function startPi(host) {
     port = listener.address().port;
   } finally { await new Promise(done => listener.close(done)); }
   ensureLive();
+  const agentDir = await realpath(resolve(selectedAgentDir));
+  const temporaryRoot = await realpath(tmpdir());
+  assert.ok(agentDir.startsWith(temporaryRoot + "/"), "real-model agent directory must be task-owned under the OS temporary directory");
+  // This opt-in permits an explicitly authorized link for a single manual trial.
+  // Check link metadata only: neither read nor copy the credential file here.
+  const authPath = join(agentDir, "auth.json");
+  const authMetadata = await lstat(authPath);
+  if (authMetadata.isSymbolicLink()) {
+    assert.ok(authorizedAuthLinkTarget && resolve(authorizedAuthLinkTarget) === authorizedAuthLinkTarget,
+      "an auth.json symlink requires an explicit absolute PI_PANE_REAL_AUTH_SYMLINK_TARGET authorization");
+    assert.equal(resolve(agentDir, await readlink(authPath)), resolve(authorizedAuthLinkTarget), "test auth link matches the explicitly authorized file");
+  } else {
+    assert.ok(!authorizedAuthLinkTarget, "existing auth authorization requires a symbolic link instead of a copied credential file");
+    assert.ok(authMetadata.isFile(), "task-owned auth.json must be a file or an explicitly authorized symbolic link");
+  }
   const systemPrompt = `You are performing a synthetic pi-pane acceptance test. Follow each test prompt exactly and keep replies short. Only use the allowed builtin tools when explicitly asked. All shell commands, reads and writes must stay inside the temporary working directory ${actualCwd}. Never inspect credentials, environment variables, home directories, authentication files or other projects. Do not use network tools or invoke other agents.`;
-  const argv = [process.execPath, host.cli, "--offline", "--verbose", "--no-context-files", "--no-skills", "--no-prompt-templates", "--no-mcp",
+  const argv = [process.execPath, host.cli, "--offline", "--verbose", "--no-extensions", "-e", resolve(process.env.PI_M0_EXTENSION || join(project, "dist/extension/index.js")), "--web-port", String(port), "--web-no-open", "--no-context-files", "--no-skills", "--no-prompt-templates", "--no-mcp",
     "--tools", "read,bash,write,edit", "--session-dir", sessionDir, "--system-prompt", systemPrompt,
     "--model", model, ...(process.env.PI_PANE_REAL_PROVIDER?.trim() ? ["--provider", process.env.PI_PANE_REAL_PROVIDER.trim()] : [])];
-  // Inherit authentication normally; do not read, copy or create the user's auth.json.
-  const env = { ...process.env, TERM: "xterm-256color", COLORTERM: "truecolor", NO_COLOR: "1", PI_CODING_AGENT_SESSION_DIR: sessionDir };
+  // pi reads only the explicitly prepared test authentication directory. The script never
+  // reads credential content or inherits model keys, npm credentials or the daily HOME.
+  const env = Object.fromEntries(["PATH", "TMPDIR", "LANG", "LC_ALL"].filter(key => process.env[key]).map(key => [key, process.env[key]]));
+  Object.assign(env, { HOME: directory, TERM: "xterm-256color", COLORTERM: "truecolor", NO_COLOR: "1", PI_CODING_AGENT_DIR: agentDir, PI_CODING_AGENT_SESSION_DIR: sessionDir });
   const proc = spawn("python3", [join(project, "scripts/pty-host.py")], { stdio: ["pipe", "pipe", "pipe"] });
   const state = { proc, cwd: actualCwd, port, terminal: "", stderr: "", pid: undefined, exitCode: undefined, url: undefined,
     command(text) { ensureLive(); proc.stdin.write(`${JSON.stringify({ type: "write", data: `${text}\r` })}\n`); },
@@ -179,7 +199,7 @@ async function startPi(host) {
     if (urls.length) state.url = urls.at(-1)[0];
     if (item.data.includes("\u001b[6n") && !proc.stdin.destroyed) proc.stdin.write(`${JSON.stringify({ type: "write", data: "\u001b[1;1R" })}\n`);
   });
-  proc.stdin.write(`${JSON.stringify({ argv, env, cwd: actualCwd })}\n`);
+  proc.stdin.write(`${JSON.stringify({ argv, env, cwd: actualCwd, controllingTty: true })}\n`);
   return state;
 }
 
@@ -190,7 +210,7 @@ async function trial() {
   report.piVersion = host.version;
   fixture = await startPi(host);
   ensureLive();
-  await check("/web starts from the real TUI using the installed pi-pane package", async () => {
+  await check("/web hands off a saved real-model TUI session to the source RPC host", async () => {
     // pi renders its footer before startup finishes. With --verbose, [Extensions] is rendered
     // only after input handlers are installed and session extensions have finished binding.
     await waitFor(() => {
@@ -198,11 +218,14 @@ async function trial() {
       const terminal = stripAnsi(fixture.terminal);
       return terminal.includes(fixture.cwd) && terminal.includes("[Extensions]");
     }, "interactive TUI and installed extensions ready", 45_000);
+    fixture.command(tuiPrompt); report.submittedPrompts++;
+    await waitFor(() => { ensureLive(); return stripAnsi(fixture.terminal).includes(tuiReply); }, "real model finishes the TUI seed", TURN_TIMEOUT_MS);
+    await pause(300);
     fixture.command(`/web --no-open --port ${fixture.port}`);
     await waitFor(() => { ensureLive(); return fixture.url; }, "TUI /web link", 30_000);
     observer = await openClient(fixture.url);
     ensureLive();
-    assert.equal(observer.snapshot.session.messages.length, 0, "trial starts with an empty temporary session");
+    assert.equal(users(observer, tuiPrompt).length, 1, "RPC host retains the handed-off TUI seed exactly once");
     report.selectedModel = { provider: observer.snapshot.state.model?.provider, id: observer.snapshot.state.model?.id };
     browser = await chromium.launch({ channel: "chrome", headless: true });
     // A cancelled launch can still return a browser; retain it before throwing so finally closes it.
@@ -214,21 +237,19 @@ async function trial() {
     await page.goto(fixture.url);
     await connected();
     assert.equal(new URL(page.url()).hash, "", "bootstrap token is removed from the address bar");
-    return { emptySession: true, installedPackage: true };
+    return { preservedTuiHistory: true, sourceExtension: true };
   });
   await check("terminal prompt and real model reply appear in the browser", async () => {
-    fixture.command(tuiPrompt);
-    report.submittedPrompts++;
     await settled(tuiPrompt, tuiReply);
     assert.equal(await browserUserCount(tuiPrompt), 1);
     assert.ok(stripAnsi(fixture.terminal).includes(tuiReply), "terminal rendered the reply, not merely the split-marker input");
     return { userMessages: 1, expectedReply: tuiReply };
   });
-  await check("browser prompt and real model reply appear in the terminal", async () => {
-    const terminalBefore = fixture.terminal.length;
+  await check("browser prompt and real model reply persist in the sole RPC session", async () => {
     await sendWeb(webPrompt);
     await settled(webPrompt, webReply);
-    await waitFor(() => stripAnsi(fixture.terminal.slice(terminalBefore)).includes(webReply), "terminal renders web reply", 30_000);
+    assert.ok(assistantHas(observer, webReply));
+    assert.equal(fixture.exitCode, undefined, "foreground host stays alive");
     assert.equal(await browserUserCount(webPrompt), 1);
     return { userMessages: 1, expectedReply: webReply };
   });

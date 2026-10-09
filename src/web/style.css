@@ -391,10 +391,10 @@ div.code-block > pre.shiki { white-space: pre; }
   .workbench .composer-inner { padding: 11px 14px 8px; }
   .workbench .tool-summary { max-width: 68vw; }
   .workbench .host-controls select { max-width: 175px; }
-  .workbench .composer-actions { gap: 5px; padding-left: 6px; }
-  .workbench .action-buttons { gap: 5px; }
-  .workbench .action-buttons button { padding-left: 9px; padding-right: 9px; }
-  .workbench .action-buttons .steer-button { display: none; }
+  .workbench .composer-actions { gap: 7px; padding-left: 6px; flex-wrap: wrap; }
+  .workbench .context-buttons { flex-basis: 100%; }
+  .workbench .action-buttons { width: 100%; gap: 5px; flex-wrap: wrap; justify-content: flex-end; }
+  .workbench .action-buttons button { min-height: 40px; padding-left: 9px; padding-right: 9px; white-space: nowrap; }
   .workbench .scope-note { font-size: 10px; }
   .command-name { min-width: 65px; }
 }
@@ -402,3 +402,30 @@ div.code-block > pre.shiki { white-space: pre; }
   .session-item, .file-item, .resource-item, .inspector-tabs button, .sidebar-tabs button, .tree-target, .tree-fork, .context-buttons button, .preview-actions button, .icon-button { min-height: 40px; }
   .sidebar-heading { height: 52px; }
 }
+
+/* Extension requests are answered by the first connected browser. */
+.dialog-backdrop { position: fixed; inset: 0; z-index: 20; display: flex; align-items: center; justify-content: center; padding: 16px; background: color-mix(in srgb, var(--bg) 60%, transparent); }
+.dialog { width: min(480px, 100%); background: var(--bg); border: 1px solid var(--border); border-radius: 10px; padding: 18px; box-shadow: 0 12px 40px rgb(0 0 0 / 35%); }
+.dialog h2 { font-size: 15px; margin: 0 0 8px; font-weight: 600; }
+.dialog p { color: var(--fg-muted); font-size: 13px; line-height: 1.6; margin: 0 0 12px; white-space: pre-wrap; }
+.dialog textarea { width: 100%; box-sizing: border-box; font: inherit; font-size: 14px; padding: 8px; border: 1px solid var(--border); border-radius: 6px; background: transparent; color: var(--fg); }
+.dialog-options { display: flex; flex-direction: column; gap: 6px; margin-bottom: 8px; }
+.dialog-options button { text-align: left; padding: 8px 10px; }
+.dialog-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 12px; }
+
+.session-management { display: flex; gap: 8px; padding: 0 14px 10px; }
+.session-management button { flex: 1; font-size: 11px; }
+.rename-session { display: flex; flex-wrap: wrap; gap: 6px; padding: 0 14px 10px; }
+.rename-session input { width: 100%; min-width: 0; background: var(--bg); border: 1px solid var(--border); color: var(--fg); border-radius: 5px; padding: 7px; }
+.rename-session button { flex: 1; }
+.dialog { max-height: calc(100dvh - 32px); overflow: auto; }
+.dialog textarea { resize: vertical; min-height: 64px; max-height: 50dvh; }
+.dialog .dialog-timeout, .dialog .dialog-offline { font-size: 11px; color: var(--fg-dim); }
+.extension-statuses { display: flex; flex-wrap: wrap; gap: 8px; padding: 8px 28px; border-bottom: 1px solid var(--border); color: var(--fg-muted); font-size: 11px; }
+.extension-widgets { padding: 0 28px; max-height: 24vh; overflow: auto; }
+.extension-widget { margin: 8px 0; padding: 8px 10px; white-space: pre-wrap; overflow-wrap: anywhere; font-family: var(--font-mono); font-size: 11px; border: 1px solid var(--border); border-radius: 5px; }
+.rotate-confirm { display: flex; gap: 8px; }
+.receipt-started, .receipt-queued, .receipt-handled { color: var(--accent); }
+@media (max-width: 760px) { .extension-statuses { padding: 7px 16px; } .extension-widgets { padding: 0 16px; } }
+
+.composer-inner > .extension-widgets { padding: 0; }

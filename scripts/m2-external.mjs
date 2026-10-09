@@ -2,7 +2,7 @@
 // A10 + A11 (mobile): external access through a real pi TUI and system Chrome.
 // - Refusals: plain non-loopback, missing password, missing transport.
 // - Proxy mode behind a local TLS reverse proxy (stand-in for e.g. Tailscale Serve): login, bootstrap-only upgrade
-//   refused, wrong password, logout, /web qr, rotation revoking every login and connection.
+//   refused, wrong password, logout, automatic handoff QR, web rotation revoking every login and connection.
 // - Direct TLS (node:https) with the same login flow; plain HTTP to the TLS port is not served.
 // - Mobile viewport over the proxy: login, Enter inserts a newline, send and steer buttons, reconnect after a network drop.
 // Chrome reaches the public host name through --host-resolver-rules and accepts the test certificate (ignoreHTTPSErrors).
@@ -17,10 +17,10 @@ import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { chromium, devices } from "playwright";
 import WebSocket from "ws";
-import { startFixture, waitFor } from "./m0-smoke.mjs";
+import { startFixture, waitFor, openClient, commandResult } from "./m0-smoke.mjs";
 
 const project = resolve(dirname(fileURLToPath(import.meta.url)), "..");
-const reportDir = resolve(process.env.PI_M2_REPORT_DIR ?? join(project, "build-artifacts/m2/external"));
+const reportDir = resolve(process.env.PI_M2_REPORT_DIR ?? join(project, "build-artifacts/m3/handoff/m2/external"));
 await mkdir(reportDir, { recursive: true });
 const PASSWORD = "m2-fixture-password-not-a-secret";
 const HOST = "pane.example.test";
@@ -120,10 +120,10 @@ try {
     await terminalShows(denied, "Non-loopback access needs");
     assert.equal(await listening(port), false);
     denied.command(`/web --public-origin https://${HOST} --proxy --port ${port} --no-open`);
-    await terminalShows(denied, "PI_PANE_PASSWORD environment variable");
+    await terminalShows(denied, "PI_PANE_PASSWORD");
     assert.equal(await listening(port), false);
     denied.command("/web qr");
-    await terminalShows(denied, "pi-pane is stopped. Run /web first.");
+    await terminalShows(denied, "Unknown /web argument");
     await denied.close(); await denied.remove(); denied = undefined;
 
     fixture = await startFixture({ autoWeb: false, envOverrides: { PI_PANE_PASSWORD: PASSWORD } });
@@ -152,7 +152,8 @@ try {
   await check("proxy mode: bootstrap link + password logs in; prompts reach pi; the link token alone cannot connect", async () => {
     fixture.command(`/web --public-origin ${origin} --proxy --port ${backend} --no-open`);
     await waitFor(() => fixture.publicUrl?.startsWith(origin), "public link in terminal");
-    await terminalShows(fixture, "login with PI_PANE_PASSWORD");
+    fixture.handoff = true;
+    await terminalShows(fixture, "PI_PANE_PASSWORD");
     proxy = await tlsProxy({ cert, key, port: proxyPort, upstream: backend });
     const bootstrap = new URL(fixture.publicUrl).hash.slice(3);
     assert.equal(await rejectedUpgrade(origin, bootstrap, origin), 401, "the bootstrap token cannot upgrade");
@@ -171,14 +172,12 @@ try {
     await page.locator(".message-assistant").filter({ hasText: "M0_REPLY:M2_REMOTE:complete" }).waitFor();
     // Direct access to the loopback backend with the public Origin still needs a login session.
     assert.equal(await call(`http://127.0.0.1:${backend}/auth/info`), 200);
-    fixture.command("/web status");
-    await terminalShows(fixture, "1 login(s)");
+    assert.equal(fixture.exitCode, undefined, "host remains in the foreground");
     return { origin, backend };
   });
 
-  await check("/web qr shows the external link as a terminal QR code", async () => {
-    fixture.command("/web qr");
-    await terminalShows(fixture, "scan to open");
+  await check("handoff banner automatically shows the external link and terminal QR code", async () => {
+    await terminalShows(fixture, "Stop: Ctrl+C");
     assert.ok(/[▀▄█]{10}/.test(stripAnsi(fixture.terminal)), "half-block QR modules are drawn");
   });
 
@@ -190,8 +189,12 @@ try {
     const session = await page.evaluate(() => sessionStorage.getItem("pi-pane.session"));
     assert.equal(await call(`${origin}/auth/session`, { headers: { Origin: origin, Authorization: `Bearer ${session}` }, ca: cert }), 200);
     const previous = fixture.publicUrl;
-    fixture.command("/web --rotate --no-open");
-    await waitFor(() => fixture.publicUrl !== previous, "new link after rotation");
+    const owner = await openClient(fixture.publicUrl, undefined, { token: session, rejectUnauthorized: false, lookup(_host, options, callback) { if (options.all) callback(null, [{ address: "127.0.0.1", family: 4 }]); else callback(null, "127.0.0.1", 4); } });
+    const rotating = await owner.command("access_rotate");
+    const rotated = await commandResult(owner, rotating.frame);
+    assert.equal(rotated.status, "completed");
+    fixture.publicUrl = rotated.value.url;
+    await owner.close();
     await page.getByText("访问凭据已轮换", { exact: false }).waitFor();
     assert.equal(await call(`${origin}/auth/session`, { headers: { Origin: origin, Authorization: `Bearer ${session}` }, ca: cert }), 401, "rotation revokes the login");
     assert.equal(await rejectedUpgrade(origin, session, origin), 401);
@@ -241,8 +244,11 @@ try {
 
   await check("direct TLS: HTTPS/WSS with the certificate and the same login; plain HTTP is not served", async () => {
     await proxy.close(); proxy = undefined;
-    fixture.command("/web stop");
-    await terminalShows(fixture, "pi-pane stopped.");
+    fixture.write("\u0003");
+    await waitFor(() => fixture.exitCode !== undefined, "proxy foreground host stops");
+    assert.equal(fixture.exitCode, 0);
+    await fixture.close(); await fixture.remove();
+    fixture = await startFixture({ autoWeb: false, envOverrides: { PI_PANE_PASSWORD: PASSWORD } });
     const port = await freePort();
     const tlsOrigin = `https://${HOST}:${port}`;
     fixture.command(`/web --port ${port} --public-origin ${tlsOrigin} --tls-cert ${join(directory, "cert.pem")} --tls-key ${join(directory, "key.pem")} --no-open`);

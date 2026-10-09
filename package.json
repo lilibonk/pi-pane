@@ -1,9 +1,9 @@
 {
   "name": "@lilibonk/pi-pane",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "license": "MIT",
   "type": "module",
-  "description": "Open the running pi TUI session in a browser: live mirror, prompts with images, optional HTTPS access from other devices",
+  "description": "Hand the current pi TUI session to a foreground browser workbench, with RPC-owned conversations and optional HTTPS access",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/lilibonk/pi-pane.git"
@@ -42,11 +42,12 @@
     "m2:external": "node scripts/m2-external.mjs",
     "m2:install": "node scripts/m2-install.mjs",
     "m2:real-model": "node scripts/m2-real-model.mjs",
-    "m3:workbench": "node scripts/m3-workbench.mjs"
+    "m3:workbench": "node scripts/m3-workbench.mjs",
+    "m3:handoff": "node scripts/m3-handoff.mjs"
   },
   "peerDependencies": {
     "@earendil-works/pi-ai": "*",
-    "@earendil-works/pi-coding-agent": "*"
+    "@earendil-works/pi-coding-agent": ">=1.1.0 <2"
   },
   "dependencies": {
     "qrcode-generator": "2.0.4",

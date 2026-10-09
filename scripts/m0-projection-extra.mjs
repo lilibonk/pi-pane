@@ -7,13 +7,20 @@ import { fileURLToPath } from "node:url";
 import { openClient, startFixture, textOf, waitFor } from "./m0-smoke.mjs";
 
 const project = resolve(dirname(fileURLToPath(import.meta.url)), "..");
-const output = resolve(process.env.PI_M0_PROJECTION_REPORT_DIR || join(project, "build-artifacts/m0/projection-extra"));
+const output = resolve(process.env.PI_M0_PROJECTION_REPORT_DIR || join(project, "build-artifacts/m3/handoff/m0/projection-extra"));
 await mkdir(output, { recursive: true });
-const report = { startedAt: new Date().toISOString(), piVersion: "1.0.4", realTui: true, realModelCalls: 0, checks: [] };
+const report = { startedAt: new Date().toISOString(), piVersion: "1.1.0", realTui: true, realModelCalls: 0, checks: [] };
 const redact = (value) => String(value).replace(/#t=[A-Za-z0-9_-]+/g, "#t=[REDACTED]");
 let fixture, first, second, restored;
 try {
-  fixture = await startFixture({ extraExtensions: [join(project, "tests/fixtures/projection-extra.ts")] });
+  fixture = await startFixture({ autoWeb: false, extraExtensions: [join(project, "tests/fixtures/projection-extra.ts")] });
+  fixture.tuiCommand("!printf M0_BASH_VISIBLE");
+  const session = (await fixture.events()).filter(event => event.event === "session_start").at(-1);
+  await waitFor(async () => {
+    const entries = (await readFile(session.sessionFile, "utf8")).trim().split("\n").map(line => JSON.parse(line));
+    return entries.some(entry => entry.type === "message" && entry.message.role === "bashExecution" && entry.message.output === "M0_BASH_VISIBLE");
+  }, "actual TUI bash result persists before handoff", 5000);
+  await fixture.handoffToWeb();
   first = await openClient(fixture.url); second = await openClient(fixture.url);
   const epoch = first.snapshot.epoch;
   fixture.command("/m0-projection-visible");
@@ -32,15 +39,14 @@ try {
     hiddenAndOpaqueDataAbsent: true, sameEpoch: true });
 
   const bangStarted = Date.now();
-  fixture.command("!printf M0_BASH_VISIBLE");
-  await waitFor(() => [first, second].every((client) => client.snapshot.session.messages.some((message) => message.role === "bashExecution" && textOf(message).endsWith("\nM0_BASH_VISIBLE"))), "real TUI bang execution output is projected", 5000);
+  await waitFor(() => [first, second].every((client) => client.snapshot.session.messages.some((message) => message.role === "bashExecution" && textOf(message).endsWith("\nM0_BASH_VISIBLE"))), "saved pre-handoff TUI bang execution output is projected", 5000);
   const bash = first.snapshot.session.messages.find((message) => message.role === "bashExecution");
   assert.equal(textOf(bash), "$ printf M0_BASH_VISIBLE\n[Exit code: 0]\nM0_BASH_VISIBLE");
   assert.equal(first.snapshot.epoch, epoch);
   restored = await openClient(fixture.url);
   assert.deepEqual(restored.snapshot.session.messages.map((message) => [message.id, message.role, textOf(message)]),
     first.snapshot.session.messages.map((message) => [message.id, message.role, textOf(message)]));
-  report.checks.push({ name: "real TUI bang command, exit code and output match a fresh snapshot", status: "passed", durationMs: Date.now() - bangStarted,
+  report.checks.push({ name: "saved pre-handoff TUI bang command, exit code and output match the RPC canonical snapshot", status: "passed", durationMs: Date.now() - bangStarted,
     sameMessageIds: true, sameEpoch: true });
   report.status = "passed";
 } catch (error) {

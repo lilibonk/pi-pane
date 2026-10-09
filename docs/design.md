@@ -1,540 +1,184 @@
-# pi `/web`：设计方案
+# pi `/web`：交接工作台设计
 
-> 状态：M3 首批工作台实现 v0.6 · 2026-10-09（v0.6：M3-A 与核心 B 接入；v0.5：以官方 Kimi Code 2.1.1 重审 UI 与能力范围，重排 M3；v0.4：主题、diff 与 thinking 展示）
-> 产品名：`pi-pane`；已发布 npm 包 `@lilibonk/pi-pane@0.1.0`（MIT）
-> 基线：历史源码核查为 pi `@earendil-works/pi-coding-agent` 1.0.4；当前开发依赖、宿主验证与本次能力对照为 1.1.0
-> 验证状态：M0、M1 已于 2026-10-08 完成验收（[M0](m0-status.md)、[M1](m1-status.md)）；M2 本地验收见 [M2 验收记录](m2-status.md)，npm 发布、正式安装和真实模型验证已完成，gallery 收录与日常稳定性反馈见 [试用状态](m2-trial-status.md)。这些结果仅验证 0.1.0 的会话镜像范围，不能作为 Web 工作台对齐完成的证据。§4 保留历史源码事实，§13 保留对应验证标准。
-> 当前源码：`codex/m3-workbench` 的 M3-A 与核心 B 第一增量已验收，尚未发布；慢流重连的一次验收超时待定位，实现与证据见 [M3 状态](m3-status.md)。M3-C/D 未完成，日常仍加载正式 npm 0.1.0。
+状态：M3 交接修订 v0.7，2026-10-10。源码版本 `0.2.0` 尚未发布，分支 `codex/m3-handoff`；正式 npm 与日常安装仍为 `@lilibonk/pi-pane@0.1.0`（MIT）。当前能力与测试基线为 pi / pi-ai 1.1.0，Node ≥22.19，macOS/Linux。当前结果见 [M3 状态](m3-status.md)。
 
----
+维护者的 [调整说明](m3-codex-adjustment.md) 取代 v0.6 的镜像、命令网关及后台 attach 方向。`spike/m3-handoff` 仅证明交接可行，依据与 8 项原型证据见 [交接 spike](m3-handoff-spike.md)；不能直接作为可发布实现。原工作台在 commit `6196c7b` 保存，旧证据与已发布 0.1.0 的 M0–M2 验收均为历史记录，不作为本修订的通过结论。
 
-## 1. 背景与目标
+## 1. 产品目标与基线
 
-pi 的 TUI 很好用，但有些开发者更习惯图形界面：长 diff、长工具输出、图片、手机上看进度。Kimi Code 的做法是在终端里输入 `/web`，**把当前会话交给浏览器继续**。
+`/web` 把当前会话交给浏览器：先正常关闭 TUI，再在同一个 pi 进程里运行前台网页服务。RPC 子进程持有会话，浏览器继续任务；Ctrl+C 停止服务并打印最新会话的恢复命令，关闭终端结束宿主与子进程。
 
-pi 生态里现在已经有完整的桌面端（pi-gui）和 Web 端（PI WEB、pithagoras、pi-pocket、pi-web-codex），但它们都是**独立应用**：会话要在它们自己的界面里新建或打开。pi-web-codex 虽然有 `/pi-web-codex` 命令，源码里也只是在另一个进程起一个 Web 服务，不会接管当前会话。
+对齐基线固定为 `@moonshot-ai/kimi-code@2.1.1`，官方 commit `242ac230006447f8601e1678c49182bfbae89fe9`。参考是实际 `/web`，不是 VS Code webview。界面、构建资源及 kap-server 核对证据在 `build-artifacts/kimi-alignment/current/`；Kimi 2.1.1 的前台退出接管、信号和横幅行为已在交接 spike 再核对。
 
-**定位（2026-10-09 修正）**：一个 pi package。终端里输入 `/web`，浏览器接上当前会话，并提供完成开发任务所需的 Web 工作台。对齐目标是官方当前 Kimi Code `/web` 的信息架构、功能入口与操作闭环；保留 pi 的会话和扩展语义。0.1.0 已完成当前会话镜像，但尚未完成上述工作台对齐。
-
-### 目标
-
-- G1：`/web` 一条命令打开当前会话，展示完整的当前分支历史及正在生成的内容，后续实时流式同步。参考数据集上，从浏览器 WS 连接建立到首个快照应用完成目标为 1 秒内；浏览器进程启动时间单独记录，超大历史和图片按 §6.5 分块加载。
-- G2：浏览器里可以提交消息（运行中可以 steer 或排队）、中止、切模型、调 thinking 等级、贴图片。提交回执与实际执行结果分开显示，纯扩展模式的确认边界见 §6.3。
-- G3：终端和浏览器**同时**连在同一个会话上，终端切换会话或分支时网页同步重置。待发队列只同步是否非空，不承诺完整队列内容。
-- G4：网页外观沿用用户当前的 pi 主题。
-- G5：默认安全：只监听本机，用 token 鉴权，局域网访问需要显式开启。
-- G6：`pi install npm:@lilibonk/pi-pane` 一步装好，本机模式零配置；按 pi package 规范发布并核验 gallery 收录。
-
-### 参考实现：Kimi Code（MoonshotAI/kimi-code，MIT，TypeScript）
-
-Kimi 和浏览器相关的能力其实是**两个互不相关的功能**，容易混在一起：
-
-| | `/web`（Web UI） | Kimi WebBridge / Browser Extension |
-|---|---|---|
-| 浏览器扮演什么 | **界面**：人在浏览器里操作 agent | **工具**：agent 去操作用户的浏览器 |
-| 实现 | `apps/kimi-code/src/tui/commands/web.ts` 加上 `packages/kap-server`（基于 Fastify 的 REST + WS 服务） | 本地 daemon（`127.0.0.1:10086`）+ Chrome/Edge 扩展（通过 `chrome.debugger` 走 CDP）+ 一份 skill 文档，教 agent 用 `curl POST /command` 调用 |
-| 和 agent 的耦合 | 跟 Kimi 内核深度绑定 | 只是 HTTP 接口加 skill，Claude Code、Cursor、Codex 都能用 |
-| 许可 | MIT | 插件和 skill 是 **Proprietary**，daemon 二进制从 Kimi 的 CDN 下载 |
-
-本方案只对标 `/web`。浏览器自动化在 pi 生态里已有其他方案（MCP 形式的 Chrome DevTools / Playwright，pi-pocket 内置的 Chromium），不在本项目范围内。
-
-**Kimi `/web` 的实际行为**（从源码确认）：
-
-- **交接，不是镜像**：`/web` 会先**停掉 TUI**，然后在退出流程里把**同一个进程**变成前台运行的 Web 服务（`setExitForegroundTask` → `startServerForeground`），按 Ctrl+C 结束。浏览器打开的是深链接 `/sessions/<id>#token=…`。
-- **token 持久化**：保存在数据目录的 `server.token` 文件里，可以用 `rotate-token` 命令更换；通过 URL 的 `#token=` fragment 传给前端，不会发到服务器，所以不会被记进日志。
-- **WebSocket 鉴权**：浏览器的 WebSocket API 不能自定义请求头，所以 token 放在 `Sec-WebSocket-Protocol: kimi-code.bearer.<token>` 里，**握手阶段就鉴权**，没通过的连接根本建立不起来。
-- **防护**：Host 白名单（环境变量 `KIMI_CODE_ALLOWED_HOSTS`）、Origin 和 CORS 校验、限流、安全响应头；`--dangerous-bypass-auth` 可以显式关闭鉴权。
-- **断线重连**：每个会话有一份事件日志（`sessionEventJournal`），事件带 `seq` 和 `epoch`，写在磁盘上。重连时按 `seq` 补发缺失的事件；`epoch` 用来识别服务是否重启过。
-- **多实例**：同时开多个时，通过实例注册表自动占用下一个空闲端口。
-- **远程访问**：`/remote-control` 通过 Kimi 云端中继，用设备 ID 加二维码连接，需要云端基础设施。
-- 题外话：Kimi Code 的 TUI 用的就是 pi-tui 的 fork（`packages/pi-tui`，`@moonshot-ai/pi-tui` 0.84.5）。
-
-**对本方案的影响**：
-
-1. 0.1.0 采用镜像架构，终端继续可用。这只说明进程交互差异，不能用来推定 Web 工作台已对齐；此前只审查传输与退出机制、未完整核对 UI 功能，是范围偏差。
-2. 照搬：token 放 `#fragment`、WebSocket 用 subprotocol 传 bearer、Host/Origin 白名单、限流、深链接、多实例端口自增。
-3. 借鉴：事件加上 `epoch`（见 §6.1）；Kimi 那种"同进程交接"作为 M3-D 的候选实现（见 §12）。
-4. 不做：云端中继。
-
-### 工作台对齐基线（2026-10-09）
-
-维护者明确选择**官方当前版本**，本次固定为 npm `@moonshot-ai/kimi-code@2.1.1` 与官方仓库 commit `242ac230006447f8601e1678c49182bfbae89fe9`。参考页面由独立 HOME / KIMI_CODE_HOME、样例 Git 工作区和空会话实际运行；未使用日常凭据或调用真实模型。截图与检查记录见 `build-artifacts/kimi-alignment/current/`。本机 0.38.0 的早期观察仅留作历史，不作为此次对齐基线。
-
-官方仓库的 `apps/kimi-code/scripts/check-web-assets.mjs` 说明 Web 源组件位于另一仓库；本次结合实际 2.1.1 界面、`dist-web/assets/index-CiJ6FDOC.js` 的真实组件/调用及 kap-server 源码，未把 VS Code webview 当作 `/web`。
-
-| 功能域 | Kimi 2.1.1 已确认入口 | pi-pane 0.1.0 现状 | 对齐工作 |
-|---|---|---|---|
-| 工作区与会话 | 侧栏、搜索、新建；源码还有置顶、重命名、完成、归档、fork、导出 | 只有当前会话名称、cwd 和当前分支历史 | 工作区/会话导航、列表与搜索；接通 new/resume/fork/tree，定义跨工作区所有权 |
-| 命令与上下文输入 | `/` 命令与 skill 菜单；`@` 文件/skill 引用和附件 | 图片、普通文本、steer/followUp；显式关闭 slash/skill/template 展开 | 命令发现与补全、pi 内建命令的类型化入口、skill/template、文件引用 |
-| 工作成果查看 | 标签式侧面板、Git 改动、回合 diff、文件预览 | 对话内工具卡及 edit diff | 从工具或文件引用打开文件预览；独立 Git 改动/差异面板，避免用消息中的 patch 冒充仓库状态 |
-| 设置与资源 | 通用、账户、智能体与会话、模型供应商、插件、实验室、归档；插件市场与启停入口 | 模型/thinking 下拉框和 compact，无设置/资源导航 | 按 pi 语义接模型/认证状态、主题、工具、扩展、skills、模板及配置；明确持久化与 reload 行为 |
-| 人机决策与任务 | 权限选择；源码有审批/提问、Plan/Goal、Agent 和后台任务详情、侧聊 | 工具只展示；标准对话框提示去终端；无 Plan/Goal/Agent 控制 | 建立请求/响应、等待/取消/超时/重连状态；为 pi 设计能力映射，不能只放无后端按钮 |
-| 运行生命周期 | `/web` 进入 Web；会话页与功能面板共同构成工作台 | TUI + 网页镜像；TUI 退出后断开 | 在功能对齐基础上继续交接、唯一写入者、attach/resume 和恢复设计 |
-
-此表保留 npm 0.1.0 的差距基线。M3 首批源码已接入工作区/会话侧栏、分支树、明确命令/skill/template 分派、真实文件引用/预览、Git 改动与资源概览；逐项状态见 [M3 映射与验收](m3-status.md)。资源配置、交互决策和运行交接仍在后续范围内，不能将首批结构接入表述为整体 Kimi 对齐完成。
-
-能力对接分层（pi 1.1.0）：
-
-- **当前扩展架构可做**：会话列表/搜索（`SessionManager.list/listAll`）、new/switch/fork/tree（`ExtensionCommandContext`，需新增有效命令网关，不能用普通事件 context 或长期缓存旧 command context 替代）、命令/skill/template 发现、文件读取、Git 查询、工具目录与部分会话级 MCP 注册。不能将旧设计中的“非目标”继续当作宿主不支持。
-- **需新增控制或 UI 适配层**：TUI 内建命令映射、持久配置/认证、完整扩展与 MCP 状态、标准 select/confirm/input/editor 请求响应。现有 `ui_prompt` 事件仅有 kind/title；应验证 SDK/RPC 的完整 UI binding，不能靠转发一行 slash 字符串完成对接。
-- **需单独产品设计**：Kimi 的 Plan/Goal/Swarm/Agent/侧聊与 pi 的原生或扩展能力如何对应。定义执行语义、可用条件与完成证据后再展示入口。
-
-证据边界：实测了工作台导航、空会话、样例 Git diff、设置/插件页和 slash 菜单；权限审批、Goal/Plan/Agent 的动态过程尚只确认源码入口，未运行模型或安装插件。当前纯 Web 的实际面板映射为 file/diff/turn-diff/compaction/agent/btw；不能把共享 terminal 类型或服务端 terminal API 当作已出现交互终端。没有确认持久文件树或独立 MCP 管理 GUI；插件页中的 MCP 数量不等于 MCP 配置页。
-
-### 产品边界
-
-- 会话列表、搜索、工作区导航、文件预览、差异面板和资源设置纳入工作台对齐，不再整体排除。
-- 持久文件树、交互终端及独立 MCP 配置 GUI 作为待定增量，按真实使用任务评估，不能声称它们都是当前 Kimi Web 的现成功能。
-- 关闭终端后存活仍需通过进程分离、唯一写入者和失败恢复验收；标准对话框适配与后台常驻分开验证。
-- 云端托管、多用户协作、云端中继及任意 TUI custom 组件自动转换仍不作默认承诺。优先使用 pi 公开 API，避免 fork pi 核心。
-
----
-
-## 2. 用户体验
-
-### 命令
-
-| 命令 | 行为 |
+| 范围 | 当前目标 |
 |---|---|
-| `/web` | 服务没起就先启动，然后打开浏览器；已经在跑就直接打开浏览器，并在终端显示 URL |
-| `/web stop` | 关闭服务，断开所有浏览器连接 |
-| `/web status` | 显示 URL、连接数、监听地址 |
-| `/web qr` | 外部访问时以终端 widget 显示公共链接二维码（两分钟后隐藏），链接含 bootstrap token，密码仍单独输入；本机模式拒绝 |
-| `/web --rotate` | 换新 token，撤销浏览器认证并断开现有连接；由终端显示新地址 |
-| `pi --web` | 启动 pi 时同时启动服务（对标 `kimi web`），通过 `registerFlag` 实现 |
+| 工作台 | 工作区/会话侧栏，中央对话与输入，右侧文件、Git diff、资源 |
+| 会话 | 搜索、新建、恢复、重命名、克隆、从用户消息之前分叉 |
+| 输入 | 扩展命令、skill、模板按 RPC 展开；pi 内置交互命令由网页拦截 |
+| 回复 | streaming、thinking、工具 partial/result、steer/followUp、中止、压缩、图片 |
+| 交互 | select/confirm/input/editor 的回答、取消、超时、重连；扩展 status/widget/title/editor text |
+| 生命周期 | TUI 正常退出、唯一 RPC 写入者、前台服务、Ctrl+C 恢复提示、终端关闭退出 |
+| 外部访问 | 沿用 M2 的 HTTPS/同机代理 + 密码 + 二维码，无云中继 |
 
-`/web` 参数：`--host <addr>`（默认 `127.0.0.1`）、`--port <n>`、`--no-open`。M2 的非本机访问还需配置 §9 的安全访问地址。启动参数使用命名空间 `--web-host`、`--web-port`、`--web-no-open`，与其他扩展避免冲突。M0 通过公开 `pi.getSettings()` 读取 `settings.json` 的 `piPane { host, port, noOpen }`；优先级为命令参数、启动 flags、宿主合并后的设置、默认值。全局与可信项目的合并由 pi 控制。pi 1.0.4 未提供任意自定义字段的公开写入 API，因此扩展只读，不自动保存；宿主已知字段的保存使用锁与重新读取后合并，不能称为崩溃原子替换。错误配置不得阻止 stop/status/token 更换，配置自身不触发自启动。
+Kimi 的持久文件树、交互终端、独立 MCP 配置 GUI 未在当前 `/web` 确认；不据共享类型或服务器 API 推定界面已有功能。权限审批、Plan/Goal/Agent 等动态过程原来只确认源码入口；pi 对应的执行语义仍待定义，不能用无后端按钮声称对齐。
 
-默认端口从 7878 起，在最多 20 个端口内查找；显式指定端口时占用即报错，不静默换端口。URL 必须使用实际绑定成功的端口。`--web` 只在进程首次启动时应用一次；`/web stop` 后切会话或 `/reload` 不会再次自动启动服务。M1 只开放回环监听，拒绝非回环配置。
+明确边界：没有镜像路径、`/web --mirror`、实时 attach、关闭终端后存活或后台常驻承诺；不做云端托管、多用户角色及云中继。任意 TUI `custom()` 组件不自动转换成网页组件。
 
-### 典型流程
+## 2. 用户流程与配置
 
-```
-$ pi
-> 帮我重构 auth 模块              ← 在终端里正常工作
-  …agent 开始改文件…
-> /web
-  ✓ pi-pane: http://127.0.0.1:7878/#t=Xk3…  （已在浏览器打开）
-                                   ← 浏览器显示完整历史，后续输出实时同步
-[浏览器] 输入"先别改测试" → steer   ← 终端里也能看到这条消息
-[终端]   按 Esc 中止              ← 浏览器状态同步变成空闲
-```
-
-终端状态栏通过 `ctx.ui.setStatus` 常驻显示 `🌐 web: 1 viewer`，提醒用户服务还开着。
-
----
-
-## 3. 总体架构
-
-### 3.1 两种模式
-
-| | **A. 镜像**（0.1.0） | **B. 交接**（M3-D） |
-|---|---|---|
-| 进程 | 就是原来那个 pi 进程 | 候选：同进程前台服务，或独立 SDK host；尚未选型 |
-| 终端 | 继续可用 | 退出 TUI；重新接入与恢复历史是两种不同操作，见 §12 |
-| 关掉终端 | Web 断开 | 只有完成进程分离的后台方案才承诺继续运行 |
-| 其他扩展的对话框 | 只能在终端里操作 | SDK host 可适配标准对话框；任意 TUI 自定义组件仍不能直接搬到网页 |
-| 实现成本 | 需先验证双端一致性 | 需另做进程所有权与 UI 适配设计 |
-
-0.1.0 只做 A。M3-A/B/C 的工作台与能力对齐并不整体依赖 B；标准对话框适配也须单独验证。B 可以复用消息与状态协议，但接入、所有权和对话框能力需要扩展协议及 `caps`，不能只替换后端就认为交接完成。
-
-### 3.2 模式 A 结构图
-
-```
-┌──────────────────────── pi 进程（用户原来那个 TUI）─────────────────────────┐
-│                                                                             │
-│  pi 核心 ── TUI（照常渲染）                                                    │
-│     │                                                                       │
-│     │ ExtensionAPI（pi）/ ExtensionContext（ctx）                             │
-│     ▼                                                                       │
-│  ┌─ pi-pane 扩展 ──────────────────────────────────────────────────────┐    │
-│  │  Bridge（每次 session_start 重新创建）                                 │    │
-│  │   ├─ 订阅事件 → 更新状态投影 → Hub 发布有序增量                         │    │
-│  │   └─ 执行命令：sendUserMessage / abort / setModel / …                  │    │
-│  │                                                                     │    │
-│  │  Hub（进程级单例，挂在 globalThis 上，跨会话切换和 /reload 存活）          │    │
-│  │   ├─ node:http：静态资源 + /healthz                                   │    │
-│  │   ├─ ws：鉴权、广播、心跳                                               │    │
-│  │   └─ 快照发布、命令去重、重绑超时与慢客户端回收                         │    │
-│  └─────────────────────────────────────────────────────────────────────┘    │
-└──────────────────────────────────┬──────────────────────────────────────────┘
-                                   │ WebSocket（默认 127.0.0.1）
-                        ┌──────────▼──────────┐
-                        │ 浏览器 SPA（预构建）   │  可以同时连多个
-                        └─────────────────────┘
+```text
+pi TUI：正常对话 → 等回复结束、待发队列为空 → /web
+  → TUI 停止与 session_shutdown
+  → 同进程前台服务 + 一个 pi --mode rpc 子进程
+  → 横幅：链接、当前 cwd、Stop: Ctrl+C；外部访问附密码提示/二维码
+浏览器：继续对话，浏览/打开/新建会话
+终端 Ctrl+C：停止子进程和服务 → 打印 cd <最新 cwd> && pi --session <最新会话>
+关闭终端：SIGHUP → 同样结束服务和子进程
 ```
 
-**拆成两层的原因**：pi 在 `/new`、`/resume`、`/fork`、`/reload` 时会**销毁并重建扩展运行时**，见 §4。网络服务要比单个会话活得久，所以 Hub 放在进程级；会话相关的状态放在 Bridge 里。Bridge 从 `session_start` 起采集实时状态，即使用户还没有运行 `/web`。`/tree` 在原运行时里改变分支，需单独重建状态投影。
+交接前必须是保存的交互 TUI 会话、空闲且没有待发消息；正在回复时拒绝交接，保留 TUI。原型通过停止正在进行的回合模拟 Kimi 的路线未采用。`--no-session`、Windows 和无法安全区分值的扩展 CLI 选项在退出 TUI 前报错。
 
----
+`/web` 参数：`--host`、`--port`、`--no-open`、`--public-origin`、`--tls-cert`、`--tls-key`、`--proxy`。默认绑定 `127.0.0.1`，从 7878 起最多试 20 个端口；显式端口占用即失败。TUI 阶段校验配置与 TLS，退出接管后才创建监听。
 
-## 4. 已验证的关键事实（来自 pi 1.0.4 源码和类型定义）
+移除启动 flag `--web` 及 `/web handoff`、`stop`、`status`、`qr`、`--rotate` 子命令。配置 flags `--web-host`、`--web-port`、`--web-no-open`、`--web-public-origin`、`--web-tls-cert`、`--web-tls-key`、`--web-proxy` 保留；优先级为 `/web` 参数 > flags > pi 合并设置的 `piPane` 字段 > 默认值。配置不触发自启动，扩展不写 settings。
 
-本节以 1.0.4 发布包的 `dist/` 与随包文档为准。可复核的固定版本源码：[扩展类型](https://github.com/earendil-works/pi/blob/v1.0.4/packages/coding-agent/src/core/extensions/types.ts)、[会话实现](https://github.com/earendil-works/pi/blob/v1.0.4/packages/coding-agent/src/core/agent-session.ts)、[运行时](https://github.com/earendil-works/pi/blob/v1.0.4/packages/coding-agent/src/core/agent-session-runtime.ts)、[加载器](https://github.com/earendil-works/pi/blob/v1.0.4/packages/coding-agent/src/core/extensions/loader.ts)。它们证明 API 语义，不替代双端运行验证。
+## 3. 进程与所有权
 
-| # | 问题 | 结论 | 依据 |
-|---|---|---|---|
-| F1 | 切换会话时扩展会被重建吗？ | **会**。`/new`、`/resume`、`/fork` 都会走 `teardownCurrent()`：先 abort，再发 `session_shutdown`（reason 是 `new`/`resume`/`fork`），然后 dispose，再 `createRuntime()` 重建 | `core/agent-session-runtime.js` |
-| F2 | 扩展模块会被重新 import 吗？ | `/reload` 时会。jiti 是用 `moduleCache: false` 加载的，只在 cwd 和 generation 都不变时复用 factory，**所以模块级变量不可靠** | `core/extensions/loader.js` |
-| F3 | 官方对长生命周期资源的建议 | 不要在 factory 里起 socket、进程、watcher 或 timer；在 `session_start` 或命令里启动，会话级资源在 `session_shutdown` 幂等关闭。跨会话 Hub 的回收由本方案补充 | `docs/extensions.md` |
-| F4 | 流式输出是增量吗？ | 是。`message_update.assistantMessageEvent` 有 `text_delta`、`thinking_delta`、`toolcall_delta`，都带 `contentIndex` 和 `delta` | `pi-ai/dist/types.d.ts` |
-| F5 | 工具执行能看到过程吗？ | `tool_execution_start/update/end`，带 `toolCallId`、`args`、`partialResult`，以及嵌套调用的 `parentToolCallId` | `extensions/types.d.ts` |
-| F6 | 网页发的消息在终端里怎么显示？ | `pi.sendUserMessage()` 经用户输入流程提交消息，来源为 `extension`，其他扩展仍可转换或消费输入。运行中须指定 `deliverAs: "steer" \| "followUp"`；该 API 返回 `void`，异步失败由宿主报告 | `extensions/types.d.ts`、`core/agent-session.js` 的 `sendUserMessage` 与 `bindCore` |
-| F7 | 能拿到主题的具体色值吗？ | **能**。`ctx.ui.theme.colors` 返回具体颜色；终端未报告默认色时会按 `appearance` 估算，并非始终精确等于终端实际色值 | `theme.d.ts`（`get colors()`） |
-| F8 | 能知道其他扩展弹了对话框吗？ | 只能知道"有一个"：`ui_prompt_start/end`，带 `kind` 和 `title`。**拿不到选项，也没法替它作答** | `extensions/types.d.ts` |
-| F9 | 能区分输入来源吗？ | `input` 事件的 `source` 是 `interactive`、`rpc` 或 `extension` | 同上 |
-| F10 | 能读到完整历史吗？ | `ctx.sessionManager`（只读）提供 `getBranch()`、`getEntries()`、`getTree()`、`getLeafId()`、`getSessionName()`；正在生成的消息不在持久化历史中，须由实时投影补充 | `session-manager.d.ts`；`core/agent-session.js` 在 `message_end` 通知扩展后才持久化 |
-| F11 | `/tree` 会重建运行时吗？ | 不会；改变 leaf 后发 `session_tree`，没有新的 `session_start` | `core/agent-session.js` 的 `navigateTree()` |
-| F12 | 模板展开开关只控制模板吗？ | 不只。`expandPromptTemplates: true` 会先尝试执行扩展命令，运行中也可立即执行，再处理 skill 和模板展开 | `core/agent-session.js` 的 `prompt()` |
-| F13 | 能订阅完整队列变化吗？ | `queue_update` 属于 SDK session 事件，不向 `ExtensionAPI.on` 开放；纯扩展只有 `ctx.hasPendingMessages()` 布尔值 | `extensions/types.d.ts`、`core/agent-session.js` 的 `_emitQueueUpdate()` |
-| F14 | 其他命令如何确认结果？ | `setModel()` 返回 `Promise<boolean>`；`setThinkingLevel()` 返回 `void` 且会按模型能力钳制；`ctx.compact()` 返回 `void`，提供 `onComplete/onError` | `extensions/types.d.ts` |
-
----
-
-## 5. 生命周期设计
-
-进程级保存无资源的控制记录，而不只保存 `new Hub()`：
-
-```ts
-// 示意字段；具体类型与兼容检查由实现定义。factory 不启动资源。
-const STATE_KEY = Symbol.for("pi-pane.process.v1");
-// globalThis[STATE_KEY]: {
-//   autoStartApplied, desiredRunning, generation,
-//   hub?, bridge?, rebindLease?, implementationVersion
-// }
+```text
+同一个 pi 进程
+  TUI 阶段：pi-pane 只注册命令/配置和会话锁，不运行 Bridge、Hub 或监听
+  /web → 正常 TUI shutdown → 拦截一次正常 process.exit
+  前台宿主：Hub（HTTP/HTTPS、WS、鉴权、租约、去重）
+            HandoffHost（目录、RPC 命令、对话框、锁、当前 cwd）
+            RpcSessionMirror → Bridge（消息/工具投影、分页、内容/图片）
+            WorkspaceService（当前会话 cwd 内的只读文件/Git）
+               ↕ JSONL stdin/stdout
+            pi --mode rpc 子进程（唯一会话写入者）
+               ↕ pi 的正常运行时、扩展与模型
+浏览器 SPA ↔ Hub：版本化命令、workbench_query、消息增量与扩展 UI
 ```
 
-`autoStartApplied` 记录本进程是否处理过 `--web`，`desiredRunning` 记录用户当前启停意图，`generation` 用于作废旧 Bridge 和异步回调。HTTP、WebSocket、广播队列及回收定时器属于 Hub；实时状态投影和宿主引用属于 Bridge。
+宿主使用**当前运行的 pi 安装**的公开 RPC entry，沿用 CLI 运行时工厂及公开 JSONL 命令；不在子进程增设私有工具/树导航通道。CLI 参数按已知选项重建，过滤会话选择及 `--web-*`；已用于 TUI 的初始位置提示词、@文件与 -- 后的位置内容不重放到 RPC。无法区分值的未知扩展选项拒绝交接，并要求改用 --flag=value，不能把位置内容变成子进程的新提示。
 
-| pi 事件 | 处理 |
+pi 没有公开的“退出后前台接管”钩子，正式实现仍拦截一次 `process.exit`，正常 TUI shutdown 完成后才接管；异常退出码不接管。这是依赖 pi 实现细节的兼容边界，需要上游公开 API。
+
+### 会话文件锁
+
+宿主锁记录位于 `<session>.pi-pane.lock`，0600，以排他创建和随机所有者 token 协调加载 pi-pane 的 TUI/宿主。TUI 到 RPC 交接连续持锁；切会话先检查目标锁，成功后释放旧锁，失败保留原会话所有权；停止时等子进程实际退出再释放。锁记录同时保留宿主与 RPC 写入者 PID；任一仍存活时不能抢占，确认两者退出且文件身份未变的旧锁才可回收。
+
+这是**协作锁**。上游裸 pi 和外部程序不会遵守它，不能宣称阻止任何写入。宿主在空闲期/写入前比较会话文件身份与大小/时间指纹，发现预期外的写入即停止服务并给出检查/恢复提示；运行中的并发外写无法完全归因，必须在文档注明。协作锁阻止两个 pi-pane 所有者，外部写入检测是额外的失败保护。
+
+### 崩溃策略
+
+子进程异常退出采用**停止服务，不自动重启**：当前可能存在已写入但未发回结果的命令，重启可能重新执行或制造第二个写入者。宿主关闭 Hub、停止/确认子进程退出、释放锁、打印当前 cwd 与会话文件的恢复命令。恢复是用户执行 `pi --session`，不是 attach。
+
+SIGINT/SIGTERM/SIGHUP 幂等停止：关闭子进程 stdin，超时依次 SIGTERM、SIGKILL；父进程被 SIGKILL 时 stdin EOF 使子进程自行退出。不得在子进程死亡尚未确认时启动第二个写入者。终端恢复命令跟随浏览器最后打开的会话和 cwd。Windows 退出/信号行为未验证，当前直接拒绝交接；Linux 支持实现但运行证据须与 macOS 分开记录。
+
+## 4. RPC 与工作台能力映射
+
+| 工作台能力 | 宿主调用与边界 |
 |---|---|
-| factory 执行 | 只注册命令、flag 和事件处理函数，**不起任何资源**（F3） |
-| 首次 `session_start`（`startup`） | 创建 Bridge，读取持久化历史并开始持续采集事件；只应用一次 `--web`，且只允许 `ctx.mode === "tui"` |
-| `session_start`（`new`/`resume`/`fork`/`reload`） | 创建新 Bridge；重绑期限内且 `desiredRunning` 为真时接管 Hub，生成新 epoch，先推 `session_reset` 再推快照 |
-| `session_shutdown`（`new`/`resume`/`fork`/`reload`） | 增加 generation，解除旧 Bridge 并清理其定时器、缓冲与订阅；Hub 进入 `switching`、拒绝命令，并启动重绑超时 |
-| `session_before_tree` / `session_tree` | 导航期间禁用写命令；成功后重建当前分支投影，增加 `branchRevision` 并换新 epoch，推 reset 和快照。若没有成功事件，则在 pending 期间每 250ms 检查 `ctx.isIdle()`；恢复 idle 后校准分支快照并解除屏障。1.0.4 在导航 finally 中清理 busy 状态；取消、失败及随后立即有新输入的路径纳入 M0 |
-| `session_shutdown`（`quit`） | 幂等关闭 Hub，断开连接并作废 token；关闭剩余 Bridge 资源 |
-| `/web stop` | 设置 `desiredRunning=false`，关闭 Hub、作废 token、清空客户端租约及去重记录；Bridge 继续采集当前会话，供再次 `/web` 接入 |
-| 进程被异常 kill | socket 随进程一起释放；浏览器显示"已断开"，并提示"在终端重新运行 `/web`" |
+| 会话目录/搜索 | 宿主 `SessionManager.list/listAll`；合并当前和最近访问目录 LRU，最多 32 个根；只接受已列出的 ID，不接受浏览器路径 |
+| 新建/恢复 | RPC `new_session`、`switch_session {sessionPath}`；使用 cancelled 等真实结果，成功后重建 RPC 会话视图/Bridge/cwd，推新 epoch |
+| 重命名/克隆 | RPC `set_session_name`、`clone`；当前标记和列表自动刷新 |
+| 分叉 | RPC `fork {entryId}`，只允许当前会话用户消息；分叉位于用户消息之前，返回 text 恢复输入，不恢复图片 |
+| 树 | RPC `get_entries` 重建只读树；tree 导航禁用并说明上游缺口，不使用内部命令 |
+| 命令目录 | RPC `get_commands`；来源分类、名称冲突提示与保留内置名称 |
+| 模型/thinking | RPC `get_available_models`、`set_model`、`get_available_thinking_levels`、`set_thinking_level` |
+| 工具列表/启停 | RPC 暂无接口，禁用并显示“需要 pi 支持” |
+| 文件/Git | 当前会话 cwd 的宿主只读服务，跨工作区切换立即换根 |
+| 扩展对话框 | 官方 RPC UI 子协议 select/confirm/input/editor；所有客户端第一份有效答案胜出 |
+| 扩展展示 | notify、setStatus、setWidget、setTitle、set_editor_text 的受控网页适配 |
 
-**重绑失败回收**：Hub 自持有带 generation 的重绑期限，初始取 10 秒，M0 根据慢启动验证调整。扩展被禁用、移除、加载失败或重建超时而无人接管时，Hub 必须关闭 socket/server，清空认证及缓存并置 `desiredRunning=false`。保留无资源控制记录和 `autoStartApplied`，避免迟到的 `session_start` 再按 `--web` 自动启动；需用户在终端显式 `/web` 恢复。超时只关闭网页服务，不中断 pi 的会话重建。
+RPC `prompt` 总会尝试扩展命令、skill、模板展开，无法按原文关闭。网页中的普通 slash 因而遵循 RPC 语义；**pi 内置交互命令不能直接传给 RPC prompt**，否则会作为普通模型文本。网页保留内置名称，即使目录尚未返回也拦截：new/resume/fork/model/thinking/compact/settings/session/name/clone 打开对应动作，tree/login/reload 等没有 RPC 映射的命令提示交接模式不支持。扩展与内置名称冲突不能绕过拦截。
 
-**旧上下文与回调**：命令捕获接收时的 Bridge/generation，调用宿主前再次核对。异步回调、压缩回调和节流任务在提交结果前也必须核对；不允许把旧请求转交给新 Bridge。已经进入宿主的异步操作不承诺可撤回，其结果只能归属于原 epoch。
+## 5. 通信协议与一致性
 
-**reload 代码升级**：控制记录保存协议和实现版本。同版本可重绑；不兼容的 Hub 必须先关闭再替换，不能用 `??=` 永久保留旧实现。新实现无法安全接管时降级为停止服务，并提示重新 `/web`。已被用户停止的服务不因升级重启。
+WebSocket subprotocol 为 `pi-pane.v1`、`pi-pane.bearer.<token>`，握手先鉴权；服务器只回显 `pi-pane.v1`。`hello`/`welcome` 建立客户端租约，`snapshot {epoch,seq,session,state,theme,caps,ui?}` 建立投影水位。
 
----
-
-## 6. 通信协议
-
-WebSocket 使用 JSON 文本帧，协议版本为 `pi-pane.v1`。只有广播的状态增量消耗 `seq`，同一 epoch 内从 1 连续递增；快照携带对应水位，定向 `ack`、认证、心跳和 reset 控制消息不消耗序号。这样一个客户端的回执不会让其他客户端误判丢事件。
-
-### 6.1 握手与快照
-
-```
-C → S  WebSocket 握手，Sec-WebSocket-Protocol: pi-pane.v1, pi-pane.bearer.<token>
-       （本机为启动 token；外部访问为 §9 登录后签发的 sessionToken）
-S → C  升级响应只选择 pi-pane.v1，不回显 bearer；鉴权失败不升级
-C → S  { t: "hello", clientId? }
-S → C  { t: "welcome", clientId, leaseExpiresAt, nextCommandNo }
-S → C  { t: "snapshot", epoch, seq, session: {...}, state: {...}, theme: {...}, caps: {...} }
-S → C  { t: "event", epoch, seq, ev: {...} } …（之后一直推增量）
-```
-
-`epoch` 在 Hub 启动、Bridge 重建、成功的 `/tree` 导航后重新生成；与认证凭据版本分开。`branchRevision` 只在切换分支时增加，普通消息追加不会使现有命令过期。reset 时清除旧投影和增量缓冲，并暂停输入直到新快照完整应用。
-
-- `snapshot.session`：`id`、名称、cwd、`leafId`、`branchRevision`、当前分支的有界历史窗口与更早历史游标（见 §6.5）；只传展示需要的字段，不序列化整个 ctx 或 modelRegistry。
-- **实时投影**：Bridge 从 `session_start` 起，以 `getBranch()` 初始化历史，再持续归并消息/工具事件。快照必须包含未持久化的活动消息、生成到当前的完整 content、运行中工具及最新 partial、嵌套关系、待处理 UI prompt 元信息。不能在 `/web` 启动时才开始采集，也不能只读 `getBranch()`。
-- **消息身份**：历史使用 session entry ID，活动消息由 Bridge 分配独立 `messageId`，所有 delta 和 end 引用它；持久化后记录二者映射，不另增一条消息。禁止仅凭文本或 timestamp 去重。`msg_end` 必须表达完整最终消息并 upsert，超大内容可用带版本的内容引用承载（§6.5）；在可确认持久化完成的边界与分支历史校准，避免 `message_end` 先于持久化的时序问题。其他扩展替换最终消息的情况列入 M0。
-- `snapshot.state`：宿主是否空闲、可观测的运行/压缩状态、当前模型及 thinking 等级、上下文用量（允许 unknown）、精简后的可选模型列表、`hasPendingMessages`、待处理 UI prompt。能力未知时明确显示 unknown，不能猜成 idle 或空队列。
-- `snapshot.caps`：包括可用命令、图片支持、`promptReceipt: "dispatch_only"`、`queueView: "boolean"`、`terminalDialogs: true`；前端据此展示限制。
-
-**快照与增量的切点**：状态投影更新与分配协议序号必须在同一提交步骤完成。发送快照前先提交尚未发布的合并更新，再同步捕获不可变投影和水位 N；该连接必须先收到快照，再收到 `seq > N` 的事件。序列化、分块传输期间将新事件放进有界队列，不能先读取历史、异步等待后再随意附上最新 seq。
-
-**断线重连**：v1 不重放事件。客户端认证并 hello 后始终接收新快照，不发送没有作用的 `lastSeq`。应用快照时将 `lastAppliedSeq` 设为 N；同 epoch 下 `seq <= lastAppliedSeq` 的事件丢弃，只有 `seq === lastAppliedSeq + 1` 才应用并推进水位。出现序号缺口或未知 epoch 时暂停应用及写操作，发送 `resync` 请求新快照。连接恢复不自动重发用户命令，未确认提交按 §6.4 处理。
-
-### 6.2 服务端事件（`ev.type`）
-
-| 类型 | 来源 | 说明 |
-|---|---|---|
-| `agent_state` | `agent_start` / `agent_settled`，结合 `ctx.isIdle()` | `agent_settled` 用于终止自动续跑后的收敛；压缩期间不能仅因没有文本输出就判定 idle。M1：`state.tools` 恒为空数组，工具进度只走 `tool_*` 事件，reducer 保留已有工具列表 |
-| `msg_start` / `msg_delta` / `msg_end` | `message_*` | start/end 携带完整的有界 `MessageView`。M1 实现：`message_update` 在服务端按 16ms 合并，`msg_delta { id, ops }` 中每个 op 为 `{ i, append, total? }`（文本块追加）或 `{ i, set }`（替换块）；元数据变化时退回 `msg_delta { id, message }` 整条替换。差量以所有客户端共享的“最后已发送”视图为基线，快照与其一致 |
-| `tool_start` / `tool_update` / `tool_end` | `tool_execution_*` | 带 `toolCallId`、可选 `parentToolCallId`；partial 按工具在 50ms 内合并，end 刷新最终结果并清除待发 partial |
-| `model` / `thinking` | `model_select` / `thinking_level_select` | 推送实际生效值，包括模型能力导致的 thinking 钳制 |
-| `ui_prompt` | `ui_prompt_start/end` | 按可用标识维护待处理集合；网页提示终端待处理的 kind/title，不提供代答 |
-| `history_window` | `session_compact` | M1 实现：压缩成功后发布一个带 seq 的 `history_window { messages, olderCursor }`，客户端整体替换当前窗口；保持 epoch，以便 compact 命令仍能送达结果。`session_before_compact` / `session_compact_failed` 反映在 `agent_state.compacting` |
-| `queue_state` | Bridge 读取 `ctx.hasPendingMessages()` | 有网页连接时每 250ms 采样，值变化才推送；相关输入/消息事件后也刷新，不伪造不存在的扩展 `queue_update` 事件 |
-| `session_meta` | `session_info_changed` | 更新名称等元信息 |
-| `theme` | Bridge 比较颜色与 appearance 指纹 | 值变化才推送，见 §8 |
-
-控制消息 `session_reset { epoch, sessionId, branchRevision, reason }` 来源于新 Bridge 或成功的 `session_tree`，后面必须跟新快照；`switching` 和 `notice` 描述连接生命周期。它们不占用状态增量的 seq。
-
-### 6.3 客户端命令
-
-| 命令 | 对应实现 | 备注 |
-|---|---|---|
-| `prompt { text, images?, mode? }` | `pi.sendUserMessage(content, { deliverAs: mode ?? "followUp", expandPromptTemplates: false })` | 始终传 delivery mode，避免检查 idle 后宿主转为 running 的竞态；空闲时宿主按普通输入处理。`images` 为 `{ mimeType, data(base64) }[]`，有图片时 text 可为空，content 为 `[text?, ...ImageContent]`；缩放与格式规整交给 pi 自己的 `processImage` |
-| `abort` | 当前 Bridge 的 `ctx.abort()` | 回执仅确认已调用；实际空闲由状态事件确认 |
-| `set_model { provider, id }` | 从当前 registry 解析模型后调用 `pi.setModel(model)` | v1 只在 idle 且无终端对话框时接受；根据返回 boolean 报结果 |
-| `set_thinking { level }` | `pi.setThinkingLevel()`，再读取实际值 | v1 只在 idle 且无终端对话框时接受；返回钳制后的实际等级 |
-| `compact` | `ctx.compact({ onComplete, onError })` | v1 只在 idle、无待发消息及终端对话框时接受；完成/失败由回调报告 |
-| `session_new {}`、`session_switch { sessionId }` | 一次性命令网关获取 fresh `ExtensionCommandContext`，调用 `newSession` / `switchSession` | M3 源码新增；恢复目标只接受服务端发现的会话 ID，不接受浏览器路径。成功切换后宿主重建 cwd 与运行时，两端同步 |
-| `session_fork { entryId, position? }`、`session_tree { entryId }` | 同一命令网关调用 `fork` / `navigateTree` | M3 源码新增；目标必须是当前会话条目。返回用户消息前按 pi 语义切到其父节点，并返回有界文本草稿，不恢复图片 |
-| `run_command { name, args? }` | 从宿主命令目录确认可用的 extension/skill/prompt，调用 `sendUserMessage` 并开启明确展开 | M3 源码新增；保留内建命令名称与宿主注册优先级。注册命令/skill/template 只有分派回执；内建选择器在网页打开对应面板，未适配项提示去终端 |
-
-所有写命令共用信封：
+### 写操作
 
 ```ts
 { t: "command", clientId, commandNo, id, epoch, sessionId, branchRevision, command, args }
-// id 由 clientId + commandNo 派生；commandNo 为递增安全整数。
-{ t: "ack", id, epoch, nextCommandNo, status: "dispatched" | "rejected", error?: { code, message } }
-// 仅对宿主 API 能可靠确认结果的命令发送：
+{ t: "ack", id, epoch, nextCommandNo, status: "dispatched" | "rejected", error? }
 { t: "command_result", id, epoch, status: "completed" | "failed", value?, error? }
 ```
 
-接收端先校验认证、信封 schema、客户端租约和去重记录；合法的新编号先预留，再检查命令参数及当前 `epoch/sessionId/branchRevision`。`switching` 或旧版本请求返回 `stale_session`；仅通过全部校验的命令才能调用捕获的 Bridge。每个 Bridge 串行处理命令的校验与提交步骤，但不等待一整轮生成结束，避免阻塞 abort。TUI 仍独立操作，服务端在调用前重查当前状态，异步结果也必须核对 generation；不能声称这把队列锁同时锁住了 TUI。
+所有写命令在宿主串行分派；进入队列和出队调用前核对版本，避免旧操作落入替换会话。正常回执关联原命令和 epoch，同一 Hub/有效租约可查询保留结果；不再有 sessionMutation 特殊豁免、nonce 网关、跨 Bridge 写屏障或 `StateView.mutating`。
 
-**prompt 的回执边界**：`dispatched` 只表示桥接层已校验并调用 `void` API，不表示宿主已接收、入队或执行成功。纯扩展没有完整的逐命令异步失败接口，也没有可靠的浏览器命令 ID 到 `input/message_*` 的关联；`source: "extension"` 由所有扩展共用，其他扩展还可转换或消费输入。不能靠文本或事件顺序猜测对应关系。
+`prompt`/`run_command` 的 RPC 结果显示 `started`、`queued`、`handled`；失败返回真实错误。`dispatched` 仅表示分派开始，不能当作完成。消息与工具气泡由实际事件/快照显示，不根据命令文本猜对应关系。
 
-网页提交记录显示“已交给 pi；提交结果未确认”，保留原文供恢复；会话气泡始终由实际消息事件和快照驱动。等待超时显示“请检查终端”，不自动判失败或再次提交。可观察到的模型运行错误作为会话错误展示，不能伪造其对应的命令结果。若后续产品要求准确的逐条“已入队/失败原因”，需升级宿主能力或 SDK host，不能沿用当前 API 承诺实现。
+客户端 ID/编号去重：预留合法新编号后，拒绝与错误同样消耗编号；相同 ID/内容只返回保存结果，不重复调用宿主；不同内容冲突、编号跳号、过期租约明确失败。每租约最多 128 条回执、最多 8 个租约；已淘汰结果不能再次执行。断线或重启不自动重发，超时保留原文供人工检查/恢复；不承诺跨进程重启的 exactly-once。
 
-**slash 与模板范围**：npm 0.1.0 将输入作为字面文本提交，不执行网页输入中的终端命令，也不自动展开模板/skill。M3 源码分别使用普通 `prompt` 与明确的 `run_command`：普通文本及未发现的 slash 文本仍为字面输入；用户选择条目或提交匹配宿主目录的命令后，才开启明确分派/展开。内建 new/resume/fork/tree/model/thinking/compact/settings/session 有对应动作或选择器；未接入命令显示原因。命令目录加载中不把 slash 输入猜成普通消息。扩展 `input` 处理器仍按宿主规则运行。
+新建/恢复/分叉成功后先 `session_reset` 再完整快照。fork 草稿仅由本次现场操作恢复一次，校验目的 session/branch 与输入框修订；已有/编辑中的草稿保留，旧回执查询只供人工恢复。草稿恢复覆盖 fork 回执与同页面断线重连；普通未提交草稿不持久化，刷新页面后不会保留。
 
-**会话命令网关（M3 首批）**：扩展注册随机名称的内部命令；每次操作创建限时、一次性的 nonce，收到命令时重新核对 session/generation/branch、idle 和队列状态，再用本次 fresh command context 调用宿主。禁止缓存旧 command context。生命周期替换取消未消费 nonce，已进入宿主的操作返回其实际观测结果。公开注册 API 没有 hidden 标志，内部名称可能出现在终端补全，但不进入网页目录；缺有效 nonce 不执行操作。
+### 唯一工作台读通道
 
-会话结果以原命令 epoch 归属；`value.cancelled === true` 在网页显示为取消，不能伪装成新建/导航成功。成功树导航返回目的 sessionId/branchRevision 与有界 draftText；网页只为本次现场操作恢复一次，已有草稿保留，旧回执查询不能自动覆写输入。
+`workbench_query {reqId,epoch,sessionId,branchRevision,action,args}` 提供 sessions/commands/resources/tree/files/file/git_status/git_diff，定向 `workbench_result` 不消耗写编号或事件 seq。删除 spike 的 `host_read`。调用前后版本校验、每连接最多 8 个、全局最多 16 个在途查询；网页 15 秒超时可重读，断线不重放查询。
 
-**跨 Bridge 写屏障**：会话 mutation 在进程级共享锁内进行，生命周期生成新 Bridge 后仍保留屏障，直到宿主动作结束才释放；`state.mutating` 随投影同步。所有网页禁用提交并保留草稿，宿主层同时拒绝切换空窗内的竞争 prompt。不能只靠旧 Bridge 的局部 busy 状态或前端禁用防止跨客户端竞态。
+目录最多 200 条历史元数据，搜索包含后续消息；树最多 2,000 条，命令最多 512 条，模型最多 256 条。只传展示元数据，不传认证、完整 settings 或扩展内部 data。
 
-### 6.3.1 工作台读操作（M3 首批）
+### 扩展 UI
 
-`workbench_query { reqId, epoch, sessionId, branchRevision, action, args }` 提供 `sessions`、`commands`、`resources`、`tree`、`files`、`file`、`git_status`、`git_diff`。结果使用定向 `workbench_result`，不消耗写命令编号或投影 seq；读操作前后均校验当前版本，替换会话后拒绝迟到结果。每连接最多 8 个、全局最多 16 个在途查询，网页 15 秒超时并提供重读，重连不会重放原查询。
+`ui_request {id,method,title?,message?,options?,placeholder?,prefill?,expiresAt?}` → `ui_response {id,value?,confirmed?,cancelled?}` → `ui_resolved {id,reason?}`。答案独立于命令队列，否则等待扩展对话框的 prompt 会阻塞回答。第一份有效答案胜出；超时、会话替换和停止关闭所有 viewer 的请求。重连新快照后重发宿主仍待处理的请求，不把本地乐观关闭当作宿主已确认。
 
-会话搜索读取宿主 `SessionManager.list/listAll` 的目录，搜索包括名称、首条及后续消息；最多返回 200 条历史元数据，无搜索时必要可补当前会话，不暴露任意会话路径。树最多 2,000 条；注册命令目录最多 512 条，另含内建入口；工具和模型各最多 256 条。资源结果只含必要的已发现元数据，不复制认证或原始配置。
+`snapshot.ui` 和 `ui_state` 携带全量有界 statuses/widgets/title，以及带独立 `editorRevision` 的 editorText；status/widget 更新不能重复覆盖用户已编辑的草稿。网页限制对话框文本 64 KiB UTF-8，离线时禁用回答并保留输入，焦点和 Escape 约束在活动对话框内。
 
-文件与 Git 使用当前 Bridge 的 cwd。文件列表最多 500 条、扫描最多 10,000 项；UTF-8 预览和 diff 各最多 256 KiB，Git 状态最多 2 MiB。路径限制在工作区并验证真实路径/文件身份，排除常见凭据与构建目录。Git 查询使用参数数组、限制时长，禁用外部 diff、textconv、fsmonitor 和仓库可执行过滤器，不改变配置与 index。当前只展示 cwd 为仓库根目录的仓库。
+### 消息投影、分页与背压
 
-### 6.4 多客户端与命令去重
+RpcSessionMirror 从公开 RPC 状态、条目及流式事件重建消息，为 Bridge 提供同步投影。持久化条目须与已观测消息对应，最终消息 upsert，不能以文本相同合并两个回合；原型的角色/时间戳匹配局限需在生产实现与测试继续校准。
 
-同一用户的多个浏览器均可操作，按服务器接收顺序提交，不提供协作角色或多用户隔离。每个标签页在首次 hello 后获取 Hub 签发的 `clientId` 租约（初始 30 分钟，可续期）；重连携带原 ID，服务端返回下一命令号。未知或已过期 ID 明确返回 `client_expired`，不得静默换身份重试旧操作。
+广播增量在同一 epoch 内连续 `seq`；定向回执、读取、UI 控制和 reset 不消耗 seq。快照先捕获当前水位，后续只应用 `seq>N`。v1 重连始终拉新快照，不重放事件；缺口或未知 epoch 暂停写入并 resync。慢流文本、thinking、工具 partial/arguments 和持久化衔接纳入回归。
 
-Hub 在调用宿主前预留命令记录，按 `clientId + commandNo` 去重，并保存 epoch 和请求摘要。新命令必须使用服务器期望的下一命令号，禁止跳号；相同 ID、相同内容只返回已有回执，相同 ID、不同内容返回 `command_conflict`。预留后产生的 `stale_session`、busy 或参数错误同样消耗编号并缓存 rejected；非法信封、无效租约、跳号及 ID 冲突不推进编号，能识别有效租约时响应附 `nextCommandNo`。每个租约保存已接收的最高命令号和最多 128 条最近回执；不高于高水位但记录已回收的请求返回 `result_unavailable`，**绝不再次执行**。初始最多 8 个客户端租约；容量不足返回明确错误，不淘汰活跃租约来接受新连接。
+沿用已验证的资源边界：最近 200 条/768 KiB 历史窗口加活动消息；历史页按 entry ID 合并，浏览器历史缓存 16 MiB；块内联预算 32,768 字符，`content_page` 按 128K 字符读取；逻辑帧 8 MiB、传输帧 1 MiB，超限通用 frame_begin/chunk/end；每连接发送缓冲 8 MiB，慢端回收后可重连，不能阻塞 RPC 事件或无界缓存。
 
-客户端不自动重发任何用户操作。丢失 ack 后可通过 `receipt_query { clientId, id }` 查询旧记录，查询本身不调用宿主；未收到过的 ID 返回 `not_seen`，但也不自动提交。超出保留范围、租约过期或 Hub 重启后，未确认提交显示“结果未知”；epoch 改变也不能凭新会话推定普通分派的结果。M3 会话操作可在同一 Hub/租约内查询保留的已观测旧 epoch 结果，仍不重复执行。用户重新提交是一个新操作，须提醒此前操作可能已执行。去重保证仅限当前 Hub 和有效租约内不重复调用宿主，不承诺跨重启或业务执行层面的 exactly-once。
+图片最多 4 张、单张 5 MiB、合计 10 MiB、2,000 万像素，前后端校验数量/格式/结构/字节/像素，浏览器额外解码。历史图片只携带元数据，image_page 按需加载、最多两个并发、缓存 48 MiB。thinking 耗时仅对真实观测 start/end 计时，旧历史不补算。
 
-### 6.5 校验、资源边界与慢客户端
+## 6. 文件、Git、展示与主题
 
-- 前后端共享运行时 schema；拒绝未知命令、非法枚举、过期版本和非预期字段。模型/图片只传白名单字段，不把配置、凭据或任意扩展内部状态原样发给浏览器。
-- 初始限制：单条 prompt 文本 64 KiB UTF-8；最多 4 张 PNG/JPEG/WebP 图片、每张 base64 解码后的文件不超过 5 MiB、总计不超过 10 MiB，单图解码像素不超过 2,000 万。校验 base64、文件签名及实际可解码格式。客户端命令帧上限 16 MiB；认证和 hello 请求体各不超过 8 KiB。M2 实现：共享的 `validateImages()` 检查数量、白名单类型、规范 base64、解码字节、文件结构（PNG 签名 + IHDR CRC + IEND，JPEG SOF + EOI，WebP RIFF 长度 + VP8/VP8L/VP8X 头）、声明类型与实际类型一致及像素上限；浏览器在上传前额外用 `createImageBitmap` 确认可解码，扩展端在调用宿主前再校验一次，不通过的图片返回 `invalid_image` / `image_too_large` 且不调用宿主。
-- 逻辑帧上限 8 MiB（快照、历史页等定向响应同样适用）。M1 实现为通用传输分块：序列化后超过 1 MiB 的逻辑帧拆成 `frame_begin { id, parts }`、连续的 `frame_chunk { id, index, data }`（每块 128K 字符的 JSON 文本）和 `frame_end { id }`，在同一事件循环回合内依次入队，不会与其他帧交错；客户端校验 id、连续 index 与块数后再解析并处理逻辑帧，任何交错或缺块都丢弃并 `resync`。与原设计的 `snapshot_begin/chunk/end` 等价，但不限于快照。
-- 完整历史通过只读 `history_page { reqId, epoch, sessionId, branchRevision, before }` 按页加载（`before` 为窗口中最早持久化消息的 entry ID，即快照的 `olderCursor`）；服务端验证 epoch、会话和分支版本，从该 entry 向前按 768 KiB 预算取页，返回 `{ messages, olderCursor }`，`olderCursor` 为 null 表示已到分支起点。响应定向发送、不消耗 seq；前端按 entry ID 合并，切 epoch 时丢弃未完成请求。前端保留历史上限 16 MiB：实时增长超限时淘汰最旧的持久化消息并前移游标（可再次加载）；向上加载会超限时拒绝并提示。快照窗口为最近 200 条 / 768 KiB 的持久化消息加上全部活动消息。
-- 单条消息所有块共享 32,768 字符的内联预算；超出预算的文本块保留原索引，只发送前缀并附 `total`（完整长度）。只读 `content_page { reqId, epoch, messageId, index, offset }` 按 128K 字符读取该块的完整原文，响应带 `total` 与 `final`（来源消息是否已结束），只接受消息 ID 与块序号，不接受文件路径。M1 的“版本衔接”以 `total` 与 offset 连续性实现：客户端每页校验 offset 等于已读长度，`total` 变化或 epoch 切换即判定过期需重读；仍在流式生成的超大块可以读取当前内容，但网页的“加载全部”主要面向已结束的消息。宿主不再保留来源消息时返回 `content_unavailable`，不以摘要冒充。工具实时输出在 `ToolView.output` 中只保留末尾 8,192 字符并附 `outputTotal`；完整结果通过对应 toolResult 消息的 `content_page` 读取。
-- 图片（M2）：快照与增量只携带 `{ type: "image", mimeType, bytes, width?, height? }` 元数据，块序号与原消息一致；字节通过只读 `image_page { reqId, epoch, messageId, index }` 定向读取（≤5 MiB，超出返回 `image_too_large`，经通用分块传输）。前端在图片接近视口（以 timeline 为根、600px 边距）时请求，最多 2 个并发，解码为 object URL，按最近显示淘汰，总量 ≤48 MiB；epoch 切换丢弃未完成请求，已加载的图片保留。
-- 思考耗时（M1/M2 收尾）：thinking 块可带 `timingStatus: "running" | "complete" | "interrupted"` 和 `durationMs`。Bridge 只对实际观测到的 `assistantMessageEvent.thinking_start/end` 按原始 `contentIndex` 用单调时钟计时，结束时定值；缺少 end 而消息/轮次结束时标为 interrupted。running 不带递增时长，快照读取不推进时间；元数据变化用块级 `set` 增量发布，与共享 reducer 保持一致。旧历史、错过 start 的段不补算；同条消息的持久化和重连保留观测值，canonical 思考文本被改写则撤掉不再可证明的耗时。计时状态跟随来源对象生命周期，分支重置、扩展重载及会话替换清空，不写入宿主会话文件。
-- 快照分块及附件帧不超过 1 MiB；每连接发送缓冲与待发送增量合计初始上限 8 MiB，达到高水位即停止喂入历史分块，持续无法排空则断开该客户端并允许重连拉新快照。不得等待慢客户端而阻塞宿主事件处理，也不得无界缓存或静默丢 delta。
-- 大工具结果显示限长摘要和明确截断标记，可按需读取宿主仍保留的完整结果；实时投影只保存每个工具的最新 partial。持久化历史采用索引/分页，避免复制完整会话多份。资源上限由 M0 压测调优，并保留在发布配置与验收记录中。
-- 所有解析/归一化/网络错误都在扩展边界捕获；限流按连接和 Hub 总量执行。首次 hello 限时 5 秒；心跳超时、异常关闭和重绑失败统一走幂等清理。
+文件查询根目录总是当前会话 cwd，跨工作区成功切换后重建 WorkspaceService。列表最多 500 条、扫描最多 10,000 项，预览/diff 最多 256 KiB、Git 状态最多 2 MiB、执行超时 10 秒。路径拒绝绝对路径、穿越、逃逸符号链接，打开后校验文件身份；排除 .git、node_modules、构建目录及常见凭据。
 
-M0 Spike 的有界预览（200 条/512 KiB、无分页）已由 M1 替换为上述窗口 + 分页 + 内容页实现；当前常量见 `src/protocol/index.ts` 的 `LIMITS`，验收证据见 [M1 验收记录](m1-status.md)。
+Git 使用参数数组，无 shell；禁用 external diff/textconv/fsmonitor 和 clean/process/smudge filters，清除外部 GIT_* 影响，不改配置或 index。暂存/未暂存/删除/重命名/未跟踪均读取真实仓库状态。当前只展示 cwd 自身是仓库根的 Git；引用到消息最多 24 KiB，明确截断，并转义 fence。
 
----
+前端沿用 Preact、Zustand、marked、Shiki 和清洗器，三栏桌面布局与移动端抽屉；消息默认窗口 200 条，滚动上翻/分页扩大，回到最新缩回。中文 IME 不误提交；触屏 Enter 换行。未知扩展工具通用卡片，custom entry 内部数据不泄漏。
 
-## 7. 前端渲染
+网页使用交接时已解析的 pi 主题，保持 Markdown/代码/diff 与 `export.pageBg`、OKLCH 派生面板色。RPC 没有 TUI 主题切换，旧镜像的运行时热主题同步验收退役；交接前选择主题、包内主题资源和 CSS 覆盖仍验证。安装包自带 pi-pane-dark/light 与 public/pi-pane.css 构建副本。
 
-| 内容 | 渲染方式 |
+## 7. 外部访问与安全
+
+沿用 M2，不集成 Kimi `/remote-control` 的云中继。公共 HTTPS origin、`PI_PANE_PASSWORD`（至少 12 字符）、直接 TLS 或显式同机 TLS 代理缺一项则拒绝交接。代理只监听回环，保留 Origin/subprotocol；不信任 X-Forwarded-* 自动扩充白名单。Host/Origin 精确校验、防跨站 WS/DNS rebinding；0.0.0.0 不作为访问白名单。
+
+链接 fragment 携带 bootstrap token；外部访问必须同源 POST /auth/session 校验链接与密码后取得 sessionToken，bootstrap 不能直接 WS 升级。登录默认 8 小时、最多 16 个；错误登录限流，退出/停止/轮换撤销连接。token 当前随服务启动变化，持久化为可选未实现项。
+
+交接横幅直接显示 URL、当前 cwd、Stop: Ctrl+C；外部访问附密码提示和终端二维码。网页 access_rotate 返回新链接再撤销旧连接/登录，发起页面更新凭据（外部需重登录），其他 viewer 使用终端的新链接；所有终端输出跟随当前会话，不保留 TUI widget 路径。
+
+Markdown 原始 HTML 不执行，链接仅 http/https/mailto，远程图片仅显示链接；CSP 禁内联脚本/eval、frame ancestor、object/base。静态资源不带会话内容、固定 webRoot、防路径穿越。密码不存储、token 仅本页 sessionStorage/内存，读取后清理地址栏；报告与终端日志脱敏。
+
+## 8. 里程碑与 M3-D 重写
+
+M0/M1/M2 是已发布 0.1.0 的历史镜像验收，记录保持不改写。M3 首批工作台也在 `6196c7b` 保存旧结论。本修订保留布局、移动端、草稿恢复、只读文件/Git 与 workbench_query，迁移其执行语义后重新验收。
+
+- **M3-A**：工作台结构及逐项能力映射，保留已有视觉成果。
+- **M3-B**：RPC 会话/命令/模型与文件/Git闭环，工具与 tree 缺口明确禁用。
+- **M3-C**：完整标准扩展 UI 与 RPC 提交结果；认证/资源安装和 Plan/Goal/Agent 的未定义语义继续后置。
+- **M3-D（新定义）**：Kimi 式前台交接、唯一 RPC 写入者、协作会话锁、当前 cwd、Ctrl+C 恢复提示、SIGHUP 退出、宿主/子进程崩溃无残留写入者。禁止按旧设计扩展成后台存活、attach 或自动重启。
+
+M3-D 验收门槛：正常 TUI shutdown 在子进程打开文件前完成；交接前忙/队列拒绝；目标锁冲突失败保留原会话；停止时确认子进程退出后释放锁；关闭终端/杀宿主均不遗留活子进程；子进程异常 fail closed，恢复提示与浏览器最后 cwd/会话一致。macOS 真实 PTY 证据与 Linux/Windows 的状态分别记录。
+
+## 9. 回归矩阵与发布
+
+| 范围 | 交接后的验收要求 |
 |---|---|
-| 用户消息 | 气泡，图片按需懒加载（§6.5） |
-| assistant 文本 | Markdown（`marked` + `shiki`，shiki 懒加载），流式追加 |
-| thinking | 默认折叠。观测到的思考段结束后显示耗时；未观测的历史不显示耗时，中断段标明“已观测 / 已停止”，见 §6.5 |
-| 内置工具 `read` / `write` / `edit` / `bash` / `grep` / `find` / `ls` | 专门的卡片：edit 显示 diff（按词高亮，超出 128 KiB 文本、每侧 2,048 token 或累计 250,000 个匹配格时回退行级着色），bash 显示命令、输出和退出码 |
-| 未知工具或扩展工具 | 通用卡片：工具名、参数 JSON、结果文本，可折叠（它们在终端里的自定义渲染是 TUI 组件，网页没法复用） |
-| 嵌套调用（codemode） | 根据 `parentToolCallId` 缩进显示 |
-| 自定义消息 / 自定义条目 | 自定义消息尊重 `display`；普通 custom entry 是扩展内部状态，默认不发送其 data，只有显式适配的可展示字段进入网页 |
-| 压缩点 | 一条分隔线，标注"上下文已压缩" |
+| M0 生命周期 | TUI → /web → 宿主；配置/空闲/保存会话/端口冲突，Ctrl+C/SIGHUP/SIGKILL/child crash/锁 |
+| M0 消息与边界 | prompt/steer/followUp/abort，input 消费转换、模型/认证失败、compact、去重/回执、旧 scope 拒绝 |
+| M1 协议与性能 | 慢流刷新/重连，thinking/tool arguments/partial，分页/超长内容/背压；1,000 条消息 A6 分开测量 |
+| M1 浏览器 | Markdown/Shiki/diff/耗时/内容安全，中文 IME，桌面/390px 抽屉/焦点 |
+| M2 图片/外部访问 | 上传与历史懒加载，TLS/代理密码登录与撤销，横幅二维码，手机重连 |
+| M2 安装 | npm pack 内容、干净 HOME 安装无构建依赖、安装后 /web 交接；不使用 --web |
+| M3 工作台 | 会话当前标记/新建/恢复/改名/clone/fork草稿；跨 cwd 文件/Git；命令/skill/template；工具/tree缺口 |
+| M3 扩展 UI | 四类对话框、回答/取消/超时/重连/竞争答案，status/widget/title/editor，不覆盖编辑后的草稿 |
+| 真实 provider | 显式 opt-in 的独立隔离 agent 目录；真实回复、工具、刷新重连；确定性测试不替代 |
 
-输入框：Enter 提交，Shift+Enter 换行；运行中 Enter 请求 followUp，⌘Enter（Windows/Linux 为 Ctrl+Enter）请求 steer，并提供可点击的同名按钮。中文等输入法组合期间不触发提交。M2 支持粘贴和拖入图片。提交状态遵守 §6.3，不能在收到 `dispatched` 后标注“已入队”。
+旧镜像的 TUI/网页同时输入、扩展运行时 rebind、/web stop/status/qr/rotate、--web 自启动、终端主题热变和 tree 导航按新定义退役；它们的底层安全、状态一致性、失败清理与重复执行防护在上述宿主矩阵补足。具体命令、结果和未覆盖范围见 [tests/README.md](../tests/README.md) 与 [M3 状态](m3-status.md)。旧慢流重连超时保留原证据，在交接模式重新跟踪，不能将后续通过自动当作旧问题根因已定位。
 
-**性能**：`content-visibility: auto` 跳过屏幕外消息的布局与绘制，配合前端 16 MiB 历史上限和服务端分页；store 更新经 `requestAnimationFrame` 合并后渲染，消息组件按不可变投影 memo，流式更新只重渲染变化的消息。M2 增加窗口化列表：跟随最新输出时只挂载最新 200 条；读者上滚或加载更早历史时窗口扩大，回到底部后收回。贴底状态下用 `ResizeObserver` 跟随估算尺寸与图片加载造成的高度变化。前端节流不能代替 §6.5 的服务端背压、分块和内存上限。
-
-**移动端**：触屏（`pointer: coarse`）上 Enter 换行、按钮提交，按钮最小 40px，输入框 16px 字号避免缩放，适配安全区；页面重新可见时立即重连。
-
----
-
-## 8. 主题
-
-1. 服务端读 `ctx.ui.theme.colors`（F7），转换成 hex。`IndexedColor` 按 xterm 256 色表转换，OKLCH 做 gamut-map。
-2. 映射成 CSS 变量，例如：
-
-| pi token | CSS 变量 | 用在哪里 |
-|---|---|---|
-| `text` / `muted` / `dim` | `--fg` / `--fg-muted` / `--fg-dim` | 正文、次要文字 |
-| `accent` | `--accent` | 链接、焦点、主按钮 |
-| `border*` | `--border*` | 分隔线、卡片边框 |
-| `userMessageBg` | `--user-bg` | 用户消息气泡 |
-| `toolPendingBg` / `toolSuccessBg` / `toolErrorBg` | `--tool-*` | 工具卡片状态 |
-| `toolDiff*` | `--diff-*` | diff |
-| `md*` / `syntax*` | `--md-*` / `--syntax-*` | Markdown 和代码高亮 |
-| `success` / `warning` / `error` | `--ok` / `--warn` / `--err` | 状态 |
-
-3. **pi 主题里没有的网页元素**（页面背景、侧栏、hover、阴影）：页面背景优先用主题的 `export.pageBg`，其余在 OKLCH 空间里由 `appearance` 和上面这些颜色推导出来。pi 1.0.4 的 Theme 不公开 export，使用公开 `sourcePath` 或 `ctx.ui.getAllThemes()` 给出的路径，有界读取当前主题 JSON（≤256 KiB），解析 `vars` 与颜色；缺失或无效时按 appearance 回退。缓存文件指纹，读取保持同步以维持快照切点。字体、圆角、间距是 pi-pane 自己的设计 token，跟 pi 主题无关。
-4. **自定义主题**：包的 `themes/` 自带 `pi-pane-dark` / `pi-pane-light`，通过 `pi.themes` 声明，安装包后 TUI 和网页均可使用。网页专属覆盖写在源码的 `public/pi-pane.css`，随构建复制到 `web-dist/pi-pane.css` 并在应用样式之后加载；安装后可编辑该文件并刷新，无需重新构建，不自动扫描工作目录。动态主题变量为内联 CSS 属性，有意覆盖需 `!important`；现有 CSP 仍生效。
-5. **主题切换后网页跟着变**：比较最终 CSS 变量指纹，包含解析后的 `colors`、`appearance` 与 `export.pageBg`，不只比较 `theme.name`。快照前以及 Bridge 活跃轮询（当前 250ms）时检查；值变化才推 `theme`。同名文件热更新、仅 export 变化、system 主题及终端默认色变化均纳入验收。纯扩展不深导入内部 `onThemeChange` 覆盖 TUI 自己的回调。
-
----
-
-## 9. 安全
-
-| 风险 | 对策 |
-|---|---|
-| 本机其他用户或网页访问到服务 | 默认只绑 `127.0.0.1`；使用 32 字节随机 token，以 URL-safe 编码放在 `#t=`。fragment 不会自动进入 HTTP 请求和 Referer，但后续 bearer 头仍包含凭据，不能据此声称所有日志都无 token |
-| token 泄露后长期有效 | 每次 Hub 启动生成新 token；stop、退出、重绑超时均作废。rotate 同时撤销全部登录和现有连接；不得仅改 token 却保留已认证连接 |
-| DNS rebinding 和跨站 WebSocket | HTTP 校验精确 Host；认证端点与 WS 升级额外校验精确 Origin（scheme、host、有效端口），拒绝缺失、null 和未允许值。绑定地址 `0.0.0.0`/`::` 不作为访问白名单，禁止通配符 |
-| HTTP 静态资源 | 公开页面不包含会话数据；会话内容和操作只走鉴权 WS，HTTP 另有受保护的认证端点。静态文件根目录固定，拒绝路径穿越，不因 cwd 改变而开放项目文件；healthz 只返回存活状态 |
-| 局域网/外部访问 | M1 拒绝；M2 必须显式配置外部 HTTPS origin、密码和传输保护，按 §9.1–9.2 执行。密码不能补偿明文 HTTP/WS |
-| 远程访问 | 支持显式配置的同机加密代理，例如 Tailscale Serve；不集成公网隧道。代理白名单及鉴权仍生效 |
-| XSS | Markdown 禁止原始 HTML，并对生成结果做 HTML 清洗、链接协议白名单和图片来源限制；`marked` 自身不提供净化。Shiki 输出同样经过受控渲染。使用 CSP 禁止内联脚本和 eval，不能只靠 CSP 代替清洗 |
-| 日志与浏览器存储 | 不记录认证 body、Authorization、bearer subprotocol 或完整连接链接；日志只记请求 ID 和错误码。token 只存当前标签页 sessionStorage/内存，密码不存储；读取 fragment 后清除地址栏中的 token |
-| 网页能做的事 | 跟终端用户的权限完全一样：能发消息就能让 agent 执行命令。文档里写明这一点 |
-
-### 9.1 外部访问部署（M2，已实现）
-
-外部访问要求 `PI_PANE_PASSWORD` 与 `--public-origin https://host[:port]` 同时存在。密码仅从进程环境读取，不接受命令行密码值，不写入 settings。支持两种明确部署：
-
-- **直接 TLS**：`--host` 配合 `--tls-cert`、`--tls-key`，由 `node:https` 提供 HTTPS/WSS；证书必须被访问设备正常验证。非回环 HTTP 监听拒绝启动。
-- **同机 TLS 代理**：显式启用 `--proxy-mode`，后端只绑定回环，由受信任的同机代理提供公共 HTTPS/WSS。代理须保留 Origin 和 subprotocol，按显式公共 origin 校验；不从 `X-Forwarded-*` 自动推断信任或扩充白名单。代理请求不能通过其他网络路径绕过 TLS。
-
-直接 TLS 的 Host 对应 public origin；代理模式仅额外允许实际回环上游地址。额外别名需明确配置成完整 origin，`--allowed-host` 本身不能绕过 Origin 校验。生成链接与二维码使用 public origin，不使用通配监听地址。无法满足证书或代理配置时不启用外部访问。
-
-### 9.2 外部访问认证流程
-
-1. Hub 生成随机 `bootstrapToken`，通过 `#t=` 传给前端；仅持有链接不等于完成 LAN 登录。
-2. 前端通过同源 HTTPS `POST /auth/session` 提交 `{ bootstrapToken, password }`，校验 Host、Origin、`Content-Type: application/json`，请求体不超过 8 KiB。按来源和全局限制失败登录次数，统一错误文案，不暴露是哪项凭据错误。
-3. 两项凭据通过后签发随机 32 字节 `sessionToken`；服务端保存摘要、认证版本和绝对到期时间（初始 8 小时），返回 `Cache-Control: no-store`。密码不保留在浏览器存储。
-4. WS 升级只接受 `sessionToken`，外部访问模式下拒绝 bootstrap token 直接升级。握手通过后仅回显 `pi-pane.v1`，不回显 bearer。客户端租约续期不得超过认证到期时间。
-5. 凭据到期关闭对应 WS 并要求登录；rotate、stop、Hub 回收清空登录会话和客户端租约。会话/分支切换只更换数据 epoch，不要求再次登录。
-
-实现要点：密码至少 12 字符，以 SHA-256 摘要做定长比较；会话 token 只保存摘要，到期由定时器立即关闭对应连接（close code 4401）；同时最多 16 个登录，失败登录按来源每 5 分钟 10 次、全局每分钟 20 次限流（代理模式下所有请求来自回环，只按全局计）；`GET /auth/info` 只返回模式，`GET/DELETE /auth/session` 用于校验与退出。前端在升级失败时向 `/auth/session` 询问登录是否仍有效，再决定重连或回到登录页。
-
-登录请求、HTTP/WS 连接数、失败升级和单位时间命令量都设置有界限制；代理模式的限流不能信任未经配置的客户端 IP 转发头，全局限流始终生效。静态资源和认证响应设置 `X-Content-Type-Options: nosniff`、`Referrer-Policy: no-referrer`；CSP 至少包含 `default-src 'self'`、`script-src 'self'`、`object-src 'none'`、`base-uri 'none'`、`frame-ancestors 'none'`，`connect-src` 显式允许当前 WS/WSS origin，图片只开放实际需要的 self/blob/data 类型。Shiki/CSS 变量所需样式策略单独验证，不通过放宽 script-src 解决。
-
----
-
-## 10. 打包与发布
-
-```jsonc
-{
-  "name": "@lilibonk/pi-pane",
-  "keywords": ["pi-package"],
-  "pi": {
-    "extensions": ["./dist/extension/index.js"],
-    "themes": ["./themes/*.json"],
-    "image": "https://…/preview.png"
-  },
-  "peerDependencies": { "@earendil-works/pi-coding-agent": "*" },
-  "dependencies": { "ws": "8.22.0", "qrcode-generator": "2.0.4" },
-  "files": ["dist", "web-dist", "README.md", "docs/design.md"]
-}
-```
-
-- 宿主提供的包（`pi-coding-agent`、`pi-ai`、`pi-tui`、`typebox`）只放 `peerDependencies`，**不打包**（参见 `docs/packages.md`）。
-- 前端在发布前用 Vite 预构建到 `web-dist/`，用户安装时不需要构建。目标体积：gzip 后首屏 < 200 KB，shiki 的语言包按需加载。
-- `pi-package` 关键词使包具备 gallery 发现资格；发布后实际核验收录和预览图，不把外部索引完成时间作为本地功能保证。
-- M0/M1 历史测试基线为 1.0.4；M3 开发依赖与验收固定为 1.1.0。按官方建议保留宿主 peer 的 `*`；启动时检测必需 API，缺失时明确拒绝启用或降级 caps，不能把任意宿主版本都视为已兼容。
-
----
-
-## 11. 工程结构与技术栈
-
-```
-pi-pane/
-├── src/
-│   ├── extension/          # 跑在 pi 进程里
-│   │   ├── index.ts        # factory：命令 / flag / 事件注册、进程级状态
-│   │   ├── hub.ts          # 进程级：http + ws、鉴权、租约/去重、分块发送、分页路由
-│   │   ├── bridge.ts       # 会话级：投影、窗口/分页、内容页、合并发布、主题、命令
-│   │   ├── config.ts       # piPane 设置读取与宿主能力检测
-│   │   ├── theme.ts        # 有界主题读取、颜色映射与网页颜色推导
-│   │   ├── thinking.ts     # 宿主事件观测计时，随会话投影回收
-│   │   └── qr.ts           # /web qr 的终端二维码
-│   ├── protocol/           # 前后端共享类型、LIMITS、运行时校验与共享 reducer
-│   └── web/                # 前端 SPA：store、Markdown/高亮、消息与工具卡片
-├── themes/                 # 自带的 pi-pane-dark / pi-pane-light
-├── public/pi-pane.css      # 可选的包内网页样式覆盖
-└── docs/
-```
-
-- **扩展**：TypeScript + `ws`，HTTP/HTTPS 用 Node 内置模块，不引服务端框架。共享 schema 的验证器须能在 Node 与浏览器运行；不把宿主完整模块树打进前端。
-- **前端**：Vite + Preact + Zustand（使用 vanilla store 或显式配置 compat，构建时避免重复引入 React）+ CSS 变量；Markdown 使用 `marked`、Shiki 与 HTML 清洗器。所有资源随包发布，不从公共 CDN 拉脚本。
-- **测试**：协议、状态投影及生命周期写必要的单元/集成测试；用确定性假 provider 加 PTY 驱动真实 TUI、Playwright 驱动网页做双端端到端测试。仅浏览器假后端不足以验证 TUI 切换、扩展重载和真实输入事件时序。
-
----
-
-## 12. 里程碑
-
-| 里程碑 | 内容 | 完成标准 |
-|---|---|---|
-| **M0 Spike**（以验证结果决定工期） | 最小扩展及真实 TUI/浏览器验证：连接、流式、重连、提交、中止、会话/分支切换、失败边界 | §13 Q1–Q10 逐项记录证据、结论与能力降级；核心一致性问题未解决不得进入 M1 |
-| **M1 MVP** | 本机模式完整协议；followUp/steer；工具卡片；主题映射；快照分块、背压及长历史基本展示；安全基线；stop/status/rotate/--web | §13.1 所有 M1 用例通过；补充日常使用一周的反馈记录 |
-| **M2 打磨与发布** | 图片、移动端及虚拟列表优化、完成 §9 外部访问认证与 TLS/代理路径、二维码、README 和预览图 | §13.1 所有 M2 用例通过；npm 安装验证及实际 gallery 收录；外部访问安全条件缺一则不开放该模式 |
-| **M3 Web 工作台与能力对齐** | 按 §1 的 Kimi 2.1.1 基线先对齐工作台布局与功能闭环，再完成必要的控制/UI 适配和进程交接 | 每项入口有真实后端与状态验收；会话、命令、资源、文件/diff、交互决策逐项核对；交接另满足下方门槛 |
-| **M4 官方协议** | 跟进 `pi experimental server/client`，等它稳定后作为后端 | 一个会话可以同时挂多个前端，原生支持后台常驻 |
-
-**2026-10-09 调整后的执行顺序**：验证 pi 1.1.0 兼容性并在日常终端加载 pi-pane → 用真实模型验证 `/web`、双端对话、工具执行、刷新重连 → 修复试用问题，完成 npm 发布与正式安装验证 → 稳定后推进 M3。M1 的一周反馈和 M2 的发布验收继续记录，当前进展见 [真实环境试用与发布计划](m2-trial-status.md)。
-
-**M3 修订顺序（2026-10-09）**：
-
-1. **M3-A 信息架构与功能映射**：先列全工作区/会话导航、中央对话与输入、右侧文件/diff/任务面板、设置/资源入口。为每项记录参考证据、pi API、实现层、状态和验收。先审查完整页面结构，避免仅美化聊天区域。
-2. **M3-B 核心操作闭环**：优先会话列表/搜索/new/resume/fork/tree、slash/skills/templates、文件引用/预览、Git 改动；保留双端一致性、失败取消及重连约束。已有公开能力先接通，不以后台 host 尚未完成为理由整体后置。
-3. **M3-C 资源与交互能力**：设置/模型/认证状态、扩展与工具资源、标准对话框/审批；明确 Plan/Goal/Agent 等能力在 pi 上的对应方案。需要 SDK host 的部分先做最小接口验证，每个控件必须连接真实能力。
-4. **M3-D 交接与运行恢复**：基于实际能力缺口选择同进程前台或独立 SDK host，验证所有权、终端关闭后存活、重新接入和回滚。单独的后台进程验证不能代替工作台功能对齐。
-
-维护者已于 2026-10-09 明确要求开始并继续 M3，M3-A 与核心 B 第一增量现已验收；一周日常反馈与 gallery 跟踪并行保留，未据短试用推定长期稳定。完整单测 92/92、真实 TUI/WS 15/15、已有 smoke 21/21、CUA 浏览器 22 项通过，仍保留一次慢流重连超时待定位。下一步以新增源码走真实 provider 并追踪超时，再考虑发布和继续 C/D。实现与结果记录在 [M3 状态](m3-status.md)，本批源码尚未 npm 发布。
-
-**M3-D 交接门槛**：同进程前台候选先验证扩展是否能接管 TUI 退出流程，它本身不承诺关闭终端后存活。后台候选必须在真实关闭终端后继续运行，并定义唯一会话写入者、所有权获取/释放、崩溃恢复及子进程失败回滚。`pi --resume` 是恢复历史的入口，不能默认等于附着后台进程；只有后台 host 停止且交还写入权后才允许按恢复历史继续，实时附着需另设 attach 协议。标准 select/confirm/input/editor 可设计 Web 适配，任意 TUI custom 组件只能声明不支持或提供专门适配。相关能力未验证前，不在 README 承诺 M3 会解决所有对话框限制。
-
----
-
-## 13. 待验证问题（M0 解决）
-
-下表保留 M0 的验证问题和通过标准。当前结果见 [本地验收记录](m0-status.md) 与 [Space 执行计划](https://chatgpt.com/space/page_6ac66a64d11c8191bbcc2dc63d862e09)，不能把预期结果写成已通过。记录使用的 pi/Node/OS 版本、执行步骤、可重复的测试结果及必要的录屏或日志；日志不含 token。
-
-| # | 问题 | 验证及通过标准 |
-|---|---|---|
-| Q1 | Hub 能否跨运行时重绑，失败时能否回收？ | 依次运行 `/web`、`/reload`、`/new`、`/resume`、`/fork`；再禁用扩展、模拟导入失败和超时。检查连接/epoch、监听端口、旧回调失效，且 stop/超时后不会因 `--web` 再启动 |
-| Q2 | 提交能否正确进入 TUI，回执是否诚实？ | 保留未发送草稿；测试普通输入、followUp/steer、同文本多端提交、其他扩展转换/消费输入、无模型/认证失败。实际消息驱动双端展示，draft 不受破坏，dispatched 从不显示成成功/入队 |
-| Q3 | 主题能否持续同步？ | 切主题、同名文件热更新、system/default 色变化；验证颜色/appearance 指纹，变化 1 秒内可见，不覆盖宿主回调 |
-| Q4 | 广播是否拖慢宿主或造成无界缓存？ | 固定长输出比较开启/关闭扩展的吞吐、事件循环延迟及内存；停止一个浏览器读取、增加多端连接、大工具 partial。验证分块和断开策略；必要时服务端按 16ms 合并后编号 |
-| Q5 | slash 行为是否符合范围？ | 注册有可观察副作用的测试命令，从网页输入 `/命令`、模板名和 skill 名；`expandPromptTemplates:false` 不进入 slash 分派。另验证宿主 input 扩展仍按规则处理 |
-| Q6 | 非 TUI 模式是否正确拒绝？ | rpc/print/json 不启动监听、不创建定时器；错误可见且进程正常退出 |
-| Q7 | 运行中快照是否完整并与增量衔接？ | `/web` 首次打开及刷新发生在文本、thinking、工具参数和工具 partial 的中途；检查无缺失/重复，含相同文本的不同消息仍独立。验证持久化映射和其他扩展替换最终消息 |
-| Q8 | 会话/分支边界是否拦住旧操作？ | `/tree` 成功、取消、摘要失败；延迟投递旧 prompt/abort/model/compact。尚未进入宿主的旧命令必须拒绝；已提交异步操作按 §5 边界处理，旧结果不得更新新 epoch；切换屏障可恢复 |
-| Q9 | 去重与队列状态能否实现？ | 丢失 ack、重复 ID、冲突内容、回执淘汰、租约过期及 Hub 重启；宿主调用次数正确且无自动重发。终端入队/消费/清空后，网页布尔队列状态 1 秒内收敛 |
-| Q10 | 配置和包运行是否符合宿主约束？ | 验证 settings 自定义字段读写与并发保存、启动 flags、重复 `/web`、端口冲突、stop/start、同机多 pi 实例；使用预构建包安装并验证静态资源路径与必需 API 检测 |
-
-### 13.1 M1/M2 发布验收矩阵
-
-| 编号 | 阶段 | 场景 | 必须满足 |
-|---|---|---|---|
-| A1 | M1 | 生成/工具执行中首次接入、刷新、断线重连 | 活动消息与 partial 可恢复；最终历史与 TUI 一致；无丢字或重复气泡 |
-| A2 | M1 | new/resume/fork/reload/tree，含失败和取消 | 旧版本命令被拒绝；快照切换正确；无人重绑在期限内关闭服务；无重复监听/计时器 |
-| A3 | M1 | 两个浏览器与 TUI 同时输入、中止、切模型 | 浏览器命令按 Hub 接收顺序提交并有版本归属；与 TUI 并发时状态最终收敛；无凭文本误合并 |
-| A4 | M1 | 无模型、认证失败、输入被消费、压缩期间提交、丢 ack | 不虚报发送/入队成功；可恢复提交文本；重试/查询不会重复调用宿主 |
-| A5 | M1 | 超长历史、巨大工具输出、慢客户端 | 快照分块、缓冲上限和截断提示生效；慢端被回收，TUI 继续响应，无持续内存增长 |
-| A6 | M1 | 参考性能数据集 | 1,000 条消息、归一化文本总量 ≤1 MiB、无图片；记录机器与环境，20 次测量的 WS 连接建立至浏览器快照应用完成 P95 ≤1 秒。`/web` 至浏览器启动的耗时另记；慢端与大历史不套用此阈值 |
-| A7 | M1 | 主题、队列与输入法 | 同名主题更新和队列布尔状态 1 秒内同步；中文组合输入不误提交 |
-| A8 | M1 | 错 token/Origin/Host、恶意 Markdown、非法帧、路径穿越 | 拒绝未授权升级和非法操作；无脚本执行/任意文件读取；日志无凭据；rotate 断开已有连接 |
-| A9 | M2 | 图片及大历史图片加载 | 校验大小、格式与解码像素，损坏/超限图片明确失败；重连和懒加载完整，内存受控 |
-| A10 | M2 | 直接 TLS 与同机代理认证 | 明文非回环拒绝启动；缺密码、错密码、bootstrap 直接升级、过期会话均失败；正确登录可用；轮换/退出撤销全部连接 |
-| A11 | M2 | 移动端、安装与发布 | 移动端输入/steer按钮及重连可用；干净环境安装无需构建；npm tarball 包含静态资源；核验 gallery 收录 |
-
----
-
-## 14. 0.1.0 当前已知限制（写进 README）
-
-1. 其他扩展弹的对话框（select/confirm/input/editor/custom）**只能在终端里操作**，网页只提示待处理信息（F8）。M3 可研究标准对话框适配，任意 TUI 组件不保证支持。
-2. 扩展自定义的 TUI 渲染（工具渲染器、widget、footer）在网页上会退回到通用展示。
-3. 网页不执行 slash 命令或自动展开模板/skill；终端的 `/tree`、`/resume`、`/fork` 等操作仍须在网页同步结果。
-4. 关掉终端，网页就断开；后台运行需满足 M3-D 的进程分离及唯一写入者门槛。
-5. prompt 回执只确认桥接层提交，不能逐条确认入队或覆盖全部失败原因；超时需检查终端，保留原文供人工恢复。完整待发队列内容也不在扩展 API 能力内。
-6. 多个浏览器属于同一用户权限，均可提交或中止；没有只读访客、多用户角色与协作隔离。未确认操作不会自动重发，跨重启不提供 exactly-once。
-7. 外部访问须同时配置公共 HTTPS origin、`PI_PANE_PASSWORD` 与直接 TLS 或同机加密代理；缺一项不启动。
+打包仍是 pi package（keywords pi-package，coding-agent peer ≥1.1.0 <2，pi-ai peer *），dist 扩展与 web-dist/主题预构建后随包发布。版本 `0.2.0` 为未发布的次版本升级，README 必须写明 --web 去掉及 TUI 不再并行；npm 发布只由维护者执行。干净安装验收与真实 provider 验收各自记录；不因本地 pack、原型或部分回归通过声称已发布或整体 Kimi 对齐完成。

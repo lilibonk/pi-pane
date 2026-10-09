@@ -19,9 +19,6 @@ interface Meter {
   samples: Record<string, unknown>[];
   providers: Record<string, unknown>[];
   tools: Record<string, unknown>[];
-  socketCloses: { code: number; reason: string; atMs: number }[];
-  socketCloseRequests: { code?: number; reason: string; atMs: number; bufferedBytes: number }[];
-  listeners: { socket: any; callback: (code: number, reason: Buffer) => void; originalClose: (...args: any[]) => any }[];
   progress?: { bytes: number; updates: number; durationMs: number };
   profile?: Session;
 }
@@ -32,35 +29,16 @@ function evidence(event: string, data: Record<string, unknown> = {}) {
   const path = process.env.PI_M0_EVENTS_PATH;
   if (path) appendFileSync(path, `${JSON.stringify({ at: Date.now(), event, ...data })}\n`, { mode: 0o600 });
 }
-function ownHub(): any {
-  // Test-only diagnostics of this repository's Hub; never inspect token/lease content.
-  return (globalThis as any)[Symbol.for("pi-pane.process.v1")]?.hub;
-}
 function sample(): void {
   if (!meter) return;
-  const hub = ownHub();
-  const sockets = [...(hub?.wss?.clients ?? [])] as any[];
-  meter.samples.push({ atMs: performance.now() - meter.start, memory: process.memoryUsage(),
-    authenticatedConnections: hub?.connectionCount ?? 0, socketCount: sockets.length,
-    totalBufferedBytes: sockets.reduce((total, socket) => total + socket.bufferedAmount, 0),
-    maxBufferedBytes: Math.max(0, ...sockets.map(socket => socket.bufferedAmount)) });
+  meter.samples.push({ atMs: performance.now() - meter.start, memory: process.memoryUsage() });
 }
 async function begin(name: string) {
   if (meter) throw new Error("Finish the preceding performance measurement first.");
   const histogram = monitorEventLoopDelay({ resolution: 10 });
   histogram.enable();
   meter = { name, startedAt: new Date().toISOString(), start: performance.now(), cpu: process.cpuUsage(),
-    initial: process.memoryUsage(), histogram, sampler: undefined!, samples: [], providers: [], tools: [], socketCloses: [], socketCloseRequests: [], listeners: [] };
-  const sockets = [...(ownHub()?.wss?.clients ?? [])] as any[];
-  for (const socket of sockets) {
-    const callback = (code: number, reason: Buffer) => meter?.socketCloses.push({ code, reason: reason.toString(), atMs: performance.now() - meter.start });
-    const originalClose = socket.close;
-    socket.close = function(code?: number, reason?: string | Buffer) {
-      meter?.socketCloseRequests.push({ code, reason: reason?.toString() ?? "", atMs: performance.now() - meter.start, bufferedBytes: this.bufferedAmount });
-      return originalClose.call(this, code, reason);
-    };
-    socket.on("close", callback); meter.listeners.push({ socket, callback, originalClose });
-  }
+    initial: process.memoryUsage(), histogram, sampler: undefined!, samples: [], providers: [], tools: [] };
   meter.sampler = setInterval(sample, 20);
   meter.sampler.unref();
   sample();
@@ -77,17 +55,15 @@ async function finish() {
   const completed = meter;
   clearInterval(completed.sampler);
   completed.histogram.disable();
-  for (const { socket, callback, originalClose } of completed.listeners) { socket.off("close", callback); socket.close = originalClose; }
   const histogram = completed.histogram;
   const report = { name: completed.name, startedAt: completed.startedAt, durationMs: performance.now() - completed.start,
     nodeVersion: process.version, pid: process.pid, cpuMicroseconds: process.cpuUsage(completed.cpu),
     initialMemory: completed.initial, finalMemory: process.memoryUsage(),
     eventLoopDelayMs: { min: histogram.min / 1e6, max: histogram.max / 1e6, mean: histogram.mean / 1e6,
       p50: histogram.percentile(50) / 1e6, p95: histogram.percentile(95) / 1e6, p99: histogram.percentile(99) / 1e6 },
-    providers: completed.providers, tools: completed.tools, progress: completed.progress, samples: completed.samples, socketCloses: completed.socketCloses,
-    socketCloseRequests: completed.socketCloseRequests,
-    diagnosticsScope: "Test-only readings of pi-pane's own Hub bufferedAmount and connectionCount; no credentials or host internals",
-    idleAtFinish: currentContext?.isIdle(), bridgePresent: !!(globalThis as any)[Symbol.for("pi-pane.process.v1")]?.bridge,
+    providers: completed.providers, tools: completed.tools, progress: completed.progress, samples: completed.samples,
+    diagnosticsScope: "Local pi writer CPU, memory and event-loop telemetry only; web host transport is observed through public WebSocket frames and close reasons",
+    idleAtFinish: currentContext?.isIdle(),
   };
   const directory = process.env.PI_M0_PERF_OUTPUT_DIR;
   if (!directory) throw new Error("PI_M0_PERF_OUTPUT_DIR missing.");
@@ -213,21 +189,9 @@ export default function performanceProvider(pi: ExtensionAPI) {
     for (let index = 0; index < count; index++) pi.sendMessage({ customType: "m0-perf-history", content: `HISTORY ${index}\n${"h".repeat(bytes)}`, display: true }, { triggerTurn: false });
     evidence("perf_history_added", { count, bytes });
   } });
-  pi.registerCommand("m0-perf-theme", { description: "Read or change a theme using the public extension UI API", async handler(args, ctx) {
-    const name = args.trim();
-    const result = name ? ctx.ui.setTheme(name) : { success: true };
-    const theme = ctx.ui.theme;
-    evidence("perf_theme", { requested: name, result, name: theme.name, appearance: theme.appearance,
-      colors: theme.colors, available: ctx.ui.getAllThemes().map(item => ({ name: item.name })) });
-  } });
   pi.registerCommand("m0-perf-inspect", { description: "Read bounded projection and branch sizes for fixture evidence", async handler(_args, ctx) {
     const branch = ctx.sessionManager.getBranch();
-    const state = (globalThis as any)[Symbol.for("pi-pane.process.v1")];
-    const body = state?.bridge?.snapshot();
     evidence("perf_inspect", { branchEntries: branch.length, branchMessages: branch.filter(entry => entry.type === "message").length,
-      projectionMessages: body?.session.messages.length ?? 0, projectionMessageBytes: Buffer.byteLength(JSON.stringify(body?.session.messages ?? [])),
-      olderCursor: body?.session.olderCursor ?? null, tools: body?.state.tools.length ?? 0,
-      projectionBytes: body ? Buffer.byteLength(JSON.stringify(body)) : 0, connections: state?.hub?.connectionCount ?? 0,
       memory: process.memoryUsage() });
   } });
 }

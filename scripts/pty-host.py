@@ -27,8 +27,17 @@ def main():
     config = json.loads(first_line)
     master, slave = pty.openpty()
     fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 48, 180, 0, 0))
+    controlling = bool(config.get("controllingTty"))
+
+    def make_controlling_tty():
+        # Like a terminal emulator: new session whose controlling terminal is the PTY, so
+        # Ctrl+C becomes SIGINT for the foreground group and closing the PTY sends SIGHUP.
+        os.setsid()
+        fcntl.ioctl(0, termios.TIOCSCTTY, 0)
+
     child = subprocess.Popen(config["argv"], cwd=config["cwd"], env=config["env"],
-                             stdin=slave, stdout=slave, stderr=slave, start_new_session=True)
+                             stdin=slave, stdout=slave, stderr=slave, start_new_session=not controlling,
+                             preexec_fn=make_controlling_tty if controlling else None)
     os.close(slave)
     emit({"type": "started", "pid": child.pid})
     selector = selectors.DefaultSelector()

@@ -130,6 +130,7 @@ export default function deterministicProvider(pi: ExtensionAPI) {
     if (cancelTree) { cancelTree = false; return { cancel: true }; }
   });
   pi.on("session_tree", (event) => { evidence("session_tree", { newLeafId: event.newLeafId }); });
+  pi.registerCommand("m0-mark", { description: "Local fixture dispatch evidence", async handler(args, ctx) { evidence("m0_mark", { args, mode: ctx.mode }); } });
   pi.registerCommand("m0-tree", {
     description: "Test fixture: navigate to an earlier branch entry, optionally cancel via the real extension hook.",
     async handler(args, ctx) {

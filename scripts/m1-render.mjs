@@ -10,7 +10,7 @@ import { Hub } from "../dist/extension/hub.js";
 import { COMMANDS } from "../dist/protocol/index.js";
 
 const project = resolve(dirname(fileURLToPath(import.meta.url)), "..");
-const reportDir = resolve(process.env.PI_M1_REPORT_DIR ?? join(project, "build-artifacts/m1/render"));
+const reportDir = resolve(process.env.PI_M1_REPORT_DIR ?? join(project, "build-artifacts/m3/handoff/m1/render"));
 await mkdir(reportDir, { recursive: true });
 
 const longOutput = Array.from({ length: 3000 }, (_, index) => `line ${String(index).padStart(4, "0")} ${"·".repeat(20)}`).join("\n") + "\nLONG_OUTPUT_END";
@@ -56,7 +56,7 @@ const bridge = {
     session: { id: "render-session", name: "渲染验收", cwd: "/fixture/project", leafId: "a2", branchRevision: 0, messages, olderCursor: "u1" },
     state: { idle: true, running: false, compacting: false, hasPendingMessages: false, thinking: "off", tools: [], uiPrompts: [],
       model: { provider: "fixture", id: "fixture", name: "Fixture" }, models: [{ provider: "fixture", id: "fixture", name: "Fixture" }] },
-    theme: {}, caps: { commands: COMMANDS, images: false, promptReceipt: "dispatch_only", queueView: "boolean", terminalDialogs: true, history: "paged", content: "paged" },
+    theme: {}, caps: { commands: COMMANDS, images: false, promptReceipt: "rpc", queueView: "boolean", extensionDialogs: true, workbench: true, host: true, history: "paged", content: "paged" },
   }),
   historyPage: (before) => { assert.equal(before, "u1"); return { messages: structuredClone(older), olderCursor: null }; },
   contentPage: (messageId, index, offset) => {

@@ -9,11 +9,11 @@ import { performance } from "node:perf_hooks";
 import { fileURLToPath } from "node:url";
 import WebSocket from "ws";
 import { chromium } from "playwright";
-import { startFixture, waitFor } from "./m0-smoke.mjs";
+import { startFixture, waitFor, setFixtureControl } from "./m0-smoke.mjs";
 import { LIMITS, applyProjectionEvent, mergeOlderPage } from "../dist/protocol/index.js";
 
 const project = resolve(dirname(fileURLToPath(import.meta.url)), "..");
-const outputBase = resolve(process.env.PI_M0_REPORT_DIR || join(project, "build-artifacts/m0"));
+const outputBase = resolve(process.env.PI_M0_REPORT_DIR || join(project, "build-artifacts/m3/handoff/m0"));
 const performanceDir = join(outputBase, "performance");
 const themeDir = join(outputBase, "theme");
 await mkdir(performanceDir, { recursive: true }); await mkdir(themeDir, { recursive: true });
@@ -30,26 +30,22 @@ const environment = {
   cpuModel: cpus()[0]?.model, logicalCpus: cpus().length, totalMemoryBytes: totalmem(), freeMemoryBytesAtStart: freemem(),
   piVersion: JSON.parse(await readFile(join(project, "node_modules/@earendil-works/pi-coding-agent/package.json"), "utf8")).version,
   terminal: "real POSIX PTY, 48×180, TERM=xterm-256color, COLORTERM=truecolor; output continuously drained by the same Python/Node harness",
-  provider: "local pi-pane-m0-perf deterministic stream; zero network/model calls; credential-free environment",
-  sourceSha256: Object.fromEntries(await Promise.all(["src/extension/index.ts", "src/extension/bridge.ts", "src/extension/hub.ts", "src/protocol/index.ts", "tests/fixtures/performance-provider.ts", "scripts/m0-performance.mjs"].map(async name => [name, createHash("sha256").update(await readFile(join(project, name))).digest("hex")]))),
+  provider: "local pi-pane-m0-perf deterministic stream; zero network/model calls; credential-free environment; CPU/RSS/event-loop telemetry describes the sole RPC writer, not the separate Hub host",
+  sourceSha256: Object.fromEntries(await Promise.all(["src/extension/index.ts", "src/extension/handoff.ts", "src/extension/rpc-session.ts", "src/extension/rpc-child.ts", "src/extension/session-lock.ts", "src/extension/bridge.ts", "src/extension/hub.ts", "src/protocol/index.ts", "tests/fixtures/performance-provider.ts", "scripts/m0-smoke.mjs", "scripts/m0-performance.mjs"].map(async name => [name, createHash("sha256").update(await readFile(join(project, name))).digest("hex")]))),
 };
 const perfReport = {
-  scope: "M1 paged history, content pages, backpressure and host overhead (A5); browser snapshot P95 (A6) is measured by scripts/m1-a6.mjs", environment, repetitions,
+  scope: "M1 paged history, content pages and backpressure (A5); RPC writer telemetry and mode comparisons are exploratory; browser snapshot P95 (A6) is measured by scripts/m1-a6.mjs", environment, repetitions,
   workload: { kind: "text", chunks: 256, chunkBytes: 1024, yieldMs: 1, outputBytes: 262144 },
-  controls: ["Identical provider, PTY drain, evidence writes and 20 ms in-process sampling in all configurations", "Warmup before measurement; generation duration recorded in the provider separately from TUI start/finish commands", "No explicit GC; process RSS/heap includes the pi host's full transcript and fixture telemetry", "Three rounds summarize medians, not a reliable tail-latency or significance estimate"],
+  controls: ["Identical provider, PTY drain, evidence writes and 20 ms in-process sampling in all configurations", "TUI baselines and handed-off RPC runs use different pi modes; ratios between those modes do not isolate pane overhead", "The viewer guard compares handed-off RPC runs against handed-off RPC with no viewers; CPU/RSS excludes the separate web host", "Warmup before measurement; generation duration recorded in the provider separately from TUI start/finish commands", "No explicit GC; process RSS/heap includes the pi writer's full transcript and fixture telemetry", "Three rounds summarize medians; --quick uses one observation, neither establishes reliable tail-latency or significance"],
   limits: { messageCharacters: LIMITS.messageChars, messageWindow: LIMITS.snapshotWindowMessages, messageWindowBytes: LIMITS.snapshotWindowBytes,
     pageBytes: LIMITS.pageBytes, contentPageCharacters: LIMITS.contentPageChars, toolsMax: LIMITS.maxTools, toolOutputCharacters: LIMITS.toolOutputChars,
     transportFrameBytes: LIMITS.frameBytes, logicalFrameBytes: LIMITS.logicalFrameBytes, serverSendBufferBytes: LIMITS.sendBufferBytes, clientLeases: 8 },
   configurations: [], checks: [], notCovered: ["Browser snapshot P95 (A6) — see scripts/m1-a6.mjs", "OS/browser network process memory", "Long-term production leak soak beyond the repeated bounded-window stress", "Remote networks/LAN or TLS"],
-  acceptance: { mandatory: ["Reading clients retain contiguous sequence numbers and remain connected", "Paused peer is closed specifically for slow_client and server buffer stays at the declared bound", "TUI settles during paused-peer stress", "Huge results keep bounded wire previews and remain fully readable through content_page", "Long history is windowed in snapshots and fully reachable through history_page"],
-    exploratoryRegressionGuard: "For the identical 256-KiB case, median generation overhead ≤25% and event-loop p95 increase ≤10 ms vs no-pane; these are M0 local engineering guards, not design A6 or statistical confidence claims" },
+  acceptance: { mandatory: ["Reading clients retain contiguous sequence numbers and remain connected", "Paused peer is closed specifically for slow_client while reading peers keep bounded transport frames; server buffer accounting is covered by Hub unit tests", "RPC writer settles during paused-peer stress", "Huge results keep bounded wire previews and remain fully readable through content_page", "Long history is windowed in snapshots and fully reachable through history_page"],
+    exploratoryRegressionGuard: "For the identical 256-KiB RPC case, viewers add ≤25% provider duration and ≤10 ms writer event-loop p95 against RPC with no viewers; these are local engineering guards, not total host overhead, design A6 or statistical confidence claims" },
 };
-const themeReport = { scope: "Q3 real-TUI/public-API theme synchronization", environment, checks: [], publicAPI: "ctx.ui.setTheme, ctx.ui.theme.colors, ctx.ui.theme.appearance",
-  notCovered: [
-    "System-theme color reports and appearance notifications are deterministic protocol replies delivered through a real PTY; desktop OS appearance switching and an actual terminal emulator's preference UI were not exercised.",
-    "Page background follows export.pageBg when available and otherwise uses an appearance fallback; exact reproduction of the terminal's reported OSC background color is not implemented or claimed.",
-    "When the terminal supplies no OSC default colors, empty color tokens use pi's documented appearance-based guessed defaults; actual terminal pixels were not measured.",
-  ] };
+const themeReport = { scope: "Q3 initial TUI theme preserved during RPC handoff; TUI-only dynamic theme paths retired", environment, checks: [], publicAPI: "Initial theme from TUI settings and public extension theme colors, projected as the browser snapshot",
+  notCovered: ["Terminal OSC color discovery, desktop appearance switching and custom-theme hot reload after handoff are not exercised; RPC does not expose those controls.", "Actual terminal pixels and exact OSC background colors are not measured."] };
 let currentFixture;
 let currentClients = [];
 let browser;
@@ -72,10 +68,18 @@ async function pressureClient(url) {
   const parsed = new URL(url);
   const token = new URLSearchParams(parsed.hash.slice(1)).get("t");
   const socket = new WebSocket(`ws://${parsed.host}/ws`, ["pi-pane.v1", `pi-pane.bearer.${token}`], { origin: parsed.origin });
-  const client = { socket, snapshot: undefined, clientId: undefined, seq: 0, epoch: undefined, closed: false,
-    closeCode: undefined, closeReason: undefined, protocolErrors: [], errors: [], snapshots: 0, replies: new Map(), assembling: undefined, requestNo: 0,
+  const client = { socket, snapshot: undefined, rawSnapshot: undefined, clientId: undefined, seq: 0, epoch: undefined, closed: false,
+    closeCode: undefined, closeReason: undefined, protocolErrors: [], errors: [], snapshots: 0, replies: new Map(), results: new Map(), assembling: undefined, requestNo: 0, nextCommandNo: 1, acknowledgements: new Map(),
     stats: { frames: 0, bytes: 0, events: 0, maxFrameBytes: 0, toolUpdates: 0, maxToolValueCharacters: 0 },
     send(frame) { socket.send(JSON.stringify(frame)); },
+    async command(command, args = {}) {
+      const commandNo = client.nextCommandNo++;
+      const frame = { t: "command", clientId: client.clientId, commandNo, id: `${client.clientId}:${commandNo}`, epoch: client.epoch, sessionId: client.snapshot.session.id, branchRevision: client.snapshot.session.branchRevision, command, args };
+      client.send(frame);
+      const ack = await waitFor(() => client.acknowledgements.get(frame.id), `performance ${command} acknowledgement`);
+      assert.equal(ack.status, "dispatched", ack.error?.message);
+      return { frame, ack };
+    },
     async resync() {
       const before = client.snapshots; const started = performance.now();
       client.send({ t: "resync" });
@@ -107,8 +111,10 @@ async function pressureClient(url) {
       frame = JSON.parse(done.chunks.join(""));
     }
     if (frame.reqId && (frame.t === "history_page" || frame.t === "content_page" || frame.t === "error")) { client.replies.set(frame.reqId, frame); return; }
-    if (frame.t === "welcome") client.clientId = frame.clientId;
-    if (frame.t === "snapshot") { client.snapshot = frame; client.seq = frame.seq; client.epoch = frame.epoch; client.snapshots++; }
+    if (frame.t === "welcome") { client.clientId = frame.clientId; client.nextCommandNo = frame.nextCommandNo; }
+    if (frame.t === "ack") { client.acknowledgements.set(frame.id, frame); client.nextCommandNo = Math.max(client.nextCommandNo, frame.nextCommandNo ?? 1); }
+    if (frame.t === "command_result") client.results.set(frame.id, frame);
+    if (frame.t === "snapshot") { client.rawSnapshot = structuredClone(frame); client.snapshot = frame; client.seq = frame.seq; client.epoch = frame.epoch; client.snapshots++; }
     if (frame.t === "session_reset") { client.snapshot = undefined; client.epoch = frame.epoch; client.seq = 0; }
     if (frame.t === "error") client.errors.push(frame.error);
     if (frame.t !== "event") return;
@@ -128,6 +134,7 @@ async function pressureClient(url) {
   await new Promise((accept, reject) => { socket.once("open", accept); socket.once("error", reject); });
   client.send({ t: "hello" });
   await waitFor(() => client.snapshot && client.clientId, "performance client initialized");
+  setFixtureControl(url, client);
   return client;
 }
 async function perform(item, spec, timeout = 120000) {
@@ -161,7 +168,7 @@ try {
     if (!overloadOnly) {
     for (const configuration of [
       { name: "no-pane", disablePane: true, autoWeb: false, clients: 0 },
-      { name: "bridge-only", disablePane: false, autoWeb: false, clients: 0 },
+      { name: "tui-config-only", disablePane: false, autoWeb: false, clients: 0 },
       { name: "hub-no-viewers", disablePane: false, autoWeb: true, clients: 0 },
       { name: "four-viewers", disablePane: false, autoWeb: true, clients: 4 },
       { name: "eight-viewers", disablePane: false, autoWeb: true, clients: 8 },
@@ -242,7 +249,7 @@ try {
     currentFixture = await fixture();
     currentClients = [];
     for (let index = 0; index < 4; index++) currentClients.push(await pressureClient(currentFixture.url));
-    await check(perfReport, "paused real WebSocket is recycled at the send-buffer high-water mark while reading clients and TUI settle", async () => {
+    await check(perfReport, "paused real WebSocket is recycled at the send-buffer high-water mark while reading clients and the RPC writer settle", async () => {
       const slow = currentClients[3];
       const historyBefore = await currentFixture.eventCount("perf_history_added");
       currentFixture.command("/m0-perf-history 220 2048");
@@ -257,19 +264,19 @@ try {
           await sleep(2);
         }
         await generation;
-        await sleep(1200);
+        // Drain before Hub's 1 s forced-termination fallback. Waiting longer
+        // intentionally loses the close frame and yields transport code 1006.
+        await sleep(50);
       });
       slow.socket.resume();
       await waitFor(() => slow.closed, "nonreading peer recycled", 5000);
-      assert.ok(telemetry.socketCloseRequests.some(request => request.code === 1013 && request.reason === "slow_client"), "server explicitly closes for send-buffer pressure, not heartbeat/rate limit");
+      assert.equal(slow.closeCode, 1013); assert.equal(slow.closeReason, "slow_client", "pressure close uses the public WS close reason");
       assert.ok(currentClients.slice(0, 3).every(client => !client.closed), "reading clients remain connected");
-      assert.ok(telemetry.samples.some(sample => sample.authenticatedConnections === 3), "server authenticated count drops to three");
+      assert.equal(currentClients.filter(client => !client.closed).length, 3);
       assert.equal(telemetry.idleAtFinish, true);
       assert.deepEqual(currentClients.slice(0, 3).flatMap(client => client.protocolErrors), []);
-      assert.ok(telemetry.samples.every(sample => sample.maxBufferedBytes <= perfReport.limits.serverSendBufferBytes + 65536), "server buffers stay bounded at the send-buffer limit plus one sampled frame");
-      return { clientCloseCode: slow.closeCode, clientCloseReason: slow.closeReason, serverCloseEvents: telemetry.socketCloses,
-        serverCloseRequests: telemetry.socketCloseRequests,
-        peakBufferedBytes: Math.max(...telemetry.samples.map(sample => sample.maxBufferedBytes)),
+      assert.ok(currentClients.slice(0, 3).every(client => client.stats.maxFrameBytes <= LIMITS.frameBytes), "remaining peers receive bounded transport frames");
+      return { clientCloseCode: slow.closeCode, clientCloseReason: slow.closeReason, writerTelemetryScope: "RPC child only; host buffer high-water bounds remain covered by Hub unit tests",
         peakRssBytes: Math.max(...telemetry.samples.map(sample => sample.memory.rss)),
         providerDurationMs: telemetry.providers[0]?.durationMs, remainingClients: 3, pressure: "48 legal resync requests for a ~400-KiB bounded snapshot while TCP reads are paused; fixed 256-KiB provider runs concurrently",
         transport: "Node ws.pause() stops TCP receive consumption of the same browser wire protocol; not a browser network-process freeze", rawTelemetry: "slow-client.json" };
@@ -311,24 +318,26 @@ try {
       const inspections = [];
       for (let batch = 0; batch < 4; batch++) {
         const before = await currentFixture.eventCount("perf_history_added");
-        currentFixture.command("/m0-perf-history 250 2048");
+        const submitted = await currentFixture.command("/m0-perf-history 250 2048");
         await currentFixture.waitEvent("perf_history_added", before);
+        const completed = await waitFor(() => reader.results.get(submitted.frame.id), "history extension command completed");
+        assert.equal(completed.status, "completed");
         await reader.resync();
         const inspectBefore = await currentFixture.eventCount("perf_inspect");
         currentFixture.command("/m0-perf-inspect");
         const inspection = await currentFixture.waitEvent("perf_inspect", inspectBefore);
         inspections.push(inspection);
-        assert.ok(reader.snapshot.session.olderCursor, "older history is reachable");
-        assert.ok(reader.snapshot.session.messages.length <= LIMITS.snapshotWindowMessages + 1);
-        const sum = reader.snapshot.session.messages.filter(message => message.entryId).reduce((total, message) => total + Buffer.byteLength(JSON.stringify(message)), 0);
+        assert.ok(reader.rawSnapshot.session.olderCursor, "older history is reachable");
+        assert.ok(reader.rawSnapshot.session.messages.length <= LIMITS.snapshotWindowMessages + 1, "wire snapshot is bounded independently of locally retained live events");
+        const sum = reader.rawSnapshot.session.messages.filter(message => message.entryId).reduce((total, message) => total + Buffer.byteLength(JSON.stringify(message)), 0);
         assert.ok(sum <= LIMITS.snapshotWindowBytes);
         assert.ok(inspection.branchEntries >= (batch + 1) * 250);
       }
       const responseMs = [];
       for (let index = 0; index < 20; index++) responseMs.push(await reader.resync());
       const started = performance.now();
-      let messages = reader.snapshot.session.messages;
-      let cursor = reader.snapshot.session.olderCursor;
+      let messages = reader.rawSnapshot.session.messages;
+      let cursor = reader.rawSnapshot.session.olderCursor;
       let pages = 0;
       while (cursor) {
         const page = await reader.read({ t: "history_page", sessionId: reader.snapshot.session.id, branchRevision: reader.snapshot.session.branchRevision, before: cursor });
@@ -343,8 +352,8 @@ try {
       assert.equal(new Set(messages.map(message => message.id)).size, messages.length, "no duplicate identities");
       assert.ok(reader.stats.maxFrameBytes <= LIMITS.frameBytes, "frames over 1 MiB are chunked");
       await writeFile(join(performanceDir, "history-inspections.json"), `${JSON.stringify({ inspections, snapshotRoundTripMs: responseMs, pages, pagingMs }, null, 2)}\n`);
-      return { persistedHistoryAdded: 1000, windowMessages: reader.snapshot.session.messages.length, reachableMessages: messages.length,
-        historyPages: pages, fullPagingMs: pagingMs, snapshotBytes: Buffer.byteLength(JSON.stringify(reader.snapshot)), roundTripMs: statistics(responseMs),
+      return { persistedHistoryAdded: 1000, windowMessages: reader.rawSnapshot.session.messages.length, reachableMessages: messages.length,
+        historyPages: pages, fullPagingMs: pagingMs, snapshotBytes: Buffer.byteLength(JSON.stringify(reader.rawSnapshot)), roundTripMs: statistics(responseMs),
         measurement: "Node WS resync to complete snapshot, and sequential history_page reads to the branch root; browser application is A6", rawEvidence: "history-inspections.json" };
     });
     await writeFile(join(performanceDir, "fixture-events.jsonl"), await readFile(currentFixture.eventPath, "utf8"));
@@ -363,166 +372,38 @@ try {
         eventLoopDelayMs: noPaneTool.eventLoopDelayMs, peakRssBytes: Math.max(...noPaneTool.samples.map(sample => sample.memory.rss)), rawTelemetry: "large-tool-no-pane.json" },
       paneWithReadingClients: { toolExecutionDurationMs: paneTool.tools[0]?.durationMs, totalMeasurementMs: paneTool.durationMs,
         eventLoopDelayMs: paneTool.eventLoopDelayMs, peakRssBytes: Math.max(...paneTool.samples.map(sample => sample.memory.rss)), rawTelemetry: "large-tool-partial.json" },
-      scope: "Absolute large-partial stalls remain a host/fixture limitation even if the pane adds little overhead; wire bounds are evaluated separately from responsiveness."
+      scope: "The no-pane baseline uses TUI and the pane run uses RPC. Their single-run difference does not isolate pane overhead. CPU, RSS and event-loop metrics describe the pi writer only and exclude the separate Hub host; wire bounds are evaluated separately from responsiveness."
     };
     await cleanupFixture(currentFixture); currentFixture = undefined;
-    const baseline = perfReport.configurations[0];
-    perfReport.regressionGuard = perfReport.configurations.map(configuration => ({ name: configuration.name,
-      generationRatio: configuration.medianDurationVsNoPane,
+    const baseline = perfReport.configurations.find(item => item.name === "hub-no-viewers");
+    perfReport.regressionGuard = perfReport.configurations.filter(configuration => configuration.autoWeb).map(configuration => ({ name: configuration.name,
+      generationRatio: configuration.providerDurationMs.median / baseline.providerDurationMs.median,
       eventLoopP95DeltaMs: configuration.eventLoopDelayP95Ms.median - baseline.eventLoopDelayP95Ms.median,
-      withinExploratoryGuard: configuration.medianDurationVsNoPane <= 1.25 && configuration.eventLoopDelayP95Ms.median - baseline.eventLoopDelayP95Ms.median <= 10 }));
+      withinExploratoryGuard: configuration.providerDurationMs.median / baseline.providerDurationMs.median <= 1.25 && configuration.eventLoopDelayP95Ms.median - baseline.eventLoopDelayP95Ms.median <= 10 }));
     if (perfReport.regressionGuard.some(item => !item.withinExploratoryGuard)) perfReport.performanceDecision = "Investigate the measured local guard regression before claiming Q4 complete.";
-    else perfReport.performanceDecision = "Controlled 256-KiB bounded-preview case stays within the stated M0 local overhead guard; full-history/M1 performance remains unclaimed.";
+    else perfReport.performanceDecision = "Controlled 256-KiB RPC viewer case stays within the local writer guard; separate host resources and production performance remain unclaimed.";
     }
     perfReport.status = "passed";
   }
 
   if (!perfOnly) {
-    currentFixture = await fixture();
-    currentClients = [await pressureClient(currentFixture.url)];
-    const reader = currentClients[0];
-    browser = await chromium.launch({ channel: "chrome", headless: true });
-    const page = await browser.newPage({ viewport: { width: 1280, height: 900 } });
-    await page.goto(currentFixture.url);
-    await page.getByText("已连接", { exact: true }).waitFor();
-    await page.getByRole("textbox", { name: "消息" }).fill("未发送的主题验证草稿");
-    const contrastObservations = [];
-    const buttonContrast = async () => {
-      const values = await page.locator(".send-button").evaluate(button => {
-        const styles = getComputedStyle(button);
-        return { background: styles.backgroundColor, foreground: styles.color,
-          colorScheme: getComputedStyle(document.documentElement).colorScheme };
+    themeReport.retired = ["RPC does not provide theme set/reload or terminal OSC color queries. TUI custom-theme hot reload and system appearance notifications are unavailable after handoff; no private theme channel is added."];
+    for (const name of ["dark", "light"]) {
+      currentFixture = await fixture({ settings: { theme: name } });
+      currentClients = [await pressureClient(currentFixture.url)];
+      await check(themeReport, `initial ${name} theme remains consistent across handoff and reconnect`, async () => {
+        const theme = structuredClone(currentClients[0].snapshot.theme);
+        assert.ok(Object.keys(theme).length > 0);
+        const restored = await pressureClient(currentFixture.url); currentClients.push(restored);
+        assert.deepEqual(restored.snapshot.theme, theme);
+        assert.ok(Object.values(theme).every(value => typeof value === "string" && value.length < 256));
+        return { theme: name, tokens: Object.keys(theme).length, lifecycle: "TUI theme → foreground RPC workbench" };
       });
-      const luminance = value => {
-        const channels = value.match(/[\d.]+/g).slice(0, 3).map(Number).map(channel => {
-          const srgb = channel / 255;
-          return srgb <= .04045 ? srgb / 12.92 : ((srgb + .055) / 1.055) ** 2.4;
-        });
-        return channels[0] * .2126 + channels[1] * .7152 + channels[2] * .0722;
-      };
-      const first = luminance(values.background), second = luminance(values.foreground);
-      const contrast = (Math.max(first, second) + .05) / (Math.min(first, second) + .05);
-      assert.ok(contrast >= 4.5, `send-button text contrast ${contrast}`);
-      contrastObservations.push({ ...values, contrast });
-      return { ...values, contrast };
-    };
-    const baseTheme = JSON.parse(await readFile(join(project, "node_modules/@earendil-works/pi-coding-agent/dist/modes/interactive/theme/dark.json"), "utf8"));
-    const theme = { ...baseTheme, name: "m0-hot-reload", appearance: "dark", vars: { ...baseTheme.vars, paneBackground: "#182622" }, export: { ...baseTheme.export, pageBg: "paneBackground" }, colors: { ...baseTheme.colors, accent: "#37c7a5", text: "#eeeeee", userMessageBg: "#24312b", border: "#47594e" } };
-    const themesDirectory = join(currentFixture.agentDir, "themes");
-    await mkdir(themesDirectory, { recursive: true });
-    const themePath = join(themesDirectory, "m0-hot-reload.json");
-    await writeFile(themePath, JSON.stringify(theme));
-    await check(themeReport, "public setTheme changes exact colors without reconnect", async () => {
-      const before = await currentFixture.eventCount("perf_theme");
-      const started = performance.now();
-      currentFixture.command("/m0-perf-theme m0-hot-reload");
-      const evidence = await currentFixture.waitEvent("perf_theme", before);
-      assert.equal(evidence.result.success, true);
-      assert.equal(evidence.name, "m0-hot-reload");
-      await waitFor(() => reader.snapshot.theme["--accent"] === "#37c7a5", "WS theme from public API");
-      await page.waitForFunction(() => getComputedStyle(document.documentElement).getPropertyValue("--accent").trim() === "#37c7a5");
-      assert.equal(reader.snapshot.theme["--bg"], "#182622", "page background resolves the theme's export variable");
-      await page.waitForFunction(() => getComputedStyle(document.body).backgroundColor === "rgb(24, 38, 34)");
-      const durationMs = performance.now() - started;
-      assert.ok(durationMs < 1000);
-      return { name: evidence.name, accent: reader.snapshot.theme["--accent"], durationMs, actualHostAppearance: evidence.appearance,
-        sendButton: await buttonContrast() };
-    });
-    await check(themeReport, "same-name file edits including atomic replacement update colors within one second", async () => {
-      const edits = [];
-      for (const [index, accent] of ["#eec35a", "#96aef5", "#f197af", "#43cfba"].entries()) {
-        theme.colors.accent = accent;
-        theme.colors.muted = index % 2 ? "#9a9fb0" : "#aba99a";
-        const started = performance.now();
-        if (index % 2) {
-          await writeFile(`${themePath}.tmp`, JSON.stringify(theme)); await rename(`${themePath}.tmp`, themePath);
-        } else await writeFile(themePath, JSON.stringify(theme));
-        await waitFor(() => reader.snapshot.theme["--accent"] === accent, "same-name WS theme update");
-        await page.waitForFunction(expected => getComputedStyle(document.documentElement).getPropertyValue("--accent").trim() === expected, accent);
-        const elapsedMs = performance.now() - started;
-        assert.ok(elapsedMs < 1000, `theme edit visible in ${elapsedMs} ms`);
-        const before = await currentFixture.eventCount("perf_theme"); currentFixture.command("/m0-perf-theme");
-        const evidence = await currentFixture.waitEvent("perf_theme", before);
-        assert.equal(evidence.name, "m0-hot-reload");
-        edits.push({ accent, atomicReplacement: !!(index % 2), elapsedMs, name: evidence.name, sendButton: await buttonContrast() });
-      }
-      await page.screenshot({ path: join(themeDir, "same-name-hot-reload.png"), fullPage: true });
-      return { edits, watcher: "pi's custom-theme directory watcher (100 ms debounce) plus Bridge polling; no private onThemeChange callback registration" };
-    });
-    await check(themeReport, "export-only edits refresh the background and derived web colors", async () => {
-      const previous = { ...reader.snapshot.theme };
-      theme.vars.paneBackground = "#202838";
-      const started = performance.now();
-      await writeFile(`${themePath}.tmp`, JSON.stringify(theme)); await rename(`${themePath}.tmp`, themePath);
-      await waitFor(() => reader.snapshot.theme["--bg"] === "#202838", "export-only WS theme update");
-      await page.waitForFunction(() => getComputedStyle(document.body).backgroundColor === "rgb(32, 40, 56)");
-      const elapsedMs = performance.now() - started;
-      assert.ok(elapsedMs < 1000, `background edit visible in ${elapsedMs} ms`);
-      assert.equal(reader.snapshot.theme["--accent"], previous["--accent"]);
-      const derived = Object.keys(reader.snapshot.theme).filter((key) => !key.startsWith("--pi-") && key !== "--bg" && reader.snapshot.theme[key] !== previous[key]);
-      assert.ok(derived.length >= 2, "surface/hover colors follow pageBg even when pi colors do not change");
-      return { elapsedMs, background: reader.snapshot.theme["--bg"], derived };
-    });
-    await check(themeReport, "same theme name switching appearance and terminal-default tokens updates the browser", async () => {
-      theme.appearance = "light"; theme.colors.text = ""; theme.colors.userMessageBg = "";
-      delete theme.export;
-      const started = performance.now(); await writeFile(themePath, JSON.stringify(theme));
-      await waitFor(() => reader.snapshot.theme["--bg"] === "#f5f5f4", "light appearance update");
-      await page.waitForFunction(() => getComputedStyle(document.documentElement).getPropertyValue("--bg").trim() === "#f5f5f4");
-      const before = await currentFixture.eventCount("perf_theme"); currentFixture.command("/m0-perf-theme");
-      const evidence = await currentFixture.waitEvent("perf_theme", before);
-      assert.equal(evidence.appearance, "light");
-      return { elapsedMs: performance.now() - started, pageBackground: reader.snapshot.theme["--bg"],
-        foreground: reader.snapshot.theme["--fg"], userBackground: reader.snapshot.theme["--user-bg"],
-        sendButton: await buttonContrast(),
-        limitation: "PTY initially supplies no OSC default colors; pi returns documented appearance-based guessed defaults, not measured terminal pixels" };
-    });
-    await check(themeReport, "system theme follows real PTY color replies and appearance notifications", async () => {
-      const before = await currentFixture.eventCount("perf_theme"); currentFixture.command("/m0-perf-theme system");
-      const initial = await currentFixture.waitEvent("perf_theme", before);
-      assert.equal(initial.result.success, true);
-      await waitFor(() => reader.snapshot.theme["--accent"] !== theme.colors.accent && reader.snapshot.theme["--bg"] === "#111315", "system theme replaces the custom theme before terminal reports");
-      const queryCount = () => currentFixture.terminal.split("\x1b]10;?\x07").length - 1;
-      // The general PTY harness answers cursor-position requests but intentionally does
-      // not impersonate a color-aware terminal at startup. Even timed-out color queries
-      // retain their position until DA1; acknowledge those prior query batches first.
-      const startupQueries = queryCount();
-      for (let index = 0; index < startupQueries; index++) currentFixture.write("\x1b[?1;2c");
-      await sleep(40);
-      const transitions = [];
-      for (const [appearance, code, foreground, background] of [["light", 2, "#202020", "#eeeeee"], ["dark", 1, "#dddddd", "#181818"]]) {
-        const started = performance.now();
-        const beforeQueries = queryCount();
-        currentFixture.write(`\x1b[?997;${code}n`);
-        await waitFor(() => queryCount() > beforeQueries, "pi queries terminal colors after appearance notification");
-        // These are ordinary terminal responses to pi's OSC 10/11 + DA1 query, delivered
-        // through the PTY input decoder rather than internal theme-controller functions.
-        currentFixture.write(`\x1b]10;${foreground}\x07\x1b]11;${background}\x07\x1b[?1;2c`);
-        await waitFor(() => reader.snapshot.theme["--fg"] === foreground && reader.snapshot.theme["--bg"] === (appearance === "light" ? "#f5f5f4" : "#111315"), `system ${appearance} WebSocket theme with reported foreground`);
-        const count = await currentFixture.eventCount("perf_theme"); currentFixture.command("/m0-perf-theme");
-        const evidence = await currentFixture.waitEvent("perf_theme", count);
-        assert.equal(evidence.name, "system"); assert.equal(evidence.appearance, appearance);
-        await page.waitForFunction(expected => getComputedStyle(document.documentElement).getPropertyValue("--bg").trim() === expected,
-          appearance === "light" ? "#f5f5f4" : "#111315");
-        transitions.push({ appearance, reportedForeground: foreground, reportedBackground: background,
-          mappedForeground: reader.snapshot.theme["--fg"], mappedBackground: reader.snapshot.theme["--bg"], elapsedMs: performance.now() - started,
-          sendButton: await buttonContrast() });
-      }
-      return { transitions, limitation: "Terminal responses are deterministic PTY protocol replies; no manual test against an actual terminal emulator's color preference UI. The system theme has no export.pageBg, so page background uses the appearance fallback rather than exactly matching OSC background." };
-    });
-    themeReport.contrastSummary = {
-      method: "Chrome getComputedStyle for .send-button background and foreground, evaluated with relative sRGB luminance contrast",
-      minimumRequiredRatio: 4.5, observations: contrastObservations.length,
-      minimumObservedRatio: Math.min(...contrastObservations.map(value => value.contrast)),
-      maximumObservedRatio: Math.max(...contrastObservations.map(value => value.contrast)),
-      nativeColorSchemes: [...new Set(contrastObservations.map(value => value.colorScheme))],
-      status: "passed",
-    };
-    await writeFile(join(themeDir, "fixture-events.jsonl"), await readFile(currentFixture.eventPath, "utf8"));
-    await browser.close(); browser = undefined;
-    await cleanupFixture(currentFixture, currentClients); currentFixture = undefined; currentClients = [];
+      await cleanupFixture(currentFixture, currentClients); currentFixture = undefined; currentClients = [];
+    }
     themeReport.status = "passed";
   }
+
 } catch (error) {
   const message = redact(error?.stack || error);
   if (!themeOnly && perfReport.status !== "passed") { perfReport.status = "failed"; perfReport.error = message; }

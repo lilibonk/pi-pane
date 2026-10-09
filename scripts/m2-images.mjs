@@ -10,7 +10,7 @@ import { tsImport } from "tsx/esm/api";
 import { openClient, startFixture, textOf, waitFor } from "./m0-smoke.mjs";
 
 const project = resolve(dirname(fileURLToPath(import.meta.url)), "..");
-const reportDir = resolve(process.env.PI_M2_REPORT_DIR ?? join(project, "build-artifacts/m2/images"));
+const reportDir = resolve(process.env.PI_M2_REPORT_DIR ?? join(project, "build-artifacts/m3/handoff/m2/images"));
 await mkdir(reportDir, { recursive: true });
 const { png, webpHeader } = await tsImport("../tests/fixtures/images.ts", import.meta.url);
 const CACHE_LIMIT = 48 * 1024 * 1024;

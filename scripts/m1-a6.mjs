@@ -10,7 +10,7 @@ import { chromium } from "playwright";
 import { startFixture, waitFor } from "./m0-smoke.mjs";
 
 const project = resolve(dirname(fileURLToPath(import.meta.url)), "..");
-const reportDir = resolve(process.env.PI_M1_REPORT_DIR ?? join(project, "build-artifacts/m1/a6"));
+const reportDir = resolve(process.env.PI_M1_REPORT_DIR ?? join(project, "build-artifacts/m3/handoff/m1/a6"));
 await mkdir(reportDir, { recursive: true });
 const runs = Number(process.env.PI_M1_A6_RUNS ?? 20);
 const MESSAGES = 1000;

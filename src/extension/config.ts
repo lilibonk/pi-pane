@@ -38,26 +38,3 @@ export function readPaneSettings(settings: unknown): PaneSettings {
     throw new ProtocolError("invalid_config", "piPane.host may be non-loopback only together with publicOrigin and TLS or proxy settings.");
   return result;
 }
-
-/** Surface a clear downgrade before constructing a Bridge or listening socket. */
-export function missingHostCapabilities(pi: unknown, ctx: unknown): string[] {
-  const roots: Record<string, unknown> = { pi, ctx };
-  const functions = [
-    "pi.getSettings", "pi.getThinkingLevel", "pi.setThinkingLevel", "pi.setModel", "pi.sendUserMessage",
-    "ctx.isIdle", "ctx.hasPendingMessages", "ctx.abort", "ctx.compact",
-    "ctx.sessionManager.getSessionId", "ctx.sessionManager.getSessionName", "ctx.sessionManager.getLeafId", "ctx.sessionManager.getBranch",
-    "ctx.modelRegistry.getAvailable", "ctx.modelRegistry.find", "ctx.ui.setStatus",
-  ];
-  const missing: string[] = [];
-  for (const path of functions) {
-    let value: unknown = roots;
-    try { for (const part of path.split(".")) value = isRecord(value) ? value[part] : undefined; }
-    catch { value = undefined; }
-    if (typeof value !== "function") missing.push(path);
-  }
-  try {
-    const theme = (ctx as { ui?: { theme?: { colors?: unknown; appearance?: unknown } } } | undefined)?.ui?.theme;
-    if (!theme || !isRecord(theme.colors) || !["light", "dark"].includes(String(theme.appearance))) missing.push("ctx.ui.theme.colors/appearance");
-  } catch { missing.push("ctx.ui.theme.colors/appearance"); }
-  return missing;
-}

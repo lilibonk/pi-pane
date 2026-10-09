@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import WebSocket from "ws";
-import { Hub, type HubOptions } from "../src/extension/hub.ts";
+import { Hub, type HubOptions, type HostHandler } from "../src/extension/hub.ts";
 import type { Bridge, BridgeObserver } from "../src/extension/bridge.ts";
 import { COMMANDS, type CommandEnvelope, type ServerMessage } from "../src/protocol/index.ts";
 
@@ -21,18 +21,22 @@ async function fixture(options: Partial<HubOptions> = {}, overrides: Record<stri
   let calls = 0;
   let observer: BridgeObserver | undefined;
   const bridge = {
-    sessionId: "fixture-session", branchRevision: 0, isCurrent: () => true,
+    sessionId: "fixture-session", generation: 1, branchRevision: 0, isCurrent: () => true,
     setObserver: (value: BridgeObserver | undefined) => { observer = value; },
-    dispatch: () => { calls++; },
     flush: () => {},
     snapshot: () => ({
       session: { id: "fixture-session", cwd: "/fixture", leafId: null, branchRevision: 0, messages: [], olderCursor: null },
       state: { idle: true, running: false, compacting: false, hasPendingMessages: false, thinking: "off", models: [], tools: [], uiPrompts: [] },
-      theme: {}, caps: { commands: COMMANDS, images: false, promptReceipt: "dispatch_only", queueView: "boolean", terminalDialogs: true, history: "paged", content: "paged" },
+      theme: {}, caps: { commands: COMMANDS, images: false, promptReceipt: "rpc", queueView: "boolean", extensionDialogs: true, workbench: true, host: true, history: "paged", content: "paged" },
     }),
     ...overrides,
   } as unknown as Bridge;
   const hub = new Hub({ port: 0, webRoot: directory, ...options });
+  hub.setHostHandler({
+    command: overrides.command ?? (async () => { calls++; return { disposition: "started" }; }),
+    read: overrides.read ?? (async () => ({ commands: [] })),
+    answer: () => {}, pendingDialogs: () => [], uiState: () => ({ revision: 0, statuses: {}, widgets: {} }),
+  } as unknown as HostHandler);
   await hub.start(); hub.bindBridge(bridge);
   return { hub, calls: () => calls, observer: () => observer,
     async close() { await hub.close(); await rm(directory, { recursive: true, force: true }); } };
@@ -60,7 +64,7 @@ function envelope(clientId: string, hub: Hub, commandNo: number): CommandEnvelop
 test("workbench queries are directed and discard results after an epoch change", async () => {
   let resolveRead: (value: unknown) => void = () => {};
   const requests: unknown[] = [];
-  const f = await fixture({}, { workbenchQuery: (action: string, args: unknown, revision: number) => {
+  const f = await fixture({}, { read: (action: string, args: unknown, revision: number) => {
     requests.push([action, args, revision]); return new Promise((resolve) => { resolveRead = resolve; });
   } });
   try {
@@ -88,8 +92,8 @@ test("workbench queries are directed and discard results after an epoch change",
 test("observed session lifecycle outcomes retain receipts after reset and reconnect", async () => {
   let completions = 0;
   let f: Awaited<ReturnType<typeof fixture>>;
-  f = await fixture({}, { dispatch: (_command: string, _args: unknown, complete: (result: unknown) => void) => {
-    completions++; f.observer()?.reset("new"); complete({ status: "completed", value: { cancelled: false } });
+  f = await fixture({}, { command: async () => {
+    completions++; f.observer()?.reset("new"); return { cancelled: false };
   } });
   try {
     const c = await client(f.hub);
@@ -110,22 +114,21 @@ test("observed session lifecycle outcomes retain receipts after reset and reconn
   } finally { await f.close(); }
 });
 
-test("ordinary asynchronous completions remain fenced by the original epoch", async () => {
-  let complete: ((result: unknown) => void) | undefined;
-  const f = await fixture({}, { dispatch: (_command: string, _args: unknown, callback: typeof complete) => { complete = callback; } });
+test("all accepted RPC outcomes stay correlated across epoch replacement", async () => {
+  let complete!: (result: unknown) => void;
+  const f = await fixture({}, { command: () => new Promise((resolve) => { complete = resolve; }) });
   try {
     const c = await client(f.hub);
     const welcome = c.frames.find((frame) => frame.t === "welcome"); assert.ok(welcome?.t === "welcome");
     const command = { ...envelope(welcome.clientId, f.hub, 1), command: "set_model", args: { provider: "fixture", id: "model" } };
     c.send(command); await c.wait("ack");
     f.observer()?.reset("replaced");
-    complete?.({ status: "completed", value: { provider: "fixture", id: "model" } });
-    await delay(10);
-    assert.equal(c.frames.some((frame) => frame.t === "command_result"), false);
+    complete({ provider: "fixture", id: "model" });
+    const result = await c.wait("command_result");
+    assert.ok(result.t === "command_result"); assert.equal(result.epoch, command.epoch);
     const from = c.frames.length;
     c.send({ t: "receipt_query", clientId: welcome.clientId, id: command.id });
-    const result = await c.wait("error", from);
-    assert.ok(result.t === "error"); assert.equal(result.error.code, "result_unavailable");
+    assert.deepEqual(await c.wait("command_result", from), result);
   } finally { await f.close(); }
 });
 
@@ -174,14 +177,13 @@ test("expired client lease cannot be resurrected through reconnect", async () =>
   } finally { await f.close(); }
 });
 
-test("missing Bridge rebind expires and releases the listening port", async () => {
+test("foreground service teardown releases its port and disconnects every viewer", async () => {
   const f = await fixture();
   try {
-    await client(f.hub);
-    let expired = 0;
-    f.hub.suspend("reload", () => { expired++; }, 25);
-    await until(() => !f.hub.running, "Hub stops after rebind timeout");
-    assert.equal(expired, 1);
+    const c = await client(f.hub);
+    await f.hub.close();
+    await until(() => c.closed(), "viewer closed");
+    assert.equal(f.hub.running, false);
     await assert.rejects(() => fetch(`${f.hub.origin}/healthz`));
   } finally { await f.close(); }
 });
@@ -208,7 +210,7 @@ test("frames above the transport limit are chunked contiguously and reassemble t
       session: { id: "fixture-session", cwd: "/fixture", leafId: null, branchRevision: 0, olderCursor: null,
         messages: [{ id: "m", role: "assistant", status: "complete", content: [{ type: "text", text: big }] }] },
       state: { idle: true, running: false, compacting: false, hasPendingMessages: false, thinking: "off", models: [], tools: [], uiPrompts: [] },
-      theme: {}, caps: { commands: COMMANDS, images: false, promptReceipt: "dispatch_only", queueView: "boolean", terminalDialogs: true, history: "paged", content: "paged" },
+      theme: {}, caps: { commands: COMMANDS, images: false, promptReceipt: "rpc", queueView: "boolean", extensionDialogs: true, workbench: true, host: true, history: "paged", content: "paged" },
     }),
   });
   try {
@@ -256,5 +258,48 @@ test("history and content reads are directed, version-checked and never dispatch
     assert.deepEqual(requests, [["history", "e1", 0], ["content", "m"]]);
     assert.equal(f.calls(), 0);
     assert.equal(f.hub.seq, 0, "directed reads do not consume broadcast sequence numbers");
+  } finally { await f.close(); }
+});
+
+test("workbench reads enforce per-viewer and global bounds without consuming write numbers", async () => {
+  const pending: ((value: unknown) => void)[] = [];
+  const f = await fixture({}, { read: () => new Promise((resolve) => { pending.push(resolve); }) });
+  try {
+    const a = await client(f.hub), b = await client(f.hub), c = await client(f.hub);
+    const query = (reqId: string) => ({ t: "workbench_query", reqId, epoch: f.hub.epoch, sessionId: "fixture-session", branchRevision: 0, action: "commands", args: {} });
+    for (let i = 0; i < 8; i++) a.send(query(`a${i}`));
+    await until(() => pending.length === 8, "eight peer reads");
+    a.send(query("a-over"));
+    const peerError = await a.wait("workbench_result");
+    assert.ok(peerError.t === "workbench_result"); assert.equal(peerError.error?.code, "busy");
+    for (let i = 0; i < 8; i++) b.send(query(`b${i}`));
+    await until(() => pending.length === 16, "sixteen host reads");
+    c.send(query("c-over"));
+    const hostError = await c.wait("workbench_result");
+    assert.ok(hostError.t === "workbench_result"); assert.equal(hostError.error?.code, "busy");
+    for (const finish of pending) finish({ commands: [] });
+    await until(() => b.frames.filter(frame => frame.t === "workbench_result").length === 8, "pending replies");
+    const welcome = a.frames.find(frame => frame.t === "welcome"); assert.ok(welcome?.t === "welcome");
+    const from = a.frames.length;
+    a.send(envelope(welcome.clientId, f.hub, 1));
+    const ack = await a.wait("ack", from); assert.ok(ack.t === "ack"); assert.equal(ack.nextCommandNo, 2);
+    assert.equal(f.calls(), 1); assert.equal(f.hub.seq, 0);
+  } finally { for (const finish of pending) finish({ commands: [] }); await f.close(); }
+});
+
+test("RPC failures produce retained correlated errors and preserve submission sequencing", async () => {
+  let calls = 0;
+  const scopes: unknown[] = [];
+  const f = await fixture({}, { command: async (_name: string, _args: unknown, expected: unknown) => {
+    calls++; scopes.push(expected); if (calls === 1) throw new Error("RPC preflight refused"); return { disposition: "handled" };
+  } });
+  try {
+    const c = await client(f.hub);
+    const welcome = c.frames.find(frame => frame.t === "welcome"); assert.ok(welcome?.t === "welcome");
+    c.send(envelope(welcome.clientId, f.hub, 1));
+    const failure = await c.wait("command_result"); assert.ok(failure.t === "command_result"); assert.equal(failure.status, "failed"); assert.match(failure.error?.message || "", /preflight/);
+    const from = c.frames.length; c.send(envelope(welcome.clientId, f.hub, 2));
+    const success = await c.wait("command_result", from); assert.ok(success.t === "command_result"); assert.equal(success.status, "completed");
+    assert.deepEqual(scopes[0], { sessionId: "fixture-session", branchRevision: 0, generation: 1 });
   } finally { await f.close(); }
 });

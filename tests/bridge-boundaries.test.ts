@@ -2,87 +2,43 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Bridge, type BridgeOptions } from "../src/extension/bridge.js";
-import type { CommandResult, ProjectionEvent } from "../src/protocol/index.js";
+import type { ProjectionEvent } from "../src/protocol/index.js";
 import { LIMITS, applyProjectionEvent, type MessageView, type Snapshot } from "../src/protocol/index.js";
 
 const tick = () => new Promise<void>((resolve) => setImmediate(resolve));
 function fixture() {
   let current = true;
   const entries: unknown[] = [];
-  let resolveModel: (value: boolean) => void = () => {};
-  let compactCallbacks: { onComplete?: (result: never) => void; onError?: (error: Error) => void } | undefined;
-  const sent: { text: unknown; options: unknown }[] = [];
   const events: ProjectionEvent[] = [];
   const model = { provider: "fixture", id: "fixture", name: "Fixture" };
   const ctx = {
     cwd: "/fixture", model, isIdle: () => true, hasPendingMessages: () => false,
-    abort: () => {}, compact: (callbacks: typeof compactCallbacks) => { compactCallbacks = callbacks; },
     sessionManager: { getSessionId: () => "fixture", getBranch: () => entries, getLeafId: () => (entries.at(-1) as { id?: string } | undefined)?.id ?? null, getSessionName: () => undefined },
     modelRegistry: { getAvailable: () => [model], find: () => model },
     ui: { theme: { appearance: "dark", colors: {} } },
   } as unknown as ExtensionContext;
-  const pi: BridgeOptions["pi"] = {
-    sendUserMessage: (text, options) => { sent.push({ text, options }); },
-    getThinkingLevel: () => "off", setThinkingLevel: () => {},
-    setModel: () => new Promise<boolean>((resolve) => { resolveModel = resolve; }),
-  };
+  const pi: BridgeOptions["pi"] = { getThinkingLevel: () => "off" };
   const bridge = new Bridge({ pi, ctx, generation: 1, isCurrent: () => current, pollMs: 60_000 });
   bridge.setObserver({ publish: (event) => events.push(event), reset: () => {}, switching: () => {} });
-  return { bridge, entries, sent, events,
-    stale: () => { current = false; }, resolveModel: (value: boolean) => resolveModel(value),
-    compactSuccess: () => compactCallbacks?.onComplete?.(undefined as never),
-    compactFailure: () => compactCallbacks?.onError?.(new Error("late fixture error")),
-  };
+  return { bridge, entries, events, stale: () => { current = false; } };
 }
 
-test("a void prompt only dispatches literal text with an explicit delivery mode", () => {
+test("a replaced RPC projection refuses reads and ignores delayed events", () => {
   const f = fixture();
   try {
-    const results: unknown[] = [];
-    f.bridge.dispatch("prompt", { text: "/fixture literal" }, (result) => results.push(result));
-    assert.deepEqual(f.sent, [{ text: "/fixture literal", options: { deliverAs: "followUp", expandPromptTemplates: false } }]);
-    assert.deepEqual(results, [], "the bridge must not invent a completion for the void API");
-  } finally { f.bridge.dispose(); }
-});
-
-test("model completion after generation replacement cannot publish a new-session result", async () => {
-  const f = fixture();
-  try {
-    const results: unknown[] = [];
-    f.bridge.dispatch("set_model", { provider: "fixture", id: "fixture" }, (result) => results.push(result));
-    assert.ok(f.events.some((event) => event.type === "agent_state" && event.state.mutating === true),
-      "the current session must immediately publish the pending control state");
-    const dispatchedEventCount = f.events.length;
-    f.stale(); f.resolveModel(true); await tick();
-    assert.deepEqual(results, []);
-    assert.equal(f.events.length, dispatchedEventCount, "the stale completion must not publish any further events");
-  } finally { f.bridge.dispose(); }
-});
-
-test("model completion from before a branch change is discarded even within one generation", async () => {
-  const f = fixture();
-  try {
-    const results: unknown[] = [];
-    f.bridge.dispatch("set_model", { provider: "fixture", id: "fixture" }, (result) => results.push(result));
-    f.bridge.handleEvent({ type: "session_before_tree" });
-    f.bridge.handleEvent({ type: "session_tree" });
-    assert.equal(f.bridge.branchRevision, 1);
-    f.resolveModel(true); await tick();
-    assert.deepEqual(results, []);
-  } finally { f.bridge.dispose(); }
-});
-
-test("compact callbacks after disposal have no observable side effects", async () => {
-  for (const outcome of ["success", "failure"] as const) {
-    const f = fixture();
-    const results: Partial<CommandResult>[] = [];
-    f.bridge.dispatch("compact", {}, (result) => results.push(result));
-    f.bridge.dispose();
-    outcome === "success" ? f.compactSuccess() : f.compactFailure();
-    await tick();
-    assert.deepEqual(results, []);
+    f.stale();
+    assert.throws(() => f.bridge.snapshot(), /replaced/);
+    f.bridge.handleEvent({ type: "agent_start" });
     assert.equal(f.events.length, 0);
-  }
+  } finally { f.bridge.dispose(); }
+});
+
+test("a disposed projection cannot expose a stale session", () => {
+  const f = fixture();
+  f.bridge.dispose();
+  assert.throws(() => f.bridge.snapshot(), /replaced/);
+  f.bridge.handleEvent({ type: "message_start", message: { role: "user", content: "stale" } });
+  assert.equal(f.events.length, 0);
 });
 
 test("reconciliation keeps identical messages distinct and reads post-handler final content", () => {
@@ -224,7 +180,7 @@ test("streaming updates coalesce into append-only deltas that rebuild the snapsh
   } finally { f.bridge.dispose(); }
 });
 
-test("images project as metadata, are read by block index, and prompts carry validated images", async () => {
+test("images project as metadata, are read by block index, without inlining bytes", async () => {
   const { png } = await import("./fixtures/images.ts");
   const f = fixture();
   try {
@@ -241,11 +197,5 @@ test("images project as metadata, are read by block index, and prompts carry val
     assert.throws(() => f.bridge.imagePage(result!.id, 1), /not valid base64/);
     assert.throws(() => f.bridge.contentPage(user!.id, 1, 0), /no readable text/);
 
-    f.bridge.dispatch("prompt", { text: "", images: [{ mimeType: "image/png", data }], mode: "steer" }, () => {});
-    f.bridge.dispatch("prompt", { text: "with text", images: [{ mimeType: "image/png", data }] }, () => {});
-    assert.deepEqual(f.sent[0], { text: [{ type: "image", mimeType: "image/png", data }], options: { deliverAs: "steer", expandPromptTemplates: false } });
-    assert.deepEqual((f.sent[1]!.text as unknown[])[0], { type: "text", text: "with text" });
-    assert.throws(() => f.bridge.dispatch("prompt", { text: "x", images: [{ mimeType: "image/jpeg", data }] }, () => {}), /not image\/jpeg/);
-    assert.equal(f.sent.length, 2, "invalid images never reach the host");
   } finally { f.bridge.dispose(); }
 });

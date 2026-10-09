@@ -3,12 +3,77 @@ import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "preact/ho
 import type { JSX } from "preact";
 import { IMAGE_TYPES } from "../protocol/index.js";
 import {
-  addImages, forgetSubmission, issueCommand, loadOlder, login, logout, queryReceipt, reconnect, removeAttachment, setDraft,
-  startConnection, submitPrompt, webStore, type Attachment, type MessageView, type Submission, type ToolView, type WebState,
+  addImages, answerDialog, forgetSubmission, issueCommand, loadOlder, login, logout, queryReceipt, reconnect, removeAttachment, setDraft,
+  startConnection, submitPrompt, webStore, type Attachment, type Dialog, type MessageView, type Submission, type ToolView, type WebState,
 } from "./store.js";
 import { Message, ToolCard, type ToolContext } from "./messages.js";
 import { CommandMenu, Workbench, useWorkbenchQuery, type WorkbenchController } from "./workbench.js";
+import { resolveSlash } from "./commands.js";
+import { extensionText } from "./ui-state.js";
 import "./style.css";
+
+/** First answer wins in the host; dialogs survive network loss and are restored on reconnect. */
+function DialogView({ dialog, online }: { dialog: Dialog; online: boolean }) {
+  const [text, setText] = useState(dialog.prefill ?? "");
+  const [now, setNow] = useState(Date.now());
+  const panel = useRef<HTMLDivElement>(null);
+  const expired = !!dialog.expiresAt && now >= dialog.expiresAt;
+  const canAnswer = online && !expired;
+  const oversized = new TextEncoder().encode(text).byteLength > 65536;
+  const cancel = () => { if (canAnswer) answerDialog(dialog.id, { cancelled: true }); };
+  useEffect(() => {
+    if (!dialog.expiresAt) return;
+    const timer = setInterval(() => setNow(Date.now()), 500);
+    return () => clearInterval(timer);
+  }, [dialog.expiresAt]);
+  useLayoutEffect(() => {
+    const element = panel.current;
+    if (!element) return;
+    const previous = document.activeElement as HTMLElement | null;
+    const shell = element.closest(".app-shell");
+    const background = [...(shell?.children ?? [])].filter(child => child !== element.parentElement) as HTMLElement[];
+    const inertStates = background.map(child => child.inert);
+    for (const child of background) child.inert = true;
+    const controls = () => [...element.querySelectorAll<HTMLElement>('button:not(:disabled), textarea:not(:disabled), input:not(:disabled)')].filter(control => control.getClientRects().length);
+    (element.querySelector<HTMLElement>("textarea,input") || controls()[0] || element).focus();
+    const keys = (event: KeyboardEvent) => {
+      if (event.key === "Escape") { event.preventDefault(); if (online && (!dialog.expiresAt || Date.now() < dialog.expiresAt)) answerDialog(dialog.id, { cancelled: true }); }
+      if (event.key !== "Tab") return;
+      const items = controls(), first = items[0], last = items.at(-1);
+      if (!first || !last) { event.preventDefault(); element.focus(); return; }
+      if (!element.contains(document.activeElement) || (event.shiftKey && document.activeElement === first) || (!event.shiftKey && document.activeElement === last)) { event.preventDefault(); (event.shiftKey ? last : first).focus(); }
+    };
+    document.addEventListener("keydown", keys);
+    return () => {
+      document.removeEventListener("keydown", keys);
+      background.forEach((child, index) => { child.inert = inertStates[index]!; });
+      const workbench = shell?.querySelector<HTMLElement>(".workbench");
+      const topbar = background.find(child => child.classList.contains("topbar"));
+      // A drawer may regain its focus trap during the same commit that removes the dialog.
+      if (topbar && workbench) topbar.inert = (matchMedia("(max-width: 760px)").matches && workbench.classList.contains("left-open")) || (matchMedia("(max-width: 1100px)").matches && workbench.classList.contains("right-open"));
+      if (previous?.isConnected && !previous.closest("[inert]")) previous.focus();
+    };
+  }, [dialog.id, online]);
+  return (
+    <div class="dialog-backdrop">
+      <div class="dialog" ref={panel} role="dialog" aria-modal="true" aria-labelledby="extension-dialog-title" tabindex={-1}>
+        <h2 id="extension-dialog-title">{extensionText(dialog.title ?? "pi 请求输入")}</h2>
+        {dialog.message && <p>{extensionText(dialog.message)}</p>}
+        {dialog.expiresAt && <p class="dialog-timeout" role="status">{expired ? "请求已超时，正在等待宿主确认…" : `剩余 ${Math.max(1, Math.ceil((dialog.expiresAt - now) / 1000))} 秒`}</p>}
+        {!online && <p class="dialog-offline" role="status">连接已断开。重连后可继续回答；请求可能已在宿主超时。</p>}
+        {dialog.method === "select" && <div class="dialog-options">{(dialog.options ?? []).map(option => <button type="button" disabled={!canAnswer} key={option} onClick={() => answerDialog(dialog.id, { value: option })}>{extensionText(option)}</button>)}</div>}
+        {(dialog.method === "input" || dialog.method === "editor") && <textarea aria-label="对话框输入" maxLength={65536} disabled={!canAnswer} rows={dialog.method === "editor" ? 10 : 2} placeholder={dialog.placeholder} value={text} onInput={event => setText(event.currentTarget.value)} />}
+        {oversized && <p class="error-text" role="alert">输入超过 64 KiB，请缩短后再提交。</p>}
+        <div class="dialog-actions">
+          {!online && <button type="button" onClick={reconnect}>重新连接</button>}
+          <button type="button" class="quiet" disabled={!canAnswer} onClick={cancel}>取消</button>
+          {dialog.method === "confirm" && <button type="button" class="send-button" disabled={!canAnswer} onClick={() => answerDialog(dialog.id, { confirmed: true })}>确认</button>}
+          {(dialog.method === "input" || dialog.method === "editor") && <button type="button" class="send-button" disabled={!canAnswer || oversized} onClick={() => answerDialog(dialog.id, { value: text })}>提交</button>}
+        </div>
+      </div>
+    </div>
+  );
+}
 
 function useWebState(): WebState {
   const [state, setState] = useState(webStore.getState());
@@ -24,9 +89,9 @@ function useWebState(): WebState {
 }
 
 function receiptLabel(item: Submission): string {
-  if (item.command === "prompt" && item.status === "dispatched") return "已交给 pi；提交结果未确认";
-  if (item.command === "run_command" && item.status === "dispatched") return "已交给 pi；执行结果见会话输出";
-  return ({ sent: "等待桥接回执", dispatched: "已调用；等待状态变化", rejected: "桥接拒绝", unknown: "结果未知，请检查终端", completed: "操作已完成", cancelled: "操作已取消", failed: "操作失败" })[item.status];
+  if (item.command === "prompt" && item.status === "dispatched") return "已交给 RPC；等待提交结果";
+  if (item.command === "run_command" && item.status === "dispatched") return "已交给 RPC；等待命令结果";
+  return ({ started: "回复已启动", queued: "消息已入队", handled: "命令已处理", sent: "等待桥接回执", dispatched: "已调用；等待状态变化", rejected: "桥接拒绝", unknown: "结果未知，请检查会话", completed: "操作已完成", cancelled: "操作已取消", failed: "操作失败" })[item.status];
 }
 
 function Receipts({ items, online, onRecover }: { items: Submission[]; online: boolean; onRecover: (text: string) => void }) {
@@ -35,7 +100,7 @@ function Receipts({ items, online, onRecover }: { items: Submission[]; online: b
   return (
     <details class="receipts">
       <summary><span>提交记录 · {items.length}</span><span class={`receipt-latest receipt-${latest.status}`}>{receiptLabel(latest)}</span></summary>
-      <p class="receipt-note">会话消息由 pi 的实际事件显示。回执不能确认消息已入队或执行成功；原文保存在当前页面供恢复。</p>
+      <p class="receipt-note">回执显示 RPC 返回的启动、入队或命令处理结果；回复与工具输出由实际会话事件显示。原文保留在当前页面供恢复。</p>
       <div class="receipt-list">
         {[...items].reverse().map(item => (
           <div class={`receipt-item receipt-${item.status}`} key={item.id} data-receipt-id={item.id}>
@@ -48,7 +113,7 @@ function Receipts({ items, online, onRecover }: { items: Submission[]; online: b
               {(item.status === "unknown" || item.status === "sent") && <button type="button" disabled={!online} onClick={() => queryReceipt(item.id)}>查询回执</button>}
               <button type="button" class="quiet" onClick={() => forgetSubmission(item.id)}>移除记录</button>
             </div>
-            {item.status === "unknown" && <p class="retry-warning">此前操作可能已经执行。恢复原文后，请先检查终端再决定是否发送。</p>}
+            {item.status === "unknown" && <p class="retry-warning">此前操作可能已经执行。恢复原文后，请先检查当前会话与提交记录再决定是否发送。</p>}
           </div>
         ))}
       </div>
@@ -93,6 +158,12 @@ function Attachments({ items, error }: { items: Attachment[]; error: string }) {
     </div>
   );
 }
+function ExtensionWidgets({ state, placement }: { state: WebState; placement: "aboveEditor" | "belowEditor" }) {
+  const widgets = Object.entries(state.ui?.widgets ?? {}).filter(([, widget]) => (widget.placement === "belowEditor" ? "belowEditor" : "aboveEditor") === placement);
+  if (!widgets.length) return null;
+  return <div class="extension-widgets">{widgets.map(([key, widget]) => <section class="extension-widget" key={key} aria-label={`扩展组件 ${key}`}>{widget.content.map((line, index) => <div key={index}>{extensionText(line)}</div>)}</section>)}</div>;
+}
+
 function hexLuminance(value: string): number | undefined {
   if (!/^#[0-9a-f]{6}$/i.test(value)) return undefined;
   const channels = [1, 3, 5].map(offset => {
@@ -124,9 +195,10 @@ function App() {
   const controlPending = state.submissions.some(item => item.epoch === snapshot?.epoch &&
     (item.command.startsWith("session_") || item.command === "set_model" || item.command === "compact") &&
     (item.status === "sent" || item.status === "dispatched"));
-  const canPrompt = online && !controlPending && !!snapshot?.caps.commands.includes("prompt") && !host?.mutating && !host?.compacting && !host?.uiPrompts.length;
-  const canConfigure = online && !controlPending && !!host?.idle && !host.mutating && !host.compacting && !host.uiPrompts.length;
+  const canPrompt = online && !controlPending && !!snapshot?.caps.commands.includes("prompt") && !host?.compacting && !host?.uiPrompts.length && !state.dialogs.length;
+  const canConfigure = online && !controlPending && !!host?.idle && !host.compacting && !host.uiPrompts.length && !state.dialogs.length;
   const commandCatalog = useWorkbenchQuery(state, "commands");
+  const resources = useWorkbenchQuery(state, "resources");
   const messages = snapshot?.session.messages;
   // Pair each tool call with its result and live progress; paired results render inside the call.
   const view = useMemo(() => {
@@ -238,23 +310,18 @@ function App() {
   }
   function submit(mode: "followUp" | "steer") {
     if (!canPrompt || composing.current) return;
-    const slash = /^\/([^\s]+)(?:\s+([\s\S]*))?$/.exec(state.draft.trim());
-    if (snapshot?.caps.workbench && slash && (commandCatalog.loading || !commandCatalog.value)) {
-      webStore.setState({ notice: "命令清单尚未加载，正在重新读取；请稍后再提交。" });
-      if (commandCatalog.error) commandCatalog.reload();
-      return;
-    }
-    const command = snapshot?.caps.workbench && slash ? commandCatalog.value?.commands.find(item => item.name === slash[1] && item.available) || commandCatalog.value?.commands.find(item => item.name === slash[1]) : undefined;
-    if (command && slash) {
+    const slash = resolveSlash(state.draft, commandCatalog.value?.commands ?? []);
+    if (slash?.command) {
+      const command = slash.command;
       if (state.attachments.length) { webStore.setState({ notice: "执行命令前请移除图片；命令与图片消息需要分别提交。" }); return; }
-      if (!command.available) { webStore.setState({ notice: command.reason || "此命令需要在终端使用。" }); return; }
-      if (!workbench.current?.execute(command, slash[2] || "")) { webStore.setState({ notice: "当前无法执行此命令，请等待运行结束，或使用对应面板完成操作。" }); return; }
+      if (!command.available) { webStore.setState({ notice: command.reason || "交接模式不支持此命令。" }); return; }
+      if (!workbench.current?.execute(command, slash.args)) { webStore.setState({ notice: "当前无法执行此命令，请等待运行结束，或使用对应面板完成操作。" }); return; }
       webStore.setState({ notice: "" });
       setDraft("");
-      // Picker commands own focus; clearing their syntax must not return it to the composer.
-      if (!command.browserAction || command.browserAction === "new" || command.browserAction === "compact") textarea.current?.focus();
+      if (!command.browserAction || command.browserAction === "new" || command.browserAction === "compact" || command.browserAction === "clone") textarea.current?.focus();
       return;
     }
+    // Unknown slash input is intentionally submitted to RPC, which expands registered extensions, skills and templates.
     submitPrompt(mode); goLatest(); textarea.current?.focus();
   }
   function onKeyDown(event: JSX.TargetedKeyboardEvent<HTMLTextAreaElement>) {
@@ -277,18 +344,18 @@ function App() {
       <div class="session-bar">
         <div class="session-identity"><h1>{snapshot?.session.name || "当前 pi 会话"}</h1><p title={snapshot?.session.cwd}>{snapshot?.session.cwd || "在浏览器中继续当前终端会话"}</p></div>
         <div class="session-details">
-          <span>{host?.mutating || controlPending ? "正在处理会话或模型操作" : host?.compacting ? "压缩上下文中" : host?.running ? "正在运行" : host?.idle ? "空闲" : "状态未知"}</span>
+          <span>{controlPending ? "正在处理会话或模型操作" : host?.compacting ? "压缩上下文中" : host?.running ? "正在运行" : host?.idle ? "空闲" : "状态未知"}</span>
           {host?.hasPendingMessages && <span class="queue-badge">存在待发消息</span>}
         </div>
       </div>
       {connection === "login" ? <div class="timeline"><div class="timeline-inner"><Login state={state} />{state.notice && <p class="login-notice" role="status">{state.notice}</p>}</div></div> : <>
       {state.notice && <div class={`notice notice-${connection}`} role="status"><span>{state.notice}</span>{(connection === "disconnected" || connection === "fatal") && <button type="button" onClick={reconnect}>重新连接</button>}</div>}
-      {!!host?.uiPrompts.length && <div class="terminal-notice" role="status"><strong>请在终端处理对话框</strong>{host.uiPrompts.map((prompt, i) => <span key={i}>{prompt.title || prompt.kind}</span>)}</div>}
+      {!!Object.keys(state.ui?.statuses ?? {}).length && <div class="extension-statuses" role="status">{Object.entries(state.ui!.statuses).map(([key, value]) => <span key={key} title={key}>{extensionText(value)}</span>)}</div>}
       <div class="timeline" ref={feed} onScroll={handleScroll} aria-live="off" aria-label="当前分支会话历史">
         <div class="timeline-inner" ref={feedInner}>
           {start > 0 && <div class="history-limit"><button type="button" onClick={showEarlier}>显示更早的 {Math.min(start, WINDOW_STEP)} 条（已在浏览器中）</button></div>}
           {!start && snapshot?.session.olderCursor && <div class="history-limit"><button type="button" disabled={state.historyLoading || !online} onClick={olderPage}>{state.historyLoading ? "正在加载更早的消息…" : "加载更早的消息"}</button>{state.historyError && <span>{state.historyError}</span>}</div>}
-          {!snapshot ? <div class="empty-state"><span class="empty-pi">π</span><h2>{connection === "switching" ? "等待新会话" : "连接当前会话"}</h2><p>在终端输入 /web 后，当前分支和正在生成的内容会显示在这里。</p></div> : !snapshot.session.messages.length && !host?.tools.length ? <div class="empty-state"><span class="empty-pi">π</span><h2>可以开始了</h2><p>终端与浏览器共享同一个会话。发送消息后，pi 的实际输出会出现在这里。</p></div> : null}
+          {!snapshot ? <div class="empty-state"><span class="empty-pi">π</span><h2>{connection === "switching" ? "等待新会话" : "连接当前会话"}</h2><p>在终端输入 /web 后，当前分支和正在生成的内容会显示在这里。</p></div> : !snapshot.session.messages.length && !host?.tools.length ? <div class="empty-state"><span class="empty-pi">π</span><h2>可以开始了</h2><p>会话已交给浏览器。发送消息后，pi 的实际输出会出现在这里。</p></div> : null}
           {shown.map(message => <Message key={message.id} message={message} tools={view.tools} expansions={state.expansions} />)}
           {!!view.orphans.length && <div class="tools"><div class="section-label">工具执行</div>{view.orphans.map(tool => <ToolCard key={tool.id} live={tool} expansions={state.expansions} />)}</div>}
           {host?.running && <div class="running-line"><span class="running-indicator" />pi 正在运行</div>}
@@ -297,9 +364,10 @@ function App() {
       {showLatest && <button type="button" class="go-latest" onClick={goLatest}>↓ 回到最新</button>}
       <footer class="composer-region">
         <div class="composer-inner">
+          <ExtensionWidgets state={state} placement="aboveEditor" />
           <div class="host-controls">
-            <label><span>模型</span><select aria-label="模型" value={host?.model ? JSON.stringify({ provider: host.model.provider, id: host.model.id }) : ""} disabled={!canConfigure || !snapshot?.caps.commands.includes("set_model")} onChange={event => { const model = event.currentTarget.value; if (model) issueCommand("set_model", JSON.parse(model)); }}><option value="">{host?.model?.name || "未设置"}</option>{host?.models.map(model => <option key={`${model.provider}:${model.id}`} value={JSON.stringify({ provider: model.provider, id: model.id })}>{model.name || model.id}</option>)}</select></label>
-            <label><span>thinking</span><select aria-label="thinking 等级" value={host?.thinking ?? "off"} disabled={!canConfigure || !snapshot?.caps.commands.includes("set_thinking")} onChange={event => issueCommand("set_thinking", { level: event.currentTarget.value })}>{["off", "minimal", "low", "medium", "high", "xhigh", "max"].map(level => <option value={level} key={level}>{level}</option>)}</select></label>
+            <label><span>模型</span><select aria-label="模型" value={host?.model ? JSON.stringify({ provider: host.model.provider, id: host.model.id }) : ""} disabled={!canConfigure || !snapshot?.caps.commands.includes("set_model")} onChange={event => { const model = event.currentTarget.value; if (model) issueCommand("set_model", JSON.parse(model)); }}>{!resources.value?.models.some(model => model.provider === host?.model?.provider && model.id === host?.model?.id) && <option value="">{host?.model?.name || "未设置"}</option>}{resources.value?.models.map(model => <option key={`${model.provider}:${model.id}`} value={JSON.stringify({ provider: model.provider, id: model.id })}>{model.name || model.id}</option>)}</select></label>
+            <label><span>thinking</span><select aria-label="thinking 等级" value={host?.thinking ?? "off"} disabled={!canConfigure || !snapshot?.caps.commands.includes("set_thinking") || !resources.value?.thinkingLevels?.length} onChange={event => issueCommand("set_thinking", { level: event.currentTarget.value })}>{(resources.value?.thinkingLevels ?? [host?.thinking || "off"]).map(level => <option value={level} key={level}>{level}</option>)}</select></label>
             <button type="button" class="compact-button" disabled={!canConfigure || !!host?.hasPendingMessages || !snapshot?.caps.commands.includes("compact")} onClick={() => issueCommand("compact")}>压缩上下文</button>
           </div>
           <div class="composer-wrap">
@@ -316,12 +384,14 @@ function App() {
             <div class="composer-actions"><div class="context-buttons"><button type="button" class="attach-button" disabled={!canAttach || state.attachments.length >= 4} onClick={() => fileInput.current?.click()} aria-label="添加图片">图片</button>{snapshot?.caps.workbench && <button type="button" disabled={!online} onClick={() => workbench.current?.files(true)} aria-label="引用工作区文件">@ 文件</button>}</div><div class="action-buttons">{host && !host.idle && <button type="button" class="abort-button" disabled={!online || !snapshot?.caps.commands.includes("abort")} onClick={() => issueCommand("abort")}>■ 中止</button>}<button type="button" class="steer-button" disabled={!canPrompt || (!state.draft.trim() && !state.attachments.length)} onClick={() => submit("steer")} title="⌘ / Ctrl + Enter">steer</button><button type="button" class="send-button" disabled={!canPrompt || (!state.draft.trim() && !state.attachments.length)} onClick={() => submit("followUp")}>{host?.running ? "请求 followUp ↗" : "发送 ↗"}</button></div></div>
           </div>
           </div>
-          <p class="scope-note">{snapshot?.caps.workbench ? coarsePointer ? "Enter 换行 · 按钮发送 · / 查看命令" : "Enter 发送 · Shift + Enter 换行 · / 查看命令 · @ 引用文件" : "网页按原文提交；回执确认已交给 pi。"}</p>
+          <p class="scope-note">会话已交给浏览器 · slash 命令、模板和 skill 会执行或展开 · 终端 Ctrl+C 停止服务并交还会话</p>
+          <ExtensionWidgets state={state} placement="belowEditor" />
           <Receipts items={state.submissions} online={online} onRecover={text => { setDraft(text); textarea.current?.focus(); }} />
         </div>
       </footer>
       </>}
       </Workbench>
+      {state.dialogs[0] && <DialogView key={state.dialogs[0].id} dialog={state.dialogs[0]} online={online} />}
     </div>
   );
 }

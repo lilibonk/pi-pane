@@ -1,45 +1,33 @@
 import { spawn } from "node:child_process";
-import { randomUUID } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { LIMITS, ProtocolError, isRecord, toWireError } from "../protocol/index.js";
-import { Bridge, type BridgeOptions } from "./bridge.js";
+import { createSecureContext } from "node:tls";
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { ProtocolError } from "../protocol/index.js";
 import { Hub, type ExternalAccess } from "./hub.js";
-import { missingHostCapabilities, readPaneSettings } from "./config.js";
+import { readPaneSettings } from "./config.js";
 import { qrLines, qrWidth } from "./qr.js";
+import { HandoffHost, childArgs, type HandoffTarget } from "./handoff.js";
+import { runningPiRpcEntry } from "./rpc-child.js";
+import { SessionFileLock } from "./session-lock.js";
 
-export const IMPLEMENTATION_VERSION = "m3.0";
-const QR_WIDGET = "pi-pane-qr";
-const QR_VISIBLE_MS = 120_000;
-export const PROCESS_STATE_KEY = Symbol.for("pi-pane.process.v1");
+export const IMPLEMENTATION_VERSION = "m3.handoff.1";
+export const PROCESS_STATE_KEY = Symbol.for("pi-pane.process.handoff.v1");
 export interface ProcessState {
   implementationVersion: string;
-  autoStartApplied: boolean;
-  desiredRunning: boolean;
   generation: number;
+  lock?: SessionFileLock;
   hub?: Hub;
-  bridge?: Bridge;
-  starting?: Promise<Hub>;
-  /** Recent host-owned session directories survive resume/reload and /web stop within this process. */
-  sessionDirectories?: string[];
-  /** One-use actions remain fenced across session replacement until their actual completion. */
-  sessionMutations?: Set<string>;
+  host?: HandoffHost;
+  handoff?: HandoffTarget & { args: WebArgs; external?: ExternalAccess; webRoot: string };
 }
-export function rememberSessionDirectory(state: ProcessState, directory: string): void {
-  state.sessionDirectories = [...(state.sessionDirectories ?? []).filter((item) => item !== directory), directory].slice(-32);
-}
-/** This record survives stop/reload. It owns no sockets until /web or initial --web. */
+/** No Bridge, Hub or listening socket exists during TUI operation. */
 export function getProcessState(): ProcessState {
   const globals = globalThis as unknown as Record<symbol, ProcessState | undefined>;
-  return globals[PROCESS_STATE_KEY] ??= {
-    implementationVersion: IMPLEMENTATION_VERSION, autoStartApplied: false, desiredRunning: false, generation: 0,
-  };
+  return globals[PROCESS_STATE_KEY] ??= { implementationVersion: IMPLEMENTATION_VERSION, generation: 0 };
 }
-
-interface WebArgs {
-  action: "start" | "stop" | "status" | "rotate" | "qr";
+export interface WebArgs {
   host?: string;
   port?: number;
   noOpen: boolean;
@@ -48,94 +36,9 @@ interface WebArgs {
   tlsKey?: string;
   proxy?: boolean;
 }
-const ADDRESS_KEYS = ["host", "port", "publicOrigin", "tlsCert", "tlsKey", "proxy"] as const;
-/**
- * pi's event context has no session-control methods. Dispatching a registered command creates
- * a fresh command context in the host. Only the one-use nonce can select a pending operation;
- * no context is cached and no browser-controlled slash command can call this private gateway.
- */
-export function createSessionCommandGateway(pi: Pick<ExtensionAPI, "registerCommand" | "sendUserMessage">, current: () => Bridge | undefined, sessionMutations = new Set<string>()) {
-  const commandName = `pi-pane-internal-${randomUUID()}`;
-  type Pending = { command: Parameters<NonNullable<BridgeOptions["sessionCommand"]>>[0]; args: Record<string, unknown>;
-    expected: Parameters<NonNullable<BridgeOptions["sessionCommand"]>>[2]; complete: Parameters<NonNullable<BridgeOptions["sessionCommand"]>>[3];
-    timer: ReturnType<typeof setTimeout> };
-  const pending = new Map<string, Pending>();
-  const consume = async (nonce: string, ctx: ExtensionCommandContext): Promise<void> => {
-    const request = pending.get(nonce);
-    if (!request) return;
-    pending.delete(nonce); clearTimeout(request.timer);
-    try {
-      const bridge = current();
-      if (!bridge?.isCurrent() || bridge.generation !== request.expected.generation || bridge.sessionId !== request.expected.sessionId ||
-          bridge.branchRevision !== request.expected.branchRevision || ctx.sessionManager.getSessionId() !== request.expected.sessionId)
-        throw new ProtocolError("stale_session", "The session changed before the command could run.");
-      if (!ctx.isIdle() || ctx.hasPendingMessages()) throw new ProtocolError("busy", "The session must be idle before changing sessions.");
-      const method = request.command === "session_new" ? "newSession" : request.command === "session_switch" ? "switchSession" : request.command === "session_fork" ? "fork" : "navigateTree";
-      if (typeof ctx[method] !== "function") throw new ProtocolError("unsupported_host", "This pi host cannot perform the requested session action.");
-      let result: { cancelled: boolean };
-      let draftText: string | undefined;
-      if (request.command === "session_tree") {
-        const entry = ctx.sessionManager.getEntry(request.args.entryId as string);
-        const message = entry?.type === "message" && entry.message.role === "user" ? entry.message : entry?.type === "custom_message" ? entry : undefined;
-        if (message) {
-          const content = message.content;
-          const text = typeof content === "string" ? content : Array.isArray(content) ? content.map((part) => isRecord(part) && typeof part.text === "string" ? part.text : "").join("") : "";
-          const bytes = new TextEncoder().encode(text);
-          draftText = new TextDecoder("utf-8", { fatal: false }).decode(bytes.subarray(0, LIMITS.promptBytes));
-          // Remove an incomplete code point at the byte boundary rather than emitting invalid prompt text.
-          if (bytes.length > LIMITS.promptBytes && draftText.endsWith("\ufffd")) draftText = draftText.slice(0, -1);
-        }
-      }
-      if (request.command === "session_new") result = await ctx.newSession();
-      else if (request.command === "session_switch") result = await ctx.switchSession(request.args.sessionPath as string);
-      else if (request.command === "session_fork") result = await ctx.fork(request.args.entryId as string, { position: request.args.position as "before" | "at" | undefined });
-      else result = await ctx.navigateTree(request.args.entryId as string, { summarize: false });
-      // Only read the returned outcome after replacement. The old pi/ctx is deliberately unused.
-      const freshBridge = current();
-      const scope = !result.cancelled && freshBridge?.isCurrent() ? { sessionId: freshBridge.sessionId, branchRevision: freshBridge.branchRevision } : {};
-      request.complete({ status: "completed", value: { cancelled: result.cancelled, ...scope, ...(!result.cancelled && draftText !== undefined ? { draftText } : {}) } });
-    } catch (error) { request.complete({ status: "failed", error: toWireError(error) }); }
-  };
-  pi.registerCommand(commandName, { description: "Internal one-use pi-pane session action.", handler: consume });
-  const invoke: NonNullable<BridgeOptions["sessionCommand"]> = (command, args, expected, complete) => {
-    const bridge = current();
-    if (!bridge?.isCurrent() || bridge.generation !== expected.generation || bridge.sessionId !== expected.sessionId || bridge.branchRevision !== expected.branchRevision)
-      throw new ProtocolError("stale_session", "The session changed before dispatch.");
-    if (sessionMutations.size) throw new ProtocolError("busy", "Wait until the pending session action has completed.");
-    const nonce = randomUUID();
-    let completed = false;
-    const finish: typeof complete = (result) => {
-      if (completed) return;
-      completed = true;
-      sessionMutations.delete(nonce);
-      try { complete(result); }
-      finally { current()?.refreshState?.(); }
-    };
-    const timer = setTimeout(() => {
-      const request = pending.get(nonce);
-      if (!request) return;
-      pending.delete(nonce);
-      request.complete({ status: "failed", error: { code: "command_timeout", message: "The host did not execute the session command. Refresh before retrying." } });
-    }, 15_000);
-    timer.unref?.();
-    sessionMutations.add(nonce);
-    pending.set(nonce, { command, args, expected, complete: finish, timer });
-    try { pi.sendUserMessage(`/${commandName} ${nonce}`, { expandPromptTemplates: true, deliverAs: "followUp" }); }
-    catch (error) { pending.delete(nonce); sessionMutations.delete(nonce); clearTimeout(timer); throw error; }
-  };
-  const cancelPending = (): void => {
-    for (const request of pending.values()) {
-      clearTimeout(request.timer);
-      request.complete({ status: "failed", error: { code: "stale_session", message: "The session changed before the command could run." } });
-    }
-    pending.clear();
-  };
-  return { commandName, invoke, cancelPending, isPending: () => sessionMutations.size > 0 };
-}
 export function parseWebArgs(text: string): WebArgs {
   const parts = text.trim() ? text.trim().split(/\s+/) : [];
-  const args: WebArgs = { action: "start", noOpen: false };
-  if (["stop", "status", "qr"].includes(parts[0] ?? "")) args.action = parts.shift() as "stop" | "status" | "qr";
+  const args: WebArgs = { noOpen: false };
   const value = (name: string, index: number): string => {
     const next = parts[index];
     if (!next || next.startsWith("--")) throw new ProtocolError("invalid_args", `${name} needs a value.`);
@@ -144,262 +47,214 @@ export function parseWebArgs(text: string): WebArgs {
   for (let i = 0; i < parts.length; i++) {
     const part = parts[i];
     if (part === "--no-open") args.noOpen = true;
-    else if (part === "--rotate") args.action = "rotate";
     else if (part === "--proxy") args.proxy = true;
     else if (part === "--host") args.host = value(part, ++i);
     else if (part === "--public-origin") args.publicOrigin = value(part, ++i);
     else if (part === "--tls-cert") args.tlsCert = value(part, ++i);
     else if (part === "--tls-key") args.tlsKey = value(part, ++i);
     else if (part === "--port") {
-      const value = parts[++i];
-      if (!value || !/^\d+$/.test(value)) throw new ProtocolError("invalid_args", "--port needs an integer.");
-      args.port = Number(value);
-      if (args.port < 1 || args.port > 65535) throw new ProtocolError("invalid_args", "Port must be between 1 and 65535.");
-    } else throw new ProtocolError("invalid_args", `Unknown /web argument: ${part}`);
+      const raw = value(part, ++i);
+      if (!/^\d+$/.test(raw) || Number(raw) < 1 || Number(raw) > 65535) throw new ProtocolError("invalid_args", "Port must be between 1 and 65535.");
+      args.port = Number(raw);
+    } else throw new ProtocolError("invalid_args", `Unknown /web argument: ${part}. /web only hands off; stop with Ctrl+C.`);
   }
-  if (args.action !== "start" && ADDRESS_KEYS.some((key) => args[key] !== undefined))
-    throw new ProtocolError("invalid_args", "Address options apply only when starting the service.");
   return args;
 }
-/** The password is read from the environment only: never from arguments, flags or settings. */
+/** The access password is read only from the environment. */
 async function externalAccess(args: WebArgs, cwd: string): Promise<ExternalAccess | undefined> {
   if (!args.publicOrigin) {
     if (args.tlsCert || args.tlsKey || args.proxy) throw new ProtocolError("invalid_args", "TLS and proxy options need --public-origin https://host[:port].");
     return undefined;
   }
   const password = process.env.PI_PANE_PASSWORD;
-  if (!password) throw new ProtocolError("password_required", "External access needs the PI_PANE_PASSWORD environment variable (at least 12 characters).");
+  if (!password) throw new ProtocolError("password_required", "External access needs PI_PANE_PASSWORD (at least 12 characters).");
   if (!!args.tlsCert !== !!args.tlsKey) throw new ProtocolError("invalid_args", "Provide both --tls-cert and --tls-key.");
-  if (!args.tlsCert && !args.proxy) throw new ProtocolError("transport_required", "External access needs --tls-cert/--tls-key or --proxy; plain HTTP is refused.");
+  if (!args.tlsCert && !args.proxy) throw new ProtocolError("transport_required", "External access needs TLS or --proxy; plain HTTP is refused.");
   if (args.tlsCert && args.proxy) throw new ProtocolError("invalid_args", "Choose either direct TLS or proxy mode.");
   let tls: ExternalAccess["tls"];
   if (args.tlsCert) {
     try { tls = { cert: await readFile(resolve(cwd, args.tlsCert)), key: await readFile(resolve(cwd, args.tlsKey!)) }; }
     catch { throw new ProtocolError("tls_unavailable", "The TLS certificate or key could not be read."); }
+    try { createSecureContext({ ...tls, minVersion: "TLSv1.2" }); }
+    catch { throw new ProtocolError("tls_unavailable", "The TLS certificate and key could not form a valid TLS context."); }
   }
   return { publicOrigin: args.publicOrigin, password, ...(tls ? { tls } : { proxy: true }) };
 }
 
 export default function piPane(pi: ExtensionAPI): void {
   const state = getProcessState();
-  let ownedBridge: Bridge | undefined;
-  let ownedContext: ExtensionContext | undefined;
-  const sessionMutations = state.sessionMutations ??= new Set<string>();
-  // Replacement loads a new extension closure. The process record, rather than this
-  // outgoing closure's ownedBridge, identifies the fresh Bridge for completion/state.
-  const sessionGateway = createSessionCommandGateway(pi, () => state.bridge, sessionMutations);
   const webRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../../web-dist");
-
-  pi.registerFlag("web", { type: "boolean", default: false, description: "Mirror the current TUI session in a local browser." });
-  pi.registerFlag("web-host", { type: "string", description: "Listen address for pi-pane (loopback unless external access is configured)." });
-  pi.registerFlag("web-port", { type: "string", description: "Explicit local port for pi-pane." });
-  pi.registerFlag("web-no-open", { type: "boolean", description: "Start pi-pane without opening a browser." });
-  pi.registerFlag("web-public-origin", { type: "string", description: "External access: https://host[:port]; needs PI_PANE_PASSWORD." });
-  pi.registerFlag("web-tls-cert", { type: "string", description: "External access: TLS certificate file." });
-  pi.registerFlag("web-tls-key", { type: "string", description: "External access: TLS private key file." });
+  let ownedLock: SessionFileLock | undefined;
+  let ownedGeneration = 0;
+  // Configuration flags remain; --web startup and the mirror command family are removed.
+  pi.registerFlag("web-host", { type: "string", description: "Listen address for /web (loopback by default)." });
+  pi.registerFlag("web-port", { type: "string", description: "Explicit port for /web." });
+  pi.registerFlag("web-no-open", { type: "boolean", description: "Do not open a browser after /web handoff." });
+  pi.registerFlag("web-public-origin", { type: "string", description: "External HTTPS origin; requires PI_PANE_PASSWORD." });
+  pi.registerFlag("web-tls-cert", { type: "string", description: "TLS certificate file for /web." });
+  pi.registerFlag("web-tls-key", { type: "string", description: "TLS private key file for /web." });
   pi.registerFlag("web-proxy", { type: "boolean", description: "External access through a same-machine TLS proxy." });
 
   const notify = (ctx: ExtensionContext, text: string, error = false): void => {
     if (ctx.mode === "tui") ctx.ui.notify(text, error ? "error" : "info");
     else process.stderr.write(`pi-pane: ${text}\n`);
   };
-  const updateStatus = (): void => {
-    if (!ownedContext || !ownedBridge?.isCurrent()) return;
-    try { ownedContext.ui.setStatus("pi-pane", state.hub?.running ? `🌐 web: ${state.hub.connectionCount} viewer${state.hub.connectionCount === 1 ? "" : "s"}` : undefined); } catch { /* stale UI */ }
-  };
-  let qrTimer: ReturnType<typeof setTimeout> | undefined;
-  const hideQr = (): void => {
-    if (qrTimer) { clearTimeout(qrTimer); qrTimer = undefined; }
-    try { if (ownedBridge?.isCurrent()) ownedContext?.ui.setWidget(QR_WIDGET, undefined); } catch { /* stale UI */ }
-  };
-  const stop = async (): Promise<void> => {
-    hideQr();
-    state.desiredRunning = false;
-    const hub = state.hub;
-    state.hub = undefined;
-    await hub?.close();
-    updateStatus();
-  };
-  const flagArgs = (): WebArgs => {
+  const defaults = (): WebArgs => {
     const config = readPaneSettings(pi.getSettings());
     const port = pi.getFlag("web-port");
-    const noOpen = pi.getFlag("web-no-open");
     const parsed = parseWebArgs(port === undefined ? "" : `--port ${String(port)}`);
     const strings: Partial<WebArgs> = {};
     for (const [flag, key] of [["web-host", "host"], ["web-public-origin", "publicOrigin"], ["web-tls-cert", "tlsCert"], ["web-tls-key", "tlsKey"]] as const) {
-      const value = pi.getFlag(flag);
-      if (typeof value === "string" && value) strings[key] = value;
+      const val = pi.getFlag(flag);
+      if (typeof val === "string" && val) strings[key] = val;
     }
-    const proxy = pi.getFlag("web-proxy");
-    return { ...config, ...parsed, ...strings, ...(proxy === true ? { proxy: true } : {}),
-      noOpen: typeof noOpen === "boolean" ? noOpen : config.noOpen ?? false };
-  };
-  const openBrowser = (url: string, ctx: ExtensionContext): void => {
-    const executable = process.platform === "darwin" ? "open" : process.platform === "win32" ? "rundll32" : "xdg-open";
-    const args = process.platform === "win32" ? ["url.dll,FileProtocolHandler", url] : [url];
-    const child = spawn(executable, args, { detached: true, stdio: "ignore", shell: false });
-    child.once("error", () => notify(ctx, "Browser could not open; use the URL shown in the terminal.", true));
-    child.unref();
-  };
-  const start = async (ctx: ExtensionContext, args: WebArgs): Promise<Hub> => {
-    if (ctx.mode !== "tui") throw new ProtocolError("unsupported_mode", "--web is available only in TUI mode; no service was started.");
-    const bridge = ownedBridge;
-    if (!bridge?.isCurrent() || state.bridge !== bridge) throw new ProtocolError("stale_session", "Session is not ready. Run /web after it finishes loading.");
-    if (state.hub?.running) {
-      if ((args.port !== undefined && args.port !== state.hub.port) || (args.host !== undefined && args.host !== state.hub.host) ||
-          (args.publicOrigin !== undefined && new URL(args.publicOrigin).origin !== state.hub.origin))
-        throw new ProtocolError("already_running", "Stop the current service before changing its address.");
-      return state.hub;
-    }
-    if (state.starting) return state.starting;
-    const external = await externalAccess(args, ctx.cwd);
-    // Fail before listening: wrong combinations never fall back to a weaker mode.
-    new Hub({ host: args.host ?? "127.0.0.1", port: args.port ?? 7878, webRoot, ...(external ? { external } : {}) });
-    state.desiredRunning = true;
-    const generation = state.generation;
-    state.starting = (async () => {
-      const maxAttempts = args.port === undefined ? 20 : 1;
-      let lastError: unknown;
-      for (let attempt = 0; attempt < maxAttempts; attempt++) {
-        const hub = new Hub({ host: args.host ?? "127.0.0.1", port: args.port ?? 7878 + attempt, webRoot, onConnectionCount: updateStatus, ...(external ? { external } : {}) });
-        try {
-          await hub.start();
-          if (state.generation !== generation || !state.desiredRunning || !bridge.isCurrent()) {
-            await hub.close();
-            throw new ProtocolError("start_cancelled", "Service start was cancelled by a session change or stop.");
-          }
-          state.hub = hub;
-          hub.bindBridge(bridge, "web_start");
-          updateStatus();
-          return hub;
-        } catch (error) {
-          await hub.close();
-          lastError = error;
-          if ((error as NodeJS.ErrnoException).code !== "EADDRINUSE") break;
-        }
-      }
-      state.desiredRunning = false;
-      throw lastError ?? new Error("Could not start pi-pane.");
-    })();
-    try { return await state.starting; } finally { state.starting = undefined; }
-  };
-  const showUrl = (ctx: ExtensionContext, hub: Hub, noOpen: boolean): void => {
-    const login = hub.mode === "password" ? ` · login with PI_PANE_PASSWORD · listening on ${hub.listenAddress}` : "";
-    notify(ctx, `pi-pane: ${hub.url}${login}${noOpen ? "" : " (opening browser)"}`);
-    if (!noOpen) openBrowser(hub.url, ctx);
-  };
-  const showQr = (ctx: ExtensionContext, hub: Hub): void => {
-    if (hub.mode !== "password") throw new ProtocolError("qr_local", "The QR code is for external access. Start with --public-origin and TLS or --proxy; local links only work on this machine.");
-    hideQr();
-    // A component, not a string array: string widgets are cut at 10 lines and a QR code needs about 20.
-    const lines = qrLines(hub.url);
-    const width = qrWidth(hub.url);
-    const caption = `pi-pane: scan to open ${hub.origin} · enter the password separately · hides in 2 minutes`;
-    ctx.ui.setWidget(QR_WIDGET, () => ({
-      render: (columns: number) => columns >= width
-        ? [...lines, caption.slice(0, columns)]
-        : ["pi-pane: the terminal is too narrow for the QR code; widen it or use the link.".slice(0, columns)],
-      invalidate: () => {},
-    }));
-    qrTimer = setTimeout(hideQr, QR_VISIBLE_MS);
-    qrTimer.unref?.();
+    return { ...config, ...parsed, ...strings,
+      ...(pi.getFlag("web-proxy") === true ? { proxy: true } : {}),
+      noOpen: typeof pi.getFlag("web-no-open") === "boolean" ? !!pi.getFlag("web-no-open") : config.noOpen ?? false };
   };
 
+  pi.on("session_start", async (_event, ctx) => {
+    // The RPC child also loads this extension, but never competes with its owning host's lock.
+    if (ctx.mode !== "tui") return;
+    ownedGeneration = ++state.generation;
+    const file = ctx.sessionManager.getSessionFile();
+    if (!file) return; // --no-session is refused only when /web is requested.
+    try {
+      await state.lock?.release();
+      ownedLock = await SessionFileLock.acquire(file);
+      state.lock = ownedLock;
+    } catch (error) {
+      notify(ctx, `pi-pane: ${error instanceof Error ? error.message : String(error)}. This TUI will close to protect the session.`, true);
+      ctx.shutdown();
+    }
+  });
+  pi.on("session_shutdown", async () => {
+    if (ownedGeneration !== state.generation || !ownedLock) return;
+    if (state.handoff) return; // Transfer ownership; do not create a lock gap at TUI shutdown.
+    await ownedLock.release();
+    if (state.lock === ownedLock) state.lock = undefined;
+    ownedLock = undefined;
+  });
   pi.registerCommand("web", {
-    description: "Mirror this TUI in a browser. /web [--no-open], stop, status, qr, --rotate; external access: --public-origin with --tls-cert/--tls-key or --proxy.",
+    description: "Hand this idle session to a foreground browser service. /web [--no-open]; Ctrl+C stops and prints the terminal resume command.",
     handler: async (text, ctx) => {
       try {
-        if (ctx.mode !== "tui") throw new ProtocolError("unsupported_mode", "/web is available only in TUI mode; no service was started.");
+        if (ctx.mode !== "tui") throw new ProtocolError("unsupported_mode", "/web needs an interactive TUI session.");
+        if (process.platform === "win32") throw new ProtocolError("unsupported_platform", "/web handoff is currently supported on macOS and Linux; Windows is not validated.");
+        if (state.handoff) throw new ProtocolError("busy", "A handoff is already pending.");
+        if (!ctx.isIdle() || ctx.hasPendingMessages()) throw new ProtocolError("busy", "Wait until pi is idle and the queue is empty before handing off.");
+        const sessionFile = ctx.sessionManager.getSessionFile();
+        if (!sessionFile) throw new ProtocolError("no_session_file", "Handoff needs a saved session (not --no-session).");
+        const generation = state.generation;
+        const assertReady = (): void => {
+          if (state.handoff || generation !== state.generation) throw new ProtocolError("stale_session", "The session changed while preparing the handoff; run /web again.");
+          if (!ctx.isIdle() || ctx.hasPendingMessages()) throw new ProtocolError("busy", "Wait until pi is idle and the queue is empty before handing off.");
+        };
+        if (!runningPiRpcEntry()) throw new ProtocolError("unsupported_host", "The running pi installation must provide the pi 1.1.0 RPC entry.");
+        const argv = process.argv.slice(2);
+        childArgs(argv, sessionFile); // Fail ambiguous CLI reconstruction while the TUI still exists.
         const explicit = parseWebArgs(text);
-        // Revocation and status must remain available even when startup settings are invalid.
-        if (explicit.action === "stop") { await stop(); notify(ctx, "pi-pane stopped."); }
-        else if (explicit.action === "status") notify(ctx, state.hub?.running
-          ? `pi-pane: ${state.hub.url} · ${state.hub.connectionCount} viewer(s)${state.hub.mode === "password" ? ` · ${state.hub.loginCount} login(s) · listening on ${state.hub.listenAddress}` : ""}${state.hub.switching ? " · switching" : ""}`
-          : "pi-pane stopped.");
-        else if (explicit.action === "rotate") {
-          if (!state.hub?.running) throw new ProtocolError("not_running", "pi-pane is stopped. Run /web first.");
-          let noOpen = true;
-          try { noOpen = explicit.noOpen || flagArgs().noOpen; } catch { /* Invalid startup config cannot block revocation. */ }
-          hideQr();
-          state.hub.rotateToken(); showUrl(ctx, state.hub, noOpen);
-        } else if (explicit.action === "qr") {
-          if (!state.hub?.running) throw new ProtocolError("not_running", "pi-pane is stopped. Run /web first.");
-          showQr(ctx, state.hub);
-        } else {
-          const defaults = flagArgs();
-          const args = { ...defaults, ...explicit, noOpen: explicit.noOpen || defaults.noOpen };
-          showUrl(ctx, await start(ctx, args), args.noOpen);
-        }
-      } catch (error) { notify(ctx, error instanceof Error ? error.message : "pi-pane operation failed.", true); }
+        const config = defaults();
+        const args = { ...config, ...explicit, noOpen: explicit.noOpen || config.noOpen };
+        const external = await externalAccess(args, ctx.cwd);
+        assertReady();
+        // Validate access configuration and TLS before leaving the TUI; do not listen yet.
+        new Hub({ host: args.host ?? "127.0.0.1", port: args.port ?? 7878, webRoot, ...(external ? { external } : {}) });
+        const lock = state.lock ?? await SessionFileLock.acquire(sessionFile);
+        await lock.acceptChanges(); // TUI's own writes are complete before ownership is transferred.
+        assertReady();
+        state.lock = lock;
+        state.handoff = { sessionFile, sessionDir: ctx.sessionManager.getSessionDir(), cwd: ctx.cwd, argv,
+          theme: ctx.ui.theme, themes: ctx.ui.getAllThemes(), lock, args, external, webRoot };
+        installExitTakeover(() => runHandoff(state));
+        notify(ctx, "pi-pane: handing this session to the browser…");
+        ctx.shutdown();
+      } catch (error) { notify(ctx, error instanceof Error ? error.message : "pi-pane handoff failed.", true); }
     },
   });
+}
 
-  pi.on("session_start", async (event, ctx) => {
-    if (ctx.mode !== "tui") {
-      if (pi.getFlag("web") === true) notify(ctx, "--web is available only in TUI mode; no service was started.", true);
-      return;
-    }
-    const missing = missingHostCapabilities(pi, ctx);
-    if (missing.length) {
-      await stop();
-      notify(ctx, `pi-pane requires the pi 1.0.4 extension capabilities; missing: ${missing.join(", ")}. No service was started.`, true);
-      return;
-    }
-    if (state.implementationVersion !== IMPLEMENTATION_VERSION) {
-      await stop();
-      state.implementationVersion = IMPLEMENTATION_VERSION;
-    }
-    state.bridge?.dispose();
-    const generation = ++state.generation;
-    if (typeof ctx.sessionManager.getSessionDir === "function") rememberSessionDirectory(state, ctx.sessionManager.getSessionDir());
-    ownedContext = ctx;
-    ownedBridge = new Bridge({ pi, ctx, generation, isCurrent: () => state.generation === generation,
-      sessionCommand: sessionGateway.invoke, internalCommand: sessionGateway.commandName, sessionDirectories: state.sessionDirectories,
-      isSessionMutationPending: sessionGateway.isPending });
-    state.bridge = ownedBridge;
-    if (state.hub?.running && state.desiredRunning) {
-      state.hub.setConnectionListener(updateStatus);
-      state.hub.bindBridge(ownedBridge, event.reason);
-    }
-    if (event.reason === "startup" && !state.autoStartApplied) {
-      state.autoStartApplied = true;
-      if (pi.getFlag("web") === true) {
-        try { const args = flagArgs(); showUrl(ctx, await start(ctx, args), args.noOpen); }
-        catch (error) { notify(ctx, error instanceof Error ? error.message : "pi-pane failed to start.", true); }
+/** pi has no public foreground exit takeover hook. Intercept exactly one normal TUI exit. */
+export function installExitTakeover(run: () => Promise<number>): void {
+  const original = process.exit;
+  process.exit = ((code?: number) => {
+    process.exit = original;
+    if (code && code !== 0) { original(code); return undefined as never; }
+    void run().then((final) => original(final), () => original(1));
+    return undefined as never;
+  }) as typeof process.exit;
+}
+function write(text: string): void { try { process.stdout.write(text); } catch { /* closed terminal */ } }
+export function resumeCommand(cwd: string, sessionFile: string): string {
+  const quote = (text: string): string => `'${text.replace(/'/g, "'\\''")}'`;
+  return `cd ${quote(cwd)} && pi --session ${quote(sessionFile)}`;
+}
+async function runHandoff(state: ProcessState): Promise<number> {
+  const target = state.handoff;
+  state.handoff = undefined;
+  if (!target) return 1;
+  process.stdout.on("error", () => { /* closed terminal */ });
+  let hub: Hub | undefined;
+  let host: HandoffHost | undefined;
+  let stopRequested = false;
+  let resolveStop!: (code: number) => void;
+  const stopped = new Promise<number>((resolve) => { resolveStop = resolve; });
+  const signals: NodeJS.Signals[] = ["SIGINT", "SIGTERM", "SIGHUP"];
+  const onSignal = (): void => { stopRequested = true; resolveStop(0); };
+  for (const signal of signals) process.on(signal, onSignal);
+  let exitCode = 1;
+  try {
+    // The TUI's shutdown handlers may append final metadata before disposal.
+    // Only now is its last write finished; retain the same ownership sidecar.
+    await target.lock?.acceptChanges();
+    const attempts = target.args.port === undefined ? 20 : 1;
+    for (let attempt = 0; attempt < attempts; attempt++) {
+      hub = new Hub({ host: target.args.host ?? "127.0.0.1", port: target.args.port ?? 7878 + attempt,
+        webRoot: target.webRoot, ...(target.external ? { external: target.external } : {}),
+        onCredentialRotation: (url) => {
+          write(`\npi-pane: access credentials rotated. Existing visitors must reconnect.\n  ${url}\n`);
+          if (target.external && (process.stdout.columns ?? 0) >= qrWidth(url)) write(`${qrLines(url).join("\n")}\n`);
+        } });
+      try { await hub.start(); break; }
+      catch (error) {
+        await hub.close(); hub = undefined;
+        if ((error as NodeJS.ErrnoException).code !== "EADDRINUSE" || attempt === attempts - 1) throw error;
       }
     }
-    updateStatus();
-  });
-  pi.on("session_shutdown", async (event) => {
-    sessionGateway.cancelPending();
-    hideQr();
-    const bridge = ownedBridge;
-    if (!bridge || state.bridge !== bridge) { bridge?.dispose(); return; }
-    state.generation++;
-    state.bridge = undefined;
-    bridge.dispose();
-    ownedBridge = undefined;
-    if (event.reason === "quit") await stop();
-    else if (state.hub?.running) {
-      const hub = state.hub;
-      const generation = state.generation;
-      hub.suspend(event.reason, () => {
-        if (state.generation === generation && state.hub === hub) {
-          state.desiredRunning = false;
-          state.hub = undefined;
-        }
-      });
+    if (!hub || stopRequested) return 0;
+    state.hub = hub;
+    host = new HandoffHost(hub, target, (line) => write(`${line}\n`));
+    state.host = host;
+    await host.start();
+    if (stopRequested) return 0;
+    write(`\npi-pane: this session now runs in the browser.\n  ${hub.url}\n  Workspace: ${host.cwd}\n  Stop: Ctrl+C\n`);
+    if (hub.mode === "password") {
+      write(`  Login with PI_PANE_PASSWORD · listening on ${hub.listenAddress}\n`);
+      if ((process.stdout.columns ?? 0) >= qrWidth(hub.url)) write(`${qrLines(hub.url).join("\n")}\n  Scan to open ${hub.origin} · enter the password separately\n`);
+      else write("  Widen the terminal to display the QR code; the link above is ready.\n");
     }
-  });
-
-  const observe = pi.on as unknown as (event: string, handler: (event: { type: string; [key: string]: unknown }) => void) => () => void;
-  for (const name of [
-    "agent_start", "agent_end", "agent_settled", "turn_end", "message_start", "message_update", "message_end",
-    "tool_execution_start", "tool_execution_update", "tool_execution_end", "model_select", "thinking_level_select",
-    "ui_prompt_start", "ui_prompt_end", "session_before_compact", "session_compact", "session_compact_failed",
-    "session_before_tree", "session_tree", "session_info_changed", "input",
-  ]) observe(name, (event) => {
-    try { ownedBridge?.handleEvent(event); }
-    catch { /* Projection failures must not interrupt the host agent. Integration tests exercise this boundary. */ }
-  });
+    if (!target.args.noOpen) {
+      const executable = process.platform === "darwin" ? "open" : "xdg-open";
+      try { spawn(executable, [hub.url], { detached: true, stdio: "ignore", shell: false }).on("error", () => write("pi-pane: browser did not open; use the link above.\n")).unref(); } catch { /* URL available */ }
+    }
+    exitCode = await Promise.race([stopped, host.childExited!.then((code) => {
+      write(`\npi-pane: the RPC session host exited (${code}); stopping service. No automatic restart.\n`);
+      return 1;
+    })]);
+  } catch (error) { write(`\npi-pane: handoff failed: ${error instanceof Error ? error.message : String(error)}\n`); }
+  finally {
+    for (const signal of signals) process.off(signal, onSignal);
+    const file = host?.sessionFile ?? target.sessionFile;
+    const cwd = host?.cwd ?? target.cwd;
+    // Keep lock until the child has actually exited. A late second signal uses OS defaults.
+    try { await host?.stop(); }
+    catch (error) { exitCode = 1; write(`pi-pane: session cleanup failed: ${error instanceof Error ? error.message : String(error)}\n`); }
+    finally {
+      try { await hub?.close(); }
+      finally { await state.lock?.release(); }
+    }
+    state.lock = undefined; state.host = undefined; state.hub = undefined;
+    if (file) write(`To resume this session: ${resumeCommand(cwd, file)}\n`);
+  }
+  return exitCode;
 }

@@ -1,87 +1,79 @@
 # pi-pane
 
-在 pi 终端里输入 `/web`，浏览器就接上**正在运行的这个会话**：完整历史、实时输出、工具卡片和 diff 都会显示出来，也可以在网页里发消息（含图片）、steer、中止、切模型。终端照常可用，两边看到的是同一个会话。
+在 pi 终端里输入 `/web`，把当前会话交给浏览器：TUI 正常退出，同一进程继续在前台提供网页服务，`pi --mode rpc` 子进程负责会话写入。浏览器提供会话导航、流式对话、工具输出、图片、文件与 Git 差异面板。终端按 **Ctrl+C** 停止服务，再按恢复提示回到终端会话；关闭终端也会结束服务。
 
-![pi-pane 在浏览器中显示当前 pi 会话](https://raw.githubusercontent.com/lilibonk/pi-pane/main/docs/preview.png)
+**本文描述尚未发布的 0.2.0 源码。** npm 当前正式版本仍是 `@lilibonk/pi-pane@0.1.0`，其行为是终端与网页并行的会话镜像。0.2.0 是不兼容变化，发布由维护者执行。开发与验证基线为 pi 1.1.0、Node ≥ 22.19、macOS/Linux；Windows 暂不支持交接。实现与验收进度见 [M3 状态](docs/m3-status.md)，设计见 [设计方案](docs/design.md)。
 
-当前源码开发与验收宿主为 pi 1.1.0（Node ≥ 22.19）；历史 M0/M1 基线为 1.0.4。设计见 [docs/design.md](docs/design.md)，验收记录见 [M0](docs/m0-status.md)、[M1](docs/m1-status.md)、[M2](docs/m2-status.md)、[M1/M2 收尾](docs/m2-followup-status.md)。
+## 从 0.1.0 迁移
 
-已发布的 **npm 0.1.0** 提供当前会话镜像；pi 1.1.0 兼容回归、Qwen3.7 Max 真实模型试用和正式安装已通过，日常使用仍加载这一版。**当前分支的 M3 工作台源码尚未发布**，首批会话导航、命令发现、文件引用、Git 改动与资源面板已验收；一轮慢流重连超时仍待定位，新增源码的真实模型试用与发布尚待完成，详见 [M3 状态](docs/m3-status.md)。官方 Kimi Code 2.1.1 是对齐基准，整体对齐仍在推进；一周日常反馈继续记录在 [试用状态](docs/m2-trial-status.md)。
+- `/web` 只有交接一种行为；必须先等回复结束且待发队列为空。没有 `/web --mirror`。
+- TUI 在交接后退出；网页操作期间，终端只显示服务横幅、链接、外部访问二维码与停止提示。
+- 移除 `pi --web` 启动参数。先启动交互式 `pi`，再输入 `/web`。`--web-host`、`--web-port`、`--web-no-open`、`--web-public-origin`、`--web-tls-cert`、`--web-tls-key`、`--web-proxy` 仍是 `/web` 的配置。
+- 移除 `/web status`、`/web stop`、`/web qr`、`/web --rotate`。停止服务使用终端 Ctrl+C；二维码直接出现在外部访问横幅；网页“资源 → 能力”提供轮换凭据入口。
+- 网页输入采用 pi RPC 的展开语义：扩展命令、skill 和模板会执行或展开。pi 内置交互命令由网页拦截，打开对应面板；不支持的入口显示原因。
+- 回执新增实际 RPC `started`、`queued`、`handled` 结果；回复和工具结果仍以会话输出为准。断线后不自动重发操作。
 
-## 安装
+## 安装与源码试用
 
-通过 pi 安装：
+目前 npm 安装得到的是已发布的 **0.1.0 镜像版**：
 
 ```sh
-pi install npm:@lilibonk/pi-pane
+pi install npm:@lilibonk/pi-pane@0.1.0
 ```
 
-发布包内带预构建网页，安装时不需要构建。启动 `pi` 后输入 `/web` 即可使用；已经运行的 pi 可用 `/reload` 加载。
-
-项目已在 [GitHub](https://github.com/lilibonk/pi-pane) 公开。也可以从源码试用；下方 clone 默认获取 main，M3 功能需使用包含本批改动的源码分支：
+试用当前交接源码时，在包含 M3 改动的 checkout 构建后加载：
 
 ```sh
-git clone https://github.com/lilibonk/pi-pane.git
-cd pi-pane
 npm ci
 npm run build
 pi -e .
 ```
 
-从源码试用 M3 时，使用上述 `pi -e .`。本地包也可构建后通过 `pi install .` 安装，包含扩展和主题；已有 pi 可用 `/reload` 加载。它与已发布的 npm 0.1.0 是不同来源。
-
-本项目采用 MIT 许可证。
+启动后输入 `/web`。本地包也可通过 `pi install .` 安装；该操作会改变日常包来源，隔离验收使用临时 HOME/agent 目录。包内自带预构建网页，发布后安装不需要构建。本项目采用 MIT 许可证，公开仓库为 [lilibonk/pi-pane](https://github.com/lilibonk/pi-pane)。
 
 ## 使用
 
-| 命令 | 作用 |
+| 入口 | 行为 |
 |---|---|
-| `/web` | 启动服务（默认 `127.0.0.1:7878` 起找空闲端口）并打开浏览器 |
-| `/web --no-open`、`/web --port 7900` | 不打开浏览器；指定端口（占用即报错，不换端口） |
-| `/web status` | 地址、连接数（外部访问时还有登录数） |
-| `/web stop` | 停止服务，断开所有浏览器 |
-| `/web --rotate` | 更换链接，撤销所有登录和连接 |
-| `/web qr` | 外部访问时在终端显示链接二维码，两分钟后隐藏 |
-| `pi --web` | 启动 pi 时同时启动服务 |
+| `/web` | 空闲会话交接，默认从 `127.0.0.1:7878` 找空闲端口，打开浏览器 |
+| `/web --no-open` | 交接但不自动打开浏览器 |
+| `/web --port 7900` | 指定端口，占用即报错 |
+| 终端 Ctrl+C | 停止宿主和 RPC 子进程，打印最新 cwd 与会话文件的恢复命令 |
+| 关闭终端 | 服务和子进程随之退出 |
 
 网页里：
 
-- **Enter** 发送，**Shift+Enter** 换行；运行中 Enter 请求 followUp，**⌘/Ctrl+Enter** 请求 steer。触屏设备上 Enter 换行，用按钮发送。
-- **图片**：粘贴、拖入或点“图片”。PNG/JPEG/WebP，最多 4 张，单张 ≤ 5 MiB、合计 ≤ 10 MiB、≤ 2,000 万像素；浏览器和扩展各校验一次，损坏或超限的图片会直接报错。历史里的图片只在滚动到附近时加载，浏览器最多缓存 48 MiB。
-- 历史默认显示最近 200 条，更早的点“加载更早的消息”；超长内容可“加载全部”。
-- edit diff 会强调变更词；超大补丁保留行级着色。思考过程默认折叠，已观测的思考段显示耗时；旧历史和扩展重载前的内容不补算耗时。
-- npm 0.1.0 的网页按原文提交，不执行 slash 命令或展开模板/skill。普通消息的回执只表示“已交给 pi”，不代表已入队或成功；断线后不会自动重发。
+- 左侧会话按工作区分组，可搜索、新建、恢复、重命名、克隆。从分支树里的**用户消息之前**创建分叉，原文回到输入框；已有或编辑中的草稿保留。普通未提交草稿不跨页面刷新保留。tree 导航暂不可用，入口显示 pi RPC 缺口。
+- **Enter** 发送，**Shift+Enter** 换行；运行中 Enter 请求 followUp，**⌘/Ctrl+Enter** 请求 steer。触屏 Enter 换行，用按钮发送。运行时可中止；会话切换要求空闲、队列为空。
+- `/` 菜单显示命令、技能和模板。`/new`、`/resume`、`/fork`、`/model`、`/thinking`、`/compact`、`/settings`、`/session`、`/name`、`/clone` 转到工作台操作；`/tree`、认证、reload 等缺少对应 RPC 的入口禁用，不把它们当普通模型消息。
+- 点击 `@ 文件` 或输入 `@` 搜索当前会话 cwd 的文件，预览后“引用到消息”插入真实文本。单次最多 24 KiB，整条消息最多 64 KiB，截断会明确提示。
+- 右侧“改动”读取实际 Git 状态及暂存/未暂存/未跟踪 diff；“文件”预览 UTF-8 文本；“资源”提供可用模型、thinking、命令和能力说明。工具列表与启停等待 pi RPC 上游支持。
+- 扩展的 select、confirm、input、editor 在网页回答，支持取消、超时与重连；notify、status、widget、title、editor text 使用网页适配。自定义 TUI 组件不自动转换。
+- **图片**支持粘贴、拖入和选择 PNG/JPEG/WebP，最多 4 张；单张 ≤5 MiB、合计 ≤10 MiB、≤2,000 万像素。前后端各校验一次。历史图片懒加载，浏览器缓存最多 48 MiB。
+- 默认显示最近 200 条历史，更早点“加载更早的消息”，超长内容可“加载全部”。工具 edit diff 强调变更词；thinking 默认折叠，只显示实际观测到的耗时。
 
-### M3 源码工作台（尚未发布）
+移动端用抽屉打开会话、文件和资源面板，支持焦点约束、Escape 和返回输入框。多个网页拥有相同用户权限，命令在宿主串行执行。
 
-- 左侧按工作区显示会话，可搜索历史、新建、恢复、从消息分叉和切换分支。切换会同步到终端和所有已连接网页；运行或仍有待发消息时禁用切换。
-- 输入 `/` 查看宿主发现的命令、skill 和模板；选择条目或提交匹配的已发现命令后才走明确分派。普通消息和未发现的 slash 文本仍按字面提交。`/resume`、`/tree`、`/model`、`/settings` 等已接入对应面板；未接入的内建命令显示“请在终端使用”。
-- 点击 `@ 文件` 或输入 `@` 搜索当前工作区文件，预览后点“引用到消息”插入真实文本。单次引用最多 24 KiB，超限显示提示，发送前可在输入框检查。
-- 右侧“改动”读取实际 Git 状态，显示暂存、未暂存及未跟踪文件的差异；“文件”提供文本预览；“资源”显示可用模型、工具状态、命令与能力边界。模型选择会调用宿主；安装、认证与资源配置仍在终端完成。
-- 会话操作显示已观测的完成、失败或取消。普通 prompt 和注册命令/skill/模板的分派回执仍只确认已交给 pi；不能据此推定执行成功。返回用户消息前会恢复其文本，已有未发送草稿会保留。
+## 从其他设备访问
 
-移动端以可关闭的抽屉打开会话与文件面板，中央对话继续保留图片、followUp、steer 和中止操作。标准对话框/审批、Plan/Goal/Agent 对应能力及终端退出后的交接属于后续 M3-C/D。
+外部访问沿用 M2：**公共 HTTPS origin + 密码 + 加密传输**，不做云中继。三项缺一项不会启动：
 
-## 从其他设备访问（手机、平板）
+1. `--public-origin https://host[:port]`；
+2. 环境变量 `PI_PANE_PASSWORD`，至少 12 个字符；不接受命令行密码或 settings 密码；
+3. 同机 TLS 代理或直接 TLS：
 
-默认只监听本机。外部访问需要**同时**满足三项，缺一项都不会启动：
+```sh
+PI_PANE_PASSWORD='一个足够长的密码' pi
+/web --proxy --port 7878 --public-origin https://my-mac.tailnet-name.ts.net
+```
 
-1. 公共 HTTPS 地址：`--public-origin https://host[:port]`；
-2. 访问密码：环境变量 `PI_PANE_PASSWORD`（至少 12 个字符；只从环境变量读取，不接受命令行或设置文件）；
-3. 加密传输，二选一：
-   - **同机 TLS 代理**（推荐），例如 Tailscale Serve：服务只监听回环，由代理提供 HTTPS/WSS。
-     ```sh
-     PI_PANE_PASSWORD='一个足够长的密码' pi
-     /web --proxy --port 7878 --public-origin https://my-mac.tailnet-name.ts.net
-     ```
-     代理需把 `https://my-mac.tailnet-name.ts.net` 转发到 `http://127.0.0.1:7878`，并原样保留 `Origin` 和 `Sec-WebSocket-Protocol`（例如 `tailscale serve --bg 7878`）。
-   - **直接 TLS**：`/web --host 0.0.0.0 --port 8443 --public-origin https://pane.example.com:8443 --tls-cert cert.pem --tls-key key.pem`。证书必须能被访问设备正常验证。
+代理把公共 HTTPS 地址转发到 `http://127.0.0.1:7878`，保留 `Origin` 和 `Sec-WebSocket-Protocol`。也可用 `/web --host 0.0.0.0 --port 8443 --public-origin https://pane.example.com:8443 --tls-cert cert.pem --tls-key key.pem`；证书必须被访问设备正常验证。
 
-在任一设备打开终端给出的链接（或用 `/web qr` 扫码），再输入密码登录。链接本身不能直接连接会话；登录有效期 8 小时，可在网页“退出登录”，`/web --rotate` 或 `/web stop` 会撤销所有登录。连续输错会被限流。
+交接横幅直接显示外部链接和二维码。扫码后还需输入密码，登录有效期 8 小时；网页可退出登录或轮换凭据，轮换会撤销已有链接、登录和连接，新链接打印到交接终端。发起轮换的页面更新凭据，外部访问需重新登录。连续输错密码会被限流。
 
-## 配置
+## 配置与主题
 
-可在 pi 的 `settings.json` 中写默认值（命令参数 > 启动 flags > 设置 > 默认值）：
+配置优先级：`/web` 参数 > 启动 flags > pi 合并后的 `settings.json` > 默认值。配置本身不启动服务，扩展只读设置：
 
 ```json
 {
@@ -94,51 +86,31 @@ pi -e .
 }
 ```
 
-支持的字段：`host`、`port`、`noOpen`、`publicOrigin`、`tlsCert`、`tlsKey`、`proxy`。对应启动 flags：`--web-host`、`--web-port`、`--web-no-open`、`--web-public-origin`、`--web-tls-cert`、`--web-tls-key`、`--web-proxy`。密码不能写在设置里。配置本身不会自动启动服务；扩展只读设置，不改写。
+字段：`host`、`port`、`noOpen`、`publicOrigin`、`tlsCert`、`tlsKey`、`proxy`，对应上述 `--web-*` flags。密码不写进配置。
 
-## 主题
+网页沿用交接时的 pi 主题，包含 Markdown、代码、diff 和 `export.pageBg`。RPC 不提供 TUI 主题切换接口，交接后没有终端主题热切换承诺。包内 `pi-pane-dark` / `pi-pane-light` 可在交接前的 pi `/settings` 选择；`pi -e .` 只加载扩展，安装本地包后可同时加载主题。
 
-网页跟随 pi 当前主题，包括 Markdown、代码与 diff 配色。页面背景优先读取主题的 `export.pageBg`（支持 `vars` 引用），未提供时按深浅模式回退；面板、hover、代码背景和阴影由主题颜色在 OKLCH 空间推导。同名主题修改和仅修改 `export.pageBg` 都会自动同步。
+网页覆盖样式可编辑源码 `public/pi-pane.css` 后构建，或编辑安装包 `web-dist/pi-pane.css` 后刷新。覆盖动态主题变量需 `!important`；更新可能覆盖文件，请保留副本。
 
-包内提供 `pi-pane-dark` 和 `pi-pane-light`，在 pi 的 `/settings` → Theme 中选择。从源码以 `pi -e .` 加载时只加载扩展；要一起加载主题，可构建后用 `pi install .` 安装本地包。
+## 运行边界
 
-网页专属样式可写入源码的 `public/pi-pane.css` 再构建，或直接编辑已安装包的 `web-dist/pi-pane.css` 并刷新网页，例如 `:root { font-family: "PingFang SC", system-ui, sans-serif; }`。它在应用样式之后加载；覆盖动态主题变量需使用 `!important`。文件随包更新可能被替换，请自行保留副本。
+会话 sidecar 锁协调加载 pi-pane 的 TUI/宿主；交接时锁连续保留。上游裸 pi 不遵守该锁，宿主在空闲时检测外部会话文件变化并停止服务，但这不是能阻止任意外部程序写入的操作系统锁。RPC 子进程崩溃时停止服务并给出恢复命令，**不自动重启**；宿主退出时关闭 stdin、必要时 SIGTERM/SIGKILL 停子进程，避免残留写入者。
 
-## 安全
+当前只在 macOS/Linux 提供交接；Windows 被明确拒绝。`/web` 要求保存的 TUI 会话，`--no-session` 不可交接。启动参数重建会移除已用于 TUI 的初始位置提示词和 @文件，避免在 RPC 中重复执行；不能确定是否带值的扩展选项在退出 TUI 前报错，请改用 --flag=value。实时 attach、关闭终端后存活、后台常驻均不在本次范围。
 
-- 网页的权限与终端相同：能发消息就能让 agent 执行命令。只把链接和密码给你自己的设备。
-- 本机模式使用随机 token，放在链接的 `#` 后面，打开后即从地址栏清除。Host、Origin 精确校验，防 DNS rebinding 和跨站 WebSocket。
-- Markdown 中的原始 HTML 不执行，链接只允许 http/https/mailto，模型输出里的远程图片只显示为链接，不加载。页面设置 CSP。
+文件/Git 读取限制在当前会话 cwd，排除常见凭据与构建目录；文本预览与 diff 最多 256 KiB。Git 面板要求 cwd 是仓库根目录。模型认证、资源安装、任意 custom TUI、Plan/Goal/Agent 语义仍需后续设计。外部代理用本地 TLS 反向代理验证，未验证真实 Tailscale Serve。
 
-## 已知限制
+## 安全与验证
 
-1. 其他扩展弹出的对话框只能在终端处理，网页只提示有待处理的对话框；扩展自定义的 TUI 渲染在网页里退回通用卡片。
-2. 关掉终端，网页就断开；后台运行不在当前范围内。
-3. 普通消息及注册命令分派只能确认“已交给 pi”，无法逐条确认入队或失败原因；完整待发队列也看不到，只显示是否非空。M3 源码的会话操作另有已观测结果回执。
-4. 多个浏览器都属于同一用户，都可以提交或中止；没有只读访客或多用户隔离。
-5. 外部访问的代理路径以本地 TLS 反向代理验证，尚未用真实 Tailscale Serve 验证。
-6. M3 源码的文件面板只读 UTF-8 文本并限制在当前工作区；预览/diff 最多 256 KiB，常见凭据文件和构建目录被排除。Git 面板要求当前 cwd 即仓库根目录，暂不展示父目录仓库。
-
-## 开发与验证
+网页权限与终端用户相同，能发消息就能让 agent 执行命令。链接和密码只给可信设备。随机 token 通过 fragment 传入，打开后从地址栏清除；Host/Origin 精确校验。Markdown 原始 HTML 不执行，链接协议受限，模型远程图片只显示链接，页面有 CSP。
 
 ```sh
 npm ci
-npm run build
 npm run typecheck
 npm test
+npm run build
+PI_M0_EXTENSION=./dist/extension/index.js npm run m0:smoke
+PI_M0_EXTENSION=./dist/extension/index.js npm run m3:workbench
 ```
 
-端到端验收在临时目录中启动真实 pi TUI（PTY），使用本地确定性 provider，不调用远程模型。历史浏览器脚本使用 Playwright 驱动本机 Chrome；M3 桌面/移动端交互通过 CUA 另行验证。报告写入 `build-artifacts/`（不提交），真实模型试用单独记录。
-
-| 脚本 | 内容 |
-|---|---|
-| `m0:smoke`、`m0:browser`、`m0:boundaries`、`m0:lifecycle`、`m0:projection`、`m0:performance` | 协议、生命周期、边界与性能（M0/M1） |
-| `m1:render`、`m1:a6` | 渲染与内容安全、1,000 条消息基准 |
-| `m2:images` | 图片上传与历史图片（A9） |
-| `m2:external` | 外部访问、登录、二维码、移动端（A10/A11） |
-| `m2:install` | npm 包内容与 `pi install` 安装（A11） |
-| `m3:workbench` | pi 1.1.0 上的工作台读操作、明确命令与 skill/template 分派、会话生命周期、跨工作区、双端和重连 |
-
-脚本需要指定构建产物，例如 `PI_M0_EXTENSION=./dist/extension/index.js npm run m3:workbench`；命令与证据边界见 [tests/README.md](tests/README.md)。
-
-代码结构：`src/extension/`（Hub、Bridge、扩展入口、二维码）、`src/protocol/`（共享协议、校验、资源上限、reducer）、`src/web/`（网页）、`tests/`（单元测试与夹具）、`scripts/`（验收脚本）。
+确定性 M0–M2 回归脚本迁移为“真实 TUI → `/web` → RPC 宿主 → 网页/WS 操作”，使用临时 HOME、agent/session 目录和本地确定性 provider，不读取日常凭据、不调用远程模型。M3 生命周期与桌面/移动端 CUA 分别验证；完整命令、退役项和证据见 [tests/README.md](tests/README.md)。真实模型试用是显式 opt-in 的独立流程，不把确定性测试当作真实 provider 验收。npm 发布由维护者执行。

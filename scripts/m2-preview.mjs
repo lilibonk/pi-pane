@@ -61,7 +61,7 @@ const bridge = {
   snapshot: () => structuredClone({
     session: { id: "preview", name: "图表修复", cwd: "~/work/dashboard", leafId: "a2", branchRevision: 0, messages, olderCursor: null },
     state: { idle: true, running: false, compacting: false, hasPendingMessages: false, thinking: "medium", tools: [], uiPrompts: [], model, models: [model] },
-    theme: {}, caps: { commands: COMMANDS, images: true, promptReceipt: "dispatch_only", queueView: "boolean", terminalDialogs: true, history: "paged", content: "paged" },
+    theme: {}, caps: { commands: COMMANDS, images: true, promptReceipt: "rpc", queueView: "boolean", extensionDialogs: true, workbench: true, host: true, history: "paged", content: "paged" },
   }),
   imagePage: (messageId, index) => ({ messageId, index, mimeType: "image/png", data: image.toString("base64") }),
 };

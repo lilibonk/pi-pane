@@ -8,7 +8,8 @@ import type { Duplex } from "node:stream";
 import { WebSocket, WebSocketServer, type RawData } from "ws";
 import {
   LIMITS, PROTOCOL, WS_PATH, ProtocolError, isRecord, parseClientMessage, toWireError,
-  type Ack, type ClientMessage, type CommandEnvelope, type CommandResult, type ProjectionEvent, type ServerMessage,
+  commandArgs, type Ack, type ClientMessage, type CommandEnvelope, type CommandResult, type ProjectionEvent, type ServerMessage,
+  type ExtensionUiState, type WorkbenchAction, type WorkbenchValues,
 } from "../protocol/index.js";
 import type { Bridge } from "./bridge.js";
 
@@ -24,6 +25,14 @@ export interface ExternalAccess {
   /** Absolute lifetime of a login session. */
   authTtlMs?: number;
 }
+/** The foreground host serializes every RPC write and owns workbench metadata. */
+export interface HostHandler {
+  read(action: WorkbenchAction, args: Record<string, unknown>, revision?: number): Promise<WorkbenchValues[WorkbenchAction]>;
+  command(name: string, args: unknown, expected?: { sessionId: string; branchRevision: number; generation: number }): Promise<unknown>;
+  answer(id: string, response: Record<string, unknown>): void;
+  pendingDialogs(): unknown[];
+  uiState(): ExtensionUiState;
+}
 export interface HubOptions {
   host?: string;
   port?: number;
@@ -37,10 +46,11 @@ export interface HubOptions {
   helloTimeoutMs?: number;
   maxLoginSessions?: number;
   onConnectionCount?: (count: number) => void;
+  onCredentialRotation?: (url: string) => void;
 }
 /** A password login. Only the token digest is retained. */
 interface AuthSession { digest: string; expiresAt: number; timer?: ReturnType<typeof setTimeout> }
-interface Receipt { digest: string; ack: Ack; result?: CommandResult; sessionMutation?: boolean }
+interface Receipt { digest: string; ack: Ack; result?: CommandResult }
 interface Lease {
   id: string;
   auth?: AuthSession;
@@ -100,7 +110,6 @@ export class Hub {
   private _seq = 0;
   private _port = 0;
   private _switching = false;
-  private rebindTimer?: ReturnType<typeof setTimeout>;
   private heartbeat?: ReturnType<typeof setInterval>;
   private closePromise?: Promise<void>;
   private upgradeRate = { start: Date.now(), count: 0 };
@@ -375,7 +384,7 @@ export class Hub {
     let input: unknown;
     try { input = JSON.parse(raw.toString()); } catch { throw new ProtocolError("invalid_json", "Malformed JSON."); }
     const message = parseClientMessage(input);
-    if (message.t !== "command" && Buffer.byteLength(raw.toString()) > 8192) throw new ProtocolError("invalid_frame", "Control frame exceeds 8 KiB.");
+    if (message.t !== "command" && Buffer.byteLength(raw.toString()) > (message.t === "ui_response" ? 160 * 1024 : 8192)) throw new ProtocolError("invalid_frame", "Control frame exceeds 8 KiB.");
     if (message.t === "hello") {
       if (peer.lease) throw new ProtocolError("already_initialized", "This connection already completed hello.");
       this.pruneLeases();
@@ -398,6 +407,12 @@ export class Hub {
     }
     const lease = this.validLease(peer);
     if (message.t === "resync") { this.sendSnapshot(peer); return; }
+    if (message.t === "ui_response") {
+      if (!this.hostHandler) throw new ProtocolError("unsupported", "No dialog is open.");
+      const { t: _t, id, ...response } = message;
+      this.hostHandler.answer(id, response);
+      return;
+    }
     if (message.t === "history_page" || message.t === "content_page" || message.t === "image_page") { this.page(peer, message); return; }
     if (message.t === "workbench_query") { void this.workbench(peer, message); return; }
     if (message.clientId !== lease.id) throw new ProtocolError("client_mismatch", "Command does not belong to this connection.");
@@ -407,8 +422,6 @@ export class Hub {
       if (!Number.isSafeInteger(number) || number < 1) throw new ProtocolError("invalid_envelope", "Invalid receipt ID.");
       const receipt = lease.receipts.get(number);
       if (!receipt) throw new ProtocolError(number < lease.nextCommandNo ? "result_unavailable" : "not_seen", "No retained receipt; the host will not be called again.");
-      if (receipt.ack.epoch !== this._epoch && !(receipt.sessionMutation && receipt.result))
-        throw new ProtocolError("result_unavailable", "The session changed; this operation's result is unknown.");
       this.send(peer, receipt.ack);
       if (receipt.result) this.send(peer, receipt.result);
       return;
@@ -441,8 +454,6 @@ export class Hub {
     if (lease.nextCommandNo >= Number.MAX_SAFE_INTEGER) throw new ProtocolError("client_expired", "Command sequence exhausted; create a new client lease.");
     lease.nextCommandNo++;
     const receipt: Receipt = { digest, ack: { t: "ack", id: command.id, epoch: command.epoch, nextCommandNo: lease.nextCommandNo, status: "rejected" } };
-    receipt.sessionMutation = ["session_new", "session_switch", "session_fork", "session_tree"].includes(command.command) ||
-      (command.command === "run_command" && isRecord(command.args) && command.args.name === "new");
     lease.receipts.set(command.commandNo, receipt);
     while (lease.receipts.size > (this.options.receiptLimit ?? 128)) lease.receipts.delete(lease.receipts.keys().next().value!);
     let ackSent = false;
@@ -450,10 +461,18 @@ export class Hub {
     try {
       if (!bridge || this._switching || !bridge.isCurrent() || command.epoch !== this._epoch || command.sessionId !== bridge.sessionId || command.branchRevision !== bridge.branchRevision)
         throw new ProtocolError("stale_session", "Refresh the session snapshot before submitting.");
-      bridge.dispatch(command.command, command.args, (result) => {
-        // Session lifecycle commands report the observed command-context outcome against their original receipt.
-        // Other asynchronous completions retain the strict generation/epoch fence.
-        if (!receipt.sessionMutation && (this.boundBridge !== bridge || this._epoch !== command.epoch || !bridge.isCurrent())) return;
+      const args = commandArgs(command.command, command.args);
+      if (!this.hostHandler) throw new ProtocolError("host_unavailable", "The RPC session host is not ready.");
+      // Every RPC response belongs to its originating receipt. Epoch replacement changes
+      // reads and new submissions, never the identity of an already accepted operation.
+      const pending = command.command === "access_rotate" ? Promise.resolve(this.prepareRotation())
+        : this.hostHandler.command(command.command, args, {
+          sessionId: bridge.sessionId, branchRevision: bridge.branchRevision, generation: bridge.generation,
+        });
+      void pending.then(
+        (value) => ({ status: "completed" as const, value }),
+        (error: unknown) => ({ status: "failed" as const, error: toWireError(error) }),
+      ).then((result) => {
         receipt.result = { t: "command_result", id: command.id, epoch: command.epoch, ...result };
         if (ackSent) this.send(peer, receipt.result);
       });
@@ -476,7 +495,8 @@ export class Hub {
       if (!bridge || this._switching || !bridge.isCurrent() || message.epoch !== this._epoch ||
           message.sessionId !== bridge.sessionId || message.branchRevision !== bridge.branchRevision)
         throw new ProtocolError("stale_session", "Refresh the session snapshot before reading the workbench.");
-      const value = await bridge.workbenchQuery(message.action, message.args, message.branchRevision);
+      if (!this.hostHandler) throw new ProtocolError("host_unavailable", "The RPC session host is not ready.");
+      const value = await this.hostHandler.read(message.action, message.args, message.branchRevision);
       if (this.boundBridge !== bridge || this._switching || !bridge.isCurrent() || message.epoch !== this._epoch ||
           message.branchRevision !== bridge.branchRevision) throw new ProtocolError("stale_session", "The session changed while reading the workbench.");
       this.send(peer, { t: "workbench_result", reqId: message.reqId, epoch: message.epoch, action: message.action, value });
@@ -541,15 +561,21 @@ export class Hub {
   private broadcast(message: ServerMessage): void {
     for (const peer of this.peers) if (peer.lease) this.send(peer, message);
   }
+  private hostHandler?: HostHandler;
+  setHostHandler(handler: HostHandler | undefined): void { this.hostHandler = handler; }
+  get hosted(): boolean { return !!this.hostHandler; }
+  /** Unsequenced notices from the session host (dialogs), delivered to every authenticated viewer. */
+  notifyAll(message: ServerMessage): void { this.broadcast(message); }
   private sendSnapshot(peer: Peer): void {
     const bridge = this.boundBridge;
     if (!bridge || this._switching) { this.send(peer, { t: "switching", reason: "waiting_for_session" }); return; }
     // snapshot() and watermark capture contain no await, so incrementing events cannot interleave.
     const body = bridge.snapshot();
-    this.send(peer, { t: "snapshot", epoch: this._epoch, seq: this._seq, ...body });
+    this.send(peer, { t: "snapshot", epoch: this._epoch, seq: this._seq, ...body, ...(this.hostHandler ? { ui: this.hostHandler.uiState() } : {}) });
+    // Open dialogs follow the snapshot so a viewer that (re)connects can answer them.
+    for (const dialog of this.hostHandler?.pendingDialogs() ?? []) this.send(peer, dialog as ServerMessage);
   }
   bindBridge(bridge: Bridge, reason = "session_start"): void {
-    if (this.rebindTimer) { clearTimeout(this.rebindTimer); this.rebindTimer = undefined; }
     this.boundBridge?.setObserver(undefined);
     this.boundBridge = bridge;
     this._switching = false;
@@ -576,32 +602,25 @@ export class Hub {
     if (!this.boundBridge || this._switching) return;
     this.broadcast({ t: "event", epoch: this._epoch, seq: ++this._seq, ev: event });
   }
-  suspend(reason: string, onExpire: () => void, timeoutMs = 10_000): void {
-    this.boundBridge?.setObserver(undefined);
-    this.boundBridge = undefined;
-    this._switching = true;
-    this.broadcast({ t: "switching", reason });
-    if (this.rebindTimer) clearTimeout(this.rebindTimer);
-    this.rebindTimer = setTimeout(() => {
-      this.rebindTimer = undefined;
-      try { onExpire(); } catch { /* Cleanup must still release a Hub with no owner. */ }
-      void this.close();
-    }, timeoutMs);
-    this.rebindTimer.unref?.();
-  }
   /** Revokes the link token, every login session and every connection. */
-  rotateToken(): void {
-    this._token = randomBytes(32).toString("base64url");
+  private prepareRotation(): { url: string } {
+    const token = randomBytes(32).toString("base64url");
+    // Deliver the replacement link before revoking the initiating connection.
+    setTimeout(() => { if (this.running) this.rotateToken(token); }, 100).unref();
+    return { url: `${this.origin}/#t=${token}` };
+  }
+  rotateToken(token = randomBytes(32).toString("base64url")): void {
+    this._token = token;
     for (const session of this.authSessions.values()) clearTimeout(session.timer);
     this.authSessions.clear();
     this.leases.clear();
-    for (const peer of this.peers) { peer.socket.close(1008, "token_rotated"); peer.socket.terminate(); }
+    for (const peer of this.peers) { peer.socket.close(1008, "token_rotated"); this.terminateLater(peer); }
+    try { this.options.onCredentialRotation?.(this.url); } catch { /* Rotation still revokes access. */ }
   }
   close(): Promise<void> {
     if (this.closePromise) return this.closePromise;
     this.boundBridge?.setObserver(undefined);
     this.boundBridge = undefined;
-    if (this.rebindTimer) clearTimeout(this.rebindTimer);
     if (this.heartbeat) clearInterval(this.heartbeat);
     this._token = "";
     for (const session of this.authSessions.values()) clearTimeout(session.timer);

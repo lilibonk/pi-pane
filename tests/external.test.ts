@@ -21,11 +21,11 @@ async function until<T>(predicate: () => T | undefined | false, label: string, t
   throw new Error(`Timed out: ${label}`);
 }
 const bridge = {
-  sessionId: "fixture-session", branchRevision: 0, isCurrent: () => true, setObserver: () => {}, dispatch: () => {}, flush: () => {},
+  sessionId: "fixture-session", branchRevision: 0, isCurrent: () => true, setObserver: () => {}, flush: () => {},
   snapshot: () => ({
     session: { id: "fixture-session", cwd: "/fixture", leafId: null, branchRevision: 0, messages: [], olderCursor: null },
     state: { idle: true, running: false, compacting: false, hasPendingMessages: false, thinking: "off", models: [], tools: [], uiPrompts: [] },
-    theme: {}, caps: { commands: COMMANDS, images: true, promptReceipt: "dispatch_only", queueView: "boolean", terminalDialogs: true, history: "paged", content: "paged" },
+    theme: {}, caps: { commands: COMMANDS, images: true, promptReceipt: "rpc", queueView: "boolean", extensionDialogs: true, workbench: true, host: true, history: "paged", content: "paged" },
   }),
 } as unknown as Bridge;
 

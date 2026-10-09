@@ -1,7 +1,7 @@
 {
   "name": "pi pane",
   "stage": "M3",
-  "stageStatus": "first-increment-verified-with-followup",
+  "stageStatus": "handoff-local-acceptance-complete-unreleased",
   "m0CompletedDate": "2026-10-08",
   "m1LocalAcceptanceCompletedDate": "2026-10-08",
   "m2LocalAcceptanceCompletedDate": "2026-10-08",
@@ -21,10 +21,9 @@
   "evidenceDirectory": "build-artifacts/m2/pi-1.1-trial",
   "liveTaskStatusSource": "docs/m3-status.md",
   "nextSteps": [
-    "Exercise the unreleased M3 workbench source with a real provider",
-    "Reproduce and diagnose the recorded slow-reconnect acceptance timeout using persisted failure evidence",
-    "Resolve follow-up issues before a new npm release and formal installation verification",
-    "Continue M3-C resource writes and interactive decisions, then M3-D ownership and handoff; retain daily stability feedback"
+    "Track daily stability and upstream RPC tool/tree gaps",
+    "Design explicit support for custom TUI and Plan/Goal/Agent semantics",
+    "Maintainer reviews migration and publishes the breaking 0.2.0 release"
   ],
   "pi110CompatibilityStatus": "key-regressions-passed",
   "dailyPackageLoadStatus": "verified",
@@ -39,7 +38,7 @@
   "npmPublishAttemptStatus": "published",
   "releaseCandidateStatus": "published-and-integrity-verified",
   "publicationEvidenceDirectory": "build-artifacts/m2/npm-release",
-  "m3Status": "in-progress",
+  "m3Status": "local-handoff-acceptance-complete",
   "npmPackageName": "@lilibonk/pi-pane",
   "npmPackageVersion": "0.1.0",
   "npmPackageUrl": "https://www.npmjs.com/package/@lilibonk/pi-pane",
@@ -51,8 +50,8 @@
   "publishedRealModelTrialCompletedDate": "2026-10-09",
   "galleryLastCheckedDate": "2026-10-09",
   "formalInstallationCompletedDate": "2026-10-09",
-  "m3ImplementationStatus": "m3-a-core-b-first-increment-verified-with-followup",
-  "uiParityStatus": "first-increment-verified-full-parity-incomplete",
+  "m3ImplementationStatus": "foreground-handoff-migration-verified",
+  "uiParityStatus": "handoff-workbench-verified-with-documented-upstream-gaps",
   "uiAuditEvidenceDirectory": "build-artifacts/kimi-alignment/current",
   "m3Reference": {
     "package": "@moonshot-ai/kimi-code",
@@ -62,66 +61,241 @@
     "verifiedDate": "2026-10-09"
   },
   "m3PriorityOrder": [
-    "Workbench information architecture and capability mapping",
-    "Session, command, context and file/diff workflows",
-    "Resources, settings and interactive decisions",
-    "Ownership, handoff and recovery"
+    "Foreground handoff and one public RPC writer",
+    "Migrate workbench and extension UI",
+    "Session ownership and crash cleanup",
+    "M0-M3 regressions and actual browser QA",
+    "Isolated real-provider trial; maintainer release"
   ],
   "m3StartedDate": "2026-10-09",
-  "m3ImplementationBranch": "codex/m3-workbench",
-  "m3EvidenceDirectory": "build-artifacts/m3/workbench",
-  "m3SourcePublicationStatus": "unreleased",
-  "m3AStatus": "first-increment-verified",
-  "m3BStatus": "first-increment-verified",
-  "m3CStatus": "resource-overview-only-controls-and-decisions-pending",
-  "m3DStatus": "not-started",
+  "m3ImplementationBranch": "codex/m3-handoff",
+  "m3EvidenceDirectory": "build-artifacts/m3/handoff",
+  "m3SourcePublicationStatus": "unreleased-maintainer-publishes",
+  "m3AStatus": "workbench-desktop-mobile-verified",
+  "m3BStatus": "rpc-workbench-verified",
+  "m3CStatus": "standard-rpc-ui-verified-resource-config-incomplete",
+  "m3DStatus": "foreground-handoff-verified-12-checks",
   "m3Verification": {
     "hostVersion": "1.1.0",
     "typecheck": "passed",
     "build": "passed",
     "unitTests": {
-      "passed": 92,
-      "total": 92,
+      "passed": 121,
+      "total": 121,
       "status": "passed"
     },
-    "existingTuiSmoke": {
-      "passed": 21,
-      "total": 21,
-      "status": "passed",
-      "report": "build-artifacts/m3/smoke/smoke-report.json"
+    "frontendFocusedTests": {
+      "passed": 7,
+      "total": 7,
+      "status": "passed"
     },
-    "workbenchTui": {
-      "definedChecks": 15,
-      "passed": 15,
-      "total": 15,
-      "status": "passed-independent-final-rerun",
-      "report": "build-artifacts/m3/workbench/report.json"
+    "integration": {
+      "status": "passed",
+      "suites": {
+        "smoke": {
+          "passed": 22,
+          "total": 22
+        },
+        "boundaries": {
+          "passed": 22,
+          "total": 22
+        },
+        "lifecycle": {
+          "passed": 9,
+          "total": 9
+        },
+        "browser": {
+          "passed": 10,
+          "total": 10
+        },
+        "projection": {
+          "passed": 2,
+          "total": 2
+        },
+        "render": {
+          "passed": 7,
+          "total": 7
+        },
+        "a6": {
+          "passed": 2,
+          "total": 2
+        },
+        "images": {
+          "passed": 5,
+          "total": 5
+        },
+        "external": {
+          "passed": 6,
+          "total": 6
+        },
+        "localPackageInstallation": {
+          "passed": 4,
+          "total": 4
+        },
+        "handoff": {
+          "passed": 12,
+          "total": 12
+        },
+        "workbench": {
+          "passed": 16,
+          "total": 16
+        },
+        "performance": {
+          "passed": 3,
+          "total": 3
+        },
+        "initialTheme": {
+          "passed": 2,
+          "total": 2
+        }
+      },
+      "performance": {
+        "passed": 3,
+        "total": 3,
+        "status": "passed-quick-single-observation",
+        "report": "build-artifacts/m3/handoff/m0/performance/report.json",
+        "notCovered": [
+          "Independent web-host CPU/RSS",
+          "Reliable production tail latency or long-term leak soak",
+          "20-second overload profile"
+        ],
+        "telemetryScope": "sole RPC writer; TUI versus RPC ratios do not isolate pi-pane overhead"
+      },
+      "passed": 122,
+      "total": 122,
+      "suiteCount": 14,
+      "report": "build-artifacts/m3/handoff/regression-matrix.json"
     },
     "browser": {
-      "passed": 22,
-      "total": 22,
+      "passed": 19,
+      "total": 19,
       "status": "passed",
       "method": "CUA",
-      "widths": [1280, 843, 390],
+      "widths": [
+        1280,
+        390
+      ],
       "consoleErrors": 0,
-      "report": "build-artifacts/m3/workbench/browser-report.json"
+      "report": "build-artifacts/m3/handoff/browser-report.json",
+      "screenshots": [
+        "build-artifacts/m3/handoff/browser-desktop.png",
+        "build-artifacts/m3/handoff/browser-mobile.png",
+        "build-artifacts/m3/handoff/browser-mobile-dialog.png"
+      ],
+      "firstFailure": {
+        "name": "fork-before-first-user then clone",
+        "status": "fixed-with-regression-and-CUA-rerun",
+        "evidence": [
+          "build-artifacts/m3/handoff/browser-clone-first.png",
+          "build-artifacts/m3/handoff/browser-clone-first.txt",
+          "build-artifacts/m3/handoff/cua-empty-fork-clone-failure/"
+        ]
+      }
     },
-    "realModelCalls": 0,
-    "summary": "build-artifacts/m3/workbench/validation.json",
+    "deterministicRealModelCalls": 0,
+    "realProviderTrial": {
+      "passed": 5,
+      "total": 5,
+      "status": "passed",
+      "piVersion": "1.1.0",
+      "provider": "qwen-token-plan-cn",
+      "model": "qwen3.7-max",
+      "submittedPrompts": 3,
+      "bashExecutions": 1,
+      "pageErrors": 0,
+      "protocolErrors": 0,
+      "authenticationMode": "user-authorized-existing-auth-via-symlink",
+      "credentialContentReadOrCopiedByHarness": false,
+      "temporaryCredentialReferenceCleanup": "verified",
+      "report": "build-artifacts/m3/handoff/m2/real-model/report.json",
+      "screenshot": "build-artifacts/m3/handoff/m2/real-model/browser.png",
+      "notCovered": [
+        "Daily stability beyond this short trial",
+        "Exact provider request count, billing or retries",
+        "Real-device external HTTPS access"
+      ]
+    },
+    "a6": {
+      "passed": 2,
+      "total": 2,
+      "runs": 20,
+      "wsToRenderedP95Ms": 47.8,
+      "messages": 1000,
+      "normalizedTextCharacters": 912000,
+      "images": 0,
+      "report": "build-artifacts/m3/handoff/m1/a6/report.json"
+    },
     "cleanup": {
       "status": "verified",
-      "report": "build-artifacts/m3/workbench/cleanup.json"
-    }
+      "scope": "CUA preview and original failed fixture; real-provider temporary authentication reference separately removed",
+      "report": "build-artifacts/m3/handoff/cleanup.json"
+    },
+    "summary": "build-artifacts/m3/handoff/regression-matrix.json"
   },
-  "m3VerifiedDate": "2026-10-09",
-  "m3RealProviderTrialStatus": "pending",
+  "m3RealProviderTrialStatus": "passed-explicit-this-trial-only-authorization",
   "m3FollowUps": [
     {
-      "name": "slow-reconnect-acceptance-timeout",
-      "status": "unresolved-root-cause",
-      "report": "build-artifacts/m3/workbench/report-reconnect-first.json",
-      "evidenceLimit": "Original provider/client evidence was insufficient; passing reruns do not establish a cause",
-      "diagnostics": "Failure terminal, provider events and client state persistence added for reproduction"
+      "name": "historical-slow-reconnect-timeout",
+      "status": "historical-root-cause-unresolved-current-handoff-reconnect-passed",
+      "historicalReport": "build-artifacts/m3/workbench/report-reconnect-first.json"
     }
-  ]
+  ],
+  "historicalM3Workbench": {
+    "commit": "6196c7b",
+    "branch": "codex/m3-workbench",
+    "verification": {
+      "hostVersion": "1.1.0",
+      "typecheck": "passed",
+      "build": "passed",
+      "unitTests": {
+        "passed": 92,
+        "total": 92,
+        "status": "passed"
+      },
+      "existingTuiSmoke": {
+        "passed": 21,
+        "total": 21,
+        "status": "passed",
+        "report": "build-artifacts/m3/smoke/smoke-report.json"
+      },
+      "workbenchTui": {
+        "definedChecks": 15,
+        "passed": 15,
+        "total": 15,
+        "status": "passed-independent-final-rerun",
+        "report": "build-artifacts/m3/workbench/report.json"
+      },
+      "browser": {
+        "passed": 22,
+        "total": 22,
+        "status": "passed",
+        "method": "CUA",
+        "widths": [
+          1280,
+          843,
+          390
+        ],
+        "consoleErrors": 0,
+        "report": "build-artifacts/m3/workbench/browser-report.json"
+      },
+      "realModelCalls": 0,
+      "summary": "build-artifacts/m3/workbench/validation.json",
+      "cleanup": {
+        "status": "verified",
+        "report": "build-artifacts/m3/workbench/cleanup.json"
+      }
+    },
+    "followUps": [
+      {
+        "name": "slow-reconnect-acceptance-timeout",
+        "status": "unresolved-root-cause",
+        "report": "build-artifacts/m3/workbench/report-reconnect-first.json",
+        "evidenceLimit": "Original provider/client evidence was insufficient; passing reruns do not establish a cause",
+        "diagnostics": "Failure terminal, provider events and client state persistence added for reproduction"
+      }
+    ],
+    "status": "superseded-by-handoff-adjustment"
+  },
+  "m3SourceVersion": "0.2.0",
+  "m3LocalAcceptanceCompletedDate": "2026-10-10"
 }

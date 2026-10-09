@@ -50,7 +50,7 @@ export const LIMITS = {
 export const IMAGE_TYPES = ["image/png", "image/jpeg", "image/webp"] as const;
 export type ImageType = (typeof IMAGE_TYPES)[number];
 
-export const COMMANDS = ["prompt", "abort", "set_model", "set_thinking", "compact", "session_new", "session_switch", "session_fork", "session_tree", "run_command"] as const;
+export const COMMANDS = ["prompt", "abort", "set_model", "set_thinking", "compact", "session_new", "session_switch", "session_fork", "session_clone", "session_rename", "run_command", "access_rotate"] as const;
 export type CommandName = (typeof COMMANDS)[number];
 
 /** `total` is present when `text` is a prefix of a longer block readable through content_page. */
@@ -92,8 +92,6 @@ export interface StateView {
   idle: boolean;
   running: boolean;
   compacting: boolean;
-  /** A host control operation is pending; all write commands are temporarily blocked. */
-  mutating?: boolean;
   hasPendingMessages: boolean;
   model?: ModelView;
   thinking: string;
@@ -115,13 +113,34 @@ export interface Caps {
   commands: readonly CommandName[];
   /** Prompt image upload and on-demand history images. */
   images: boolean;
-  promptReceipt: "dispatch_only";
+  promptReceipt: "rpc";
   queueView: "boolean";
-  terminalDialogs: true;
+  extensionDialogs: true;
   history: "paged";
   content: "paged";
-  /** Omitted on hosts which cannot supply a fresh command context and workspace reads. */
-  workbench?: true;
+  workbench: true;
+  /** All session writes are owned by the foreground RPC host. */
+  host: true;
+}
+export interface ExtensionUiState {
+  revision: number;
+  statuses: Record<string, string>;
+  widgets: Record<string, { content: string[]; placement?: string }>;
+  title?: string;
+  editorText?: string;
+  /** Changes only when an extension requests editor text, independent of status updates. */
+  editorRevision?: number;
+}
+export interface UiRequest {
+  t: "ui_request";
+  id: string;
+  method: "select" | "confirm" | "input" | "editor";
+  title?: string;
+  message?: string;
+  options?: string[];
+  placeholder?: string;
+  prefill?: string;
+  expiresAt?: number;
 }
 export interface Snapshot {
   t: "snapshot";
@@ -131,6 +150,7 @@ export interface Snapshot {
   state: StateView;
   theme: Record<string, string>;
   caps: Caps;
+  ui?: ExtensionUiState;
 }
 /** Append to a text block, or replace a block. */
 export type DeltaOp =
@@ -228,6 +248,7 @@ export interface ContentPage {
 export type ClientMessage =
   | { t: "hello"; clientId?: string }
   | { t: "resync" }
+  | { t: "ui_response"; id: string; value?: string; confirmed?: boolean; cancelled?: true }
   | { t: "receipt_query"; clientId: string; id: string }
   | HistoryPageRequest
   | ContentPageRequest
@@ -241,6 +262,9 @@ export type ServerMessage =
   | { t: "session_reset"; epoch: string; sessionId: string; branchRevision: number; reason: string }
   | { t: "switching"; reason: string }
   | { t: "notice"; message: string }
+  | UiRequest
+  | ({ t: "ui_state" } & ExtensionUiState)
+  | { t: "ui_resolved"; id: string; reason?: string }
   | { t: "error"; error: WireError; nextCommandNo?: number; reqId?: string }
   | Ack
   | CommandResult
@@ -278,6 +302,10 @@ export function parseClientMessage(value: unknown): ClientMessage {
   if (value.t === "hello" && exactKeys(value, ["t", "clientId"]) &&
       (value.clientId === undefined || shortString(value.clientId))) return value as ClientMessage;
   if (value.t === "resync" && exactKeys(value, ["t"])) return { t: "resync" };
+  if (value.t === "ui_response" && exactKeys(value, ["t", "id", "value", "confirmed", "cancelled"]) && shortString(value.id) &&
+      (value.value === undefined || (typeof value.value === "string" && new TextEncoder().encode(value.value).length <= LIMITS.promptBytes)) &&
+      (value.confirmed === undefined || typeof value.confirmed === "boolean") && (value.cancelled === undefined || value.cancelled === true))
+    return value as unknown as ClientMessage;
   if (value.t === "receipt_query" && exactKeys(value, ["t", "clientId", "id"]) &&
       shortString(value.clientId) && shortString(value.id)) return value as ClientMessage;
   if (value.t === "history_page" && exactKeys(value, ["t", "reqId", "epoch", "sessionId", "branchRevision", "before"]) &&
@@ -334,16 +362,16 @@ export function commandArgs(command: string, value: unknown): Record<string, unk
   } else if (command === "session_switch") {
     if (!exactKeys(value, ["sessionId"]) || !shortString(value.sessionId)) throw new ProtocolError("invalid_args", "Provide a session ID from the catalog.");
   } else if (command === "session_fork") {
-    if (!exactKeys(value, ["entryId", "position"]) || !shortString(value.entryId) ||
-        (value.position !== undefined && value.position !== "before" && value.position !== "at"))
-      throw new ProtocolError("invalid_args", "Provide a session entry and before or at position.");
-  } else if (command === "session_tree") {
-    if (!exactKeys(value, ["entryId"]) || !shortString(value.entryId)) throw new ProtocolError("invalid_args", "Provide a session entry ID.");
+    if (!exactKeys(value, ["entryId"]) || !shortString(value.entryId))
+      throw new ProtocolError("invalid_args", "Provide a user message entry ID to fork before it.");
+  } else if (command === "session_rename") {
+    if (!exactKeys(value, ["name"]) || !shortString(value.name, 256) || !value.name.trim() || /[\u0000-\u001f\u007f]/u.test(value.name))
+      throw new ProtocolError("invalid_args", "Provide a session name up to 256 characters.");
   } else if (command === "run_command") {
     if (!exactKeys(value, ["name", "args"]) || !isCommandInvocationName(value.name) ||
         (value.args !== undefined && (typeof value.args !== "string" || new TextEncoder().encode(value.args).length > 8192)))
       throw new ProtocolError("invalid_args", "Provide a registered command name and up to 8 KiB of arguments.");
-  } else if (command === "abort" || command === "compact" || command === "session_new") {
+  } else if (["abort", "compact", "session_new", "session_clone", "access_rotate"].includes(command)) {
     if (Object.keys(value).length) throw new ProtocolError("invalid_args", "This command takes no arguments.");
   } else throw new ProtocolError("unknown_command", "Unknown command.");
   return value;

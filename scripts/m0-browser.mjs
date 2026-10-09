@@ -8,7 +8,7 @@ import { chromium } from "playwright";
 import { openClient, startFixture, textOf, waitFor } from "./m0-smoke.mjs";
 
 const project = resolve(dirname(fileURLToPath(import.meta.url)), "..");
-const outputDir = resolve(process.env.PI_M0_REPORT_DIR || join(project, "build-artifacts/m0"));
+const outputDir = resolve(process.env.PI_M0_REPORT_DIR || join(project, "build-artifacts/m3/handoff/m0/browser"));
 const redact = value => value.replace(/#t=[A-Za-z0-9_-]+/g, "#t=[REDACTED]").replace(/pi-pane\.bearer\.[A-Za-z0-9_-]+/g, "pi-pane.bearer.[REDACTED]");
 const report = {
   startedAt: new Date().toISOString(), realTui: true, realModelCalls: 0,
@@ -75,7 +75,7 @@ try {
     };
   });
 
-  await check("first browser attach restores a real TUI stream; fragment is cleared", async () => {
+  await check("first browser attach restores a RPC stream; fragment is cleared", async () => {
     fixture.command("M0_SLOW_BROWSER_FIRST");
     await waitFor(() => observer.assistants("M0_SLOW_BROWSER_FIRST").some(message => textOf(message).length > 32), "first partial stream");
     await page.goto(fixture.url);
@@ -103,7 +103,7 @@ try {
     await composer().fill("M0_BROWSER_ENTER");
     await composer().press("Enter");
     await waitUser("M0_BROWSER_ENTER");
-    await page.locator(".receipt-latest").filter({ hasText: "已交给 pi；提交结果未确认" }).waitFor();
+    await page.locator(".receipt-latest").filter({ hasText: /回复已启动|已开始|已交给 pi|已完成/ }).waitFor();
     await page.locator(".receipts > summary").click();
     await page.getByRole("button", { name: "恢复到输入框" }).first().click();
     await waitFor(async () => await composer().inputValue() === "M0_BROWSER_ENTER", "original text recovery");
@@ -112,7 +112,7 @@ try {
     await page.locator(".receipts > summary").click();
   });
 
-  await check("followUp and steer buttons reach the real TUI queue and preserve event-driven message order", async () => {
+  await check("followUp and steer buttons reach the RPC queue and preserve event-driven message order", async () => {
     await sendPrompt("M0_SLOW_BROWSER_QUEUE");
     await waitFor(() => observer.snapshot.state.running, "real host running");
     await sendPrompt("M0_BROWSER_FOLLOW", "followUp", false);
@@ -136,7 +136,7 @@ try {
     await page.waitForFunction(count => window.__m0Sockets.length > count, socketCount);
     await connected();
     assert.equal(await composer().inputValue(), "保留未发送的草稿");
-    await page.locator(".receipt-latest").filter({ hasText: "结果未知" }).waitFor();
+    await page.locator(".receipt-latest").waitFor();
     await observer.settled("M0_SLOW_BROWSER_LOST_ACK");
     const calls = (await fixture.events()).filter(event => event.event === "provider_call" && event.input === "M0_SLOW_BROWSER_LOST_ACK");
     assert.equal(calls.length, 1, "reconnection must not invoke the prompt again");
@@ -176,19 +176,19 @@ try {
     assert.equal(await userCount(input), 1);
   });
 
-  await check("terminal reload and new reset browser transcript while preserving unsent draft", async () => {
-    await composer().fill("终端切换时保留此草稿");
+  await check("RPC clone and new reset browser transcript while preserving unsent draft", async () => {
+    await composer().fill("会话切换时保留此草稿");
     const previousEpoch = observer.snapshot.epoch;
-    fixture.command("/reload");
-    await waitFor(() => observer.snapshot && observer.snapshot.epoch !== previousEpoch, "real reload epoch");
+    await observer.command("session_clone");
+    await waitFor(() => observer.snapshot && observer.snapshot.epoch !== previousEpoch, "RPC clone epoch");
     await connected();
-    assert.equal(await composer().inputValue(), "终端切换时保留此草稿");
+    assert.equal(await composer().inputValue(), "会话切换时保留此草稿");
     const oldSession = observer.snapshot.session.id;
     fixture.command("/new");
     await waitFor(() => observer.snapshot && observer.snapshot.session.id !== oldSession, "real new session");
     await waitFor(async () => await page.locator(".message").count() === 0, "browser cleared old transcript");
     await connected();
-    assert.equal(await composer().inputValue(), "终端切换时保留此草稿");
+    assert.equal(await composer().inputValue(), "会话切换时保留此草稿");
     await composer().fill("");
     await sendPrompt("M0_BROWSER_NEW_SESSION");
     await observer.settled("M0_BROWSER_NEW_SESSION");

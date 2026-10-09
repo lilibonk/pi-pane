@@ -32,7 +32,7 @@ export function useWorkbenchQuery<A extends WorkbenchAction>(state: WebState, ac
       if (!abort.signal.aborted) { setError(failure instanceof Error ? failure.message : "读取失败，请重试。"); setLoading(false); }
     });
     return () => abort.abort();
-  }, [ready, action, argKey, state.snapshot?.epoch, state.snapshot?.session.branchRevision, state.snapshot?.state.model?.provider, state.snapshot?.state.model?.id, state.snapshotCount, revision]);
+  }, [ready, action, argKey, state.snapshot?.epoch, state.snapshot?.session.branchRevision, state.snapshot?.session.name, state.snapshot?.state.model?.provider, state.snapshot?.state.model?.id, state.snapshotCount, revision]);
   return { value, loading, error, reload: () => refresh(value => value + 1) };
 }
 
@@ -90,11 +90,11 @@ function timeLabel(value: string): string {
 const sourceLabels = { builtin: "内置", extension: "扩展", skill: "技能", prompt: "模板" };
 const entryTypeLabels: Record<string, string> = { model_change: "模型切换", thinking_level_change: "思考强度", compaction: "上下文压缩", branch_summary: "分支摘要", session_info: "会话信息", custom: "扩展记录" };
 const capabilityLabels: Record<string, [string, string]> = {
-  session: ["会话导航", "可新建、恢复、跳转和分叉会话；操作会同步到终端。"],
+  session: ["会话导航", "浏览器通过 RPC 新建、恢复、重命名、克隆和分叉会话。"],
   workspace: ["工作区文件与 Git", "可查看当前工作区文件、未提交改动与文本差异。"],
-  dialogs: ["网页提问与确认", "扩展需要提问或确认时，仍需在终端处理。"],
+  dialogs: ["网页提问与确认", "扩展的选择、确认、输入和编辑对话框在网页处理。"],
   authentication: ["模型登录", "在终端运行 /login，已授权模型随后出现在这里。"],
-  "resource-management": ["资源管理", "本页可查看工具、技能与模板。安装和配置仍在终端完成。"],
+  "resource-management": ["资源管理", "可查看技能与模板；工具列表和启停需要 pi RPC 上游支持。"],
 };
 
 export interface WorkbenchController {
@@ -138,6 +138,9 @@ export function Workbench({ state, canConfigure, commands, controller, onFocusCo
   const [selectedPath, setSelectedPath] = useState("");
   const [previewMode, setPreviewMode] = useState<"file" | "diff">("diff");
   const [referenceMode, setReferenceMode] = useState(false);
+  const [renaming, setRenaming] = useState(false);
+  const [sessionName, setSessionName] = useState("");
+  const [rotateConfirm, setRotateConfirm] = useState(false);
   const leftRef = useRef<HTMLElement>(null);
   const rightRef = useRef<HTMLElement>(null);
   const toggleLeft = useRef<HTMLButtonElement>(null);
@@ -178,20 +181,20 @@ export function Workbench({ state, canConfigure, commands, controller, onFocusCo
     }
     return depths;
   }, [tree.value]);
-  useEffect(() => { setSelectedPath(""); setReferenceMode(false); }, [state.snapshot?.epoch]);
+  useEffect(() => { setSelectedPath(""); setReferenceMode(false); setRenaming(false); setRotateConfirm(false); }, [state.snapshot?.epoch]);
   useEffect(() => {
     const escape = (event: KeyboardEvent) => {
-      if (event.key !== "Escape" || !modal) return;
+      if (event.key !== "Escape" || !modal || state.dialogs.length) return;
       event.preventDefault();
       if (modal === "left") { setLeftOpen(false); requestAnimationFrame(() => toggleLeft.current?.focus()); }
       else { setRightOpen(false); requestAnimationFrame(() => toggleRight.current?.focus()); }
     };
     document.addEventListener("keydown", escape);
     return () => document.removeEventListener("keydown", escape);
-  }, [modal]);
+  }, [modal, state.dialogs.length]);
   useLayoutEffect(() => {
     const panel = modal === "left" ? leftRef.current : modal === "right" ? rightRef.current : null;
-    if (!panel) return;
+    if (!panel || state.dialogs.length) return;
     const topbar = workbenchRef.current?.parentElement?.querySelector<HTMLElement>(":scope > .topbar");
     const previousInert = topbar?.inert;
     if (topbar) topbar.inert = true;
@@ -209,7 +212,7 @@ export function Workbench({ state, canConfigure, commands, controller, onFocusCo
     };
     document.addEventListener("keydown", trap);
     return () => { document.removeEventListener("keydown", trap); if (topbar) topbar.inert = previousInert ?? false; };
-  }, [modal]);
+  }, [modal, state.dialogs.length]);
   useEffect(() => {
     if (!leftOpen) return;
     const element = leftRef.current?.querySelector<HTMLInputElement>("input");
@@ -221,7 +224,7 @@ export function Workbench({ state, canConfigure, commands, controller, onFocusCo
   function run(command: WorkbenchCommand, args = ""): boolean {
     if (!command.available) return false;
     // Picker builtins do not silently discard arguments or send their syntax to the model.
-    if (command.browserAction && args.trim()) return false;
+    if (command.browserAction && args.trim() && command.browserAction !== "rename") return false;
     switch (command.browserAction) {
       case "sessions": setLeftMode("sessions"); setLeftOpen(true); if (overlayInspector) setRightOpen(false); break;
       case "tree": setLeftMode("tree"); setLeftOpen(true); if (overlayInspector) setRightOpen(false); break;
@@ -235,6 +238,12 @@ export function Workbench({ state, canConfigure, commands, controller, onFocusCo
       case "status": setTab("resources"); setResourceTab("capabilities"); setLeftOpen(false); setRightOpen(true); focusInspector(); break;
       case "new": if (!canNavigate) return false; issueCommand("session_new"); break;
       case "compact": if (!canNavigate) return false; issueCommand("compact"); break;
+      case "clone": if (!canNavigate) return false; issueCommand("session_clone"); break;
+      case "rename":
+        if (!canNavigate) return false;
+        if (args.trim()) issueCommand("session_rename", { name: args.trim() });
+        else { setSessionName(state.snapshot?.session.name || ""); setRenaming(true); setLeftMode("sessions"); setLeftOpen(true); if (overlayInspector) setRightOpen(false); }
+        break;
       default: if (!canConfigure) return false; issueCommand("run_command", { name: command.name, args }, `/${command.name}${args ? ` ${args}` : ""}`); break;
     }
     return true;
@@ -272,6 +281,8 @@ export function Workbench({ state, canConfigure, commands, controller, onFocusCo
     <aside class="workspace-sidebar" aria-label="工作区与会话" ref={leftRef} role={modal === "left" ? "dialog" : undefined} aria-modal={modal === "left" ? true : undefined} inert={modal === "right" || (narrow && !leftOpen)} aria-hidden={modal === "right" || (narrow && !leftOpen) ? true : undefined}>
       <div class="sidebar-heading"><span>工作区</span><button type="button" class="icon-button mobile-close" aria-label="关闭会话侧栏" onClick={() => { setLeftOpen(false); requestAnimationFrame(() => toggleLeft.current?.focus()); }}><Icon name="close" /></button><button type="button" class="icon-button" aria-label="刷新会话列表" disabled={!online || sessionsRead.loading} onClick={sessions.reload}><Icon name="refresh" /></button></div>
       <button type="button" class="new-session-button" disabled={!canNavigate} onClick={() => issueCommand("session_new")}><Icon name="plus" />新建会话</button>
+      <div class="session-management"><button type="button" disabled={!canNavigate} onClick={() => { setSessionName(state.snapshot?.session.name || ""); setRenaming(value => !value); }}>重命名</button><button type="button" disabled={!canNavigate} onClick={() => issueCommand("session_clone")}>克隆会话</button></div>
+      {renaming && <form class="rename-session" onSubmit={event => { event.preventDefault(); if (canNavigate && sessionName.trim()) { issueCommand("session_rename", { name: sessionName.trim() }); setRenaming(false); } }}><input aria-label="会话名称" maxLength={256} value={sessionName} onInput={event => setSessionName(event.currentTarget.value)} placeholder="会话名称" /><button type="submit" disabled={!canNavigate || !sessionName.trim()}>保存</button><button type="button" class="quiet" onClick={() => setRenaming(false)}>取消</button></form>}
       <label class="panel-search"><Icon name="search" /><input type="search" aria-label="搜索会话" placeholder="搜索会话" value={sessionSearch} onInput={event => { setSessionSearch(event.currentTarget.value); setLeftMode("sessions"); }} /></label>
       <div class="sidebar-tabs" role="group" aria-label="会话导航"><button type="button" aria-pressed={leftMode === "sessions"} onClick={() => setLeftMode("sessions")}>会话</button><button type="button" aria-pressed={leftMode === "tree"} onClick={() => setLeftMode("tree")}><Icon name="branch" />分支树</button></div>
       <div class="sidebar-scroll">
@@ -280,17 +291,18 @@ export function Workbench({ state, canConfigure, commands, controller, onFocusCo
           {catalog.map(([cwd, items]) => <section class="workspace-group" key={cwd}><h2 title={cwd}><span class="folder-mark">▱</span>{workspaceName(cwd)}<span>{items.length}</span></h2>{items.map(item => <button type="button" class={`session-item ${item.current ? "is-current" : ""}`} aria-current={item.current ? "page" : undefined} key={item.id} title={item.name || item.firstMessage || "未命名会话"} disabled={!item.current && !canNavigate} onClick={() => { if (!item.current) issueCommand("session_switch", { sessionId: item.id }); setLeftOpen(false); focusComposer(); }}><span class="session-item-title">{item.name || item.firstMessage || "未命名会话"}</span><span class="session-item-meta">{item.current ? "当前会话" : `${item.messageCount} 条消息`}<time>{timeLabel(item.modified)}</time></span></button>)}</section>)}
           {sessions.value?.truncated && <p class="panel-message">仅显示最近的部分会话。</p>}
         </ReadState> : <ReadState read={tree}>
+          <p class="reference-note">分支树为只读。pi RPC 暂不支持 tree 导航；可从用户消息之前创建新分叉。</p>
           {!tree.value?.entries.length && <p class="panel-message">发送消息后，这里会显示会话分支。</p>}
           {tree.value?.entries.map(entry => {
             const depth = treeDepths.get(entry.id) ?? 0;
             const title = entry.label || ({ user: "你", assistant: "pi", toolResult: "工具", system: "系统" } as Record<string, string>)[entry.role || ""] || entryTypeLabels[entry.type] || entry.type;
             const preview = entry.preview === entry.type && entryTypeLabels[entry.type] ? "" : entry.preview;
-            return <div class={`tree-entry ${entry.current ? "is-current" : ""}`} key={entry.id} style={{ paddingLeft: `${10 + depth * 10}px` }}><button type="button" class="tree-target" disabled={!canNavigate || entry.current} title={`${entry.role === "user" ? "返回这条消息之前并恢复输入" : "跳转到此处"}：${preview || title}`} onClick={() => issueCommand("session_tree", { entryId: entry.id })}><span class="tree-dot" /><span><strong>{title}</strong>{preview && <span>{preview}</span>}</span></button>{entry.role === "user" && <button type="button" class="tree-fork" disabled={!canNavigate} aria-label={`从 ${entry.preview.slice(0, 40) || "这条消息"} 分叉`} title="从这条消息分叉" onClick={() => issueCommand("session_fork", { entryId: entry.id, position: "at" })}><Icon name="branch" /></button>}</div>;
+            return <div class={`tree-entry ${entry.current ? "is-current" : ""}`} key={entry.id} style={{ paddingLeft: `${10 + depth * 10}px` }}><button type="button" class="tree-target" disabled title="pi RPC 暂不支持 tree 导航"><span class="tree-dot" /><span><strong>{title}</strong>{preview && <span>{preview}</span>}</span></button>{entry.role === "user" && <button type="button" class="tree-fork" disabled={!canNavigate} aria-label={`从 ${entry.preview.slice(0, 40) || "这条消息"} 分叉`} title="从这条用户消息之前分叉，并恢复原文到输入框" onClick={() => issueCommand("session_fork", { entryId: entry.id })}><Icon name="branch" /></button>}</div>;
           })}
           {tree.value?.truncated && <p class="panel-message">分支树已截断，更多内容请在终端查看。</p>}
         </ReadState>}
       </div>
-      <div class="sidebar-footer"><p>{pendingSession || state.snapshot?.state.mutating ? "正在处理会话或模型操作…" : !canNavigate && online ? "运行或待发消息处理完后可切换。" : "会话切换会同步到终端。"}</p><button type="button" class="settings-button" onClick={() => { setTab("resources"); setRightOpen(true); setLeftOpen(false); }}><Icon name="settings" />设置与资源<Icon name="arrow" /></button></div>
+      <div class="sidebar-footer"><p>{pendingSession ? "正在处理会话或模型操作…" : !canNavigate && online ? "运行或待发消息处理完后可切换。" : "浏览器管理当前会话；终端 Ctrl+C 停止服务。"}</p><button type="button" class="settings-button" onClick={() => { setTab("resources"); setRightOpen(true); setLeftOpen(false); }}><Icon name="settings" />设置与资源<Icon name="arrow" /></button></div>
     </aside>
     <main class="conversation-panel" inert={!!modal} aria-hidden={modal ? true : undefined}>
       <div class="workbench-controls"><button type="button" class="icon-button sidebar-toggle" ref={toggleLeft} aria-label="打开工作区与会话" aria-expanded={leftOpen} onClick={() => { setLeftOpen(!leftOpen); if (!leftOpen && matchMedia("(max-width: 1100px)").matches) setRightOpen(false); }}><Icon name="menu" /></button><span title={currentCwd}>{workspaceName(currentCwd)}</span><button type="button" class="inspect-toggle" ref={toggleRight} aria-expanded={rightOpen} onClick={() => { setRightOpen(!rightOpen); setLeftOpen(false); }}><Icon name="panel" />{rightOpen ? "收起面板" : "文件与改动"}</button></div>
@@ -306,10 +318,10 @@ export function Workbench({ state, canConfigure, commands, controller, onFocusCo
         {tab === "files" && <><label class="panel-search inspector-search"><Icon name="search" /><input type="search" placeholder="查找工作区文件" aria-label="查找工作区文件" value={fileSearch} onInput={event => setFileSearch(event.currentTarget.value)} /></label>{referenceMode && <p class="reference-note">选择文件并将真实内容引用到消息。</p>}<ReadState read={filesRead}><div class="file-list">{files.value?.files.filter(item => item.type !== "directory").map(item => <button type="button" class={`file-item ${selectedPath === item.path ? "is-current" : ""}`} key={item.path} onClick={() => choosePath(item.path, "file")} title={item.path}><Icon name="file" /><span>{item.path}</span></button>)}</div>{!files.value?.files.some(item => item.type !== "directory") && <p class="panel-message">没有匹配的文件。</p>}{files.value?.truncated && <p class="panel-message">文件列表已截断；可在终端查看其他文件。</p>}</ReadState></>}
         {selectedPath && tab !== "resources" && <section class="file-preview" aria-label="文件预览"><div class="preview-heading"><span title={selectedPath}>{selectedPath}</span><button type="button" class="icon-button" aria-label="关闭文件预览" onClick={() => setSelectedPath("")}><Icon name="close" /></button></div><div class="preview-actions">{tab === "changes" && <button type="button" aria-pressed={previewMode === "diff"} onClick={() => setPreviewMode(previewMode === "diff" ? "file" : "diff")}>{previewMode === "diff" ? "查看文件" : "查看差异"}</button>}{previewMode === "file" && <button type="button" disabled={!file.value || !!file.value.binary} onClick={referenceFile}>引用到消息</button>}</div>{previewMode === "diff" ? <ReadState read={diff}>{diff.value?.text ? <Diff patch={diff.value.text} /> : <p class="panel-message">没有可显示的文本差异。新文件可点“查看文件”。</p>}{diff.value?.truncated && <p class="reference-note">差异过大，只显示前面的片段。</p>}</ReadState> : <ReadState read={file}>{file.value?.binary ? <p class="panel-message">此文件是二进制文件，无法预览文本。</p> : file.value && <FileCode value={file.value} />}{file.value?.truncated && <p class="reference-note">文件过大，只显示预览片段。引用时会标明截断。</p>}</ReadState>}</section>}
         {tab === "resources" && <><div class="panel-heading"><span>设置与资源</span><button type="button" class="icon-button" aria-label="刷新资源" disabled={!online || resources.loading} onClick={resources.reload}><Icon name="refresh" /></button></div><div class="resource-tabs" role="group" aria-label="资源类型">{([['models', '模型'], ['tools', '工具'], ['commands', '命令'], ['capabilities', '能力']] as const).map(([name, label]) => <button type="button" key={name} aria-pressed={resourceTab === name} onClick={() => setResourceTab(name)}>{label}</button>)}</div><ReadState read={resources}>
-          {resourceTab === "models" && <><p class="resource-note">当前 pi 可用的模型。选择模型会同步到终端。</p>{resources.value?.models.map(model => <button type="button" class={`resource-item model-resource ${state.snapshot?.state.model?.provider === model.provider && state.snapshot?.state.model?.id === model.id ? "is-current" : ""}`} key={`${model.provider}:${model.id}`} disabled={!canConfigure} onClick={() => issueCommand("set_model", { provider: model.provider, id: model.id })}><strong>{model.name || model.id}</strong><span>{model.provider} · {model.id}</span>{state.snapshot?.state.model?.provider === model.provider && state.snapshot?.state.model?.id === model.id && <small>当前模型</small>}</button>)}{!resources.value?.models.length && <p class="panel-message">没有可用模型，请先在 pi 中登录或配置 provider。</p>}</>}
-          {resourceTab === "tools" && <>{resources.value?.tools.map(tool => <div class="resource-item" key={tool.name}><strong>{tool.name}<span class={`resource-status ${tool.active ? "active" : ""}`}>{tool.active ? "已启用" : "未启用"}</span></strong><p>{tool.description}</p>{tool.source && <span>{tool.source}</span>}</div>)}{!resources.value?.tools.length && <p class="panel-message">当前会话没有可用工具。</p>}</>}
+          {resourceTab === "models" && <><p class="resource-note">当前 RPC 会话可用的模型。选择后用于后续回复。</p>{resources.value?.models.map(model => <button type="button" class={`resource-item model-resource ${state.snapshot?.state.model?.provider === model.provider && state.snapshot?.state.model?.id === model.id ? "is-current" : ""}`} key={`${model.provider}:${model.id}`} disabled={!canConfigure} onClick={() => issueCommand("set_model", { provider: model.provider, id: model.id })}><strong>{model.name || model.id}</strong><span>{model.provider} · {model.id}</span>{state.snapshot?.state.model?.provider === model.provider && state.snapshot?.state.model?.id === model.id && <small>当前模型</small>}</button>)}{!resources.value?.models.length && <p class="panel-message">没有可用模型，请先在 pi 中登录或配置 provider。</p>}</>}
+          {resourceTab === "tools" && <>{resources.value?.tools.map(tool => <div class="resource-item" key={tool.name}><strong>{tool.name}<span class={`resource-status ${tool.active ? "active" : ""}`}>{tool.active ? "已启用" : "未启用"}</span></strong><p>{tool.description}</p>{tool.source && <span>{tool.source}</span>}</div>)}{!resources.value?.tools.length && <p class="panel-message">工具列表与启停需要 pi RPC 上游支持；交接模式暂不提供。</p>}</>}
           {resourceTab === "commands" && <>{(resources.value?.commands || commands).map((command, index) => <button type="button" class="resource-item command-resource" key={`${command.source}:${command.name}:${index}`} disabled={!command.available} title={command.reason} onClick={() => { setDraft(`/${command.name} `); if (overlayInspector) setRightOpen(false); focusComposer(); }}><strong>/{command.name}<span class="source-chip">{sourceLabels[command.source]}</span></strong><p>{command.description}</p>{!command.available && <span>{command.reason || "请在终端使用"}</span>}</button>)}</>}
-          {resourceTab === "capabilities" && <>{resources.value?.capabilities.map(capability => <div class="resource-item" key={capability.name}><strong>{capabilityLabels[capability.name]?.[0] || capability.name}<span class={`resource-status ${capability.available ? "active" : ""}`}>{capability.available ? "可用" : "待接入"}</span></strong><p>{capabilityLabels[capability.name]?.[1] || capability.detail}</p></div>)}</>}
+          {resourceTab === "capabilities" && <>{state.snapshot?.caps.commands.includes("access_rotate") && <div class="resource-item"><strong>访问凭据</strong><p>轮换后，已有链接与其他访客登录会失效。新链接会显示在交接终端。</p>{rotateConfirm ? <div class="rotate-confirm" role="group" aria-label="确认轮换访问凭据"><button type="button" disabled={!online} onClick={() => { issueCommand("access_rotate"); setRotateConfirm(false); }}>确认轮换</button><button type="button" class="quiet" onClick={() => setRotateConfirm(false)}>取消</button></div> : <button type="button" disabled={!online} onClick={() => setRotateConfirm(true)}>轮换凭据</button>}</div>}{resources.value?.capabilities.map(capability => <div class="resource-item" key={capability.name}><strong>{capabilityLabels[capability.name]?.[0] || capability.name}<span class={`resource-status ${capability.available ? "active" : ""}`}>{capability.available ? "可用" : "待接入"}</span></strong><p>{capability.detail || capabilityLabels[capability.name]?.[1]}</p></div>)}</>}
         </ReadState></>}
         {!state.snapshot?.caps.workbench && <p class="panel-message">当前 pi-pane 主机尚未提供工作台能力，请更新扩展并重新加载 pi。</p>}
       </div>

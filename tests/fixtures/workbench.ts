@@ -15,7 +15,7 @@ export default function workbenchFixture(pi: ExtensionAPI): void {
     }
   });
   pi.registerCommand("m3-delay-next", {
-    description: "M3 fixture: hold the next session switch to verify the write barrier.",
+    description: "M3 fixture: hold the next session switch to verify host serialization and scope fencing.",
     handler: async () => {
       delayNextSwitch = true;
       const path = process.env.PI_M0_EVENTS_PATH;

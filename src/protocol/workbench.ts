@@ -27,13 +27,14 @@ export interface WorkbenchCommand {
   name: string; description: string; source: "builtin" | "extension" | "skill" | "prompt";
   available: boolean; terminalOnly?: boolean; reason?: string;
   /** A workbench picker can present these builtins without sending a plain slash to the model. */
-  browserAction?: "new" | "sessions" | "tree" | "model" | "thinking" | "compact" | "resources" | "status";
+  browserAction?: "new" | "sessions" | "tree" | "model" | "thinking" | "compact" | "resources" | "status" | "rename" | "clone";
 }
 export interface CommandsView { commands: WorkbenchCommand[] }
 export interface ResourceTool { name: string; description: string; active: boolean; source?: string; exposure?: string }
 export interface ResourcesView {
   tools: ResourceTool[]; commands: WorkbenchCommand[];
   models: { provider: string; id: string; name: string }[];
+  thinkingLevels?: string[];
   capabilities: { name: string; available: boolean; detail: string }[];
 }
 export interface SessionTreeItem { id: string; parentId: string | null; type: string; role?: string; preview: string; timestamp?: string; label?: string; current: boolean }
@@ -50,8 +51,9 @@ export interface WorkbenchValues {
 export interface WorkbenchMutationArgs {
   session_new: Record<string, never>;
   session_switch: { sessionId: string };
-  session_fork: { entryId: string; position?: "before" | "at" };
-  session_tree: { entryId: string };
+  session_fork: { entryId: string };
+  session_clone: Record<string, never>;
+  session_rename: { name: string };
   run_command: { name: string; args?: string };
 }
 /** The initiating receipt can outlive an epoch reset; draft restoration must match this scope. */

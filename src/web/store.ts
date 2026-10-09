@@ -1,12 +1,13 @@
 import { createStore } from "zustand/vanilla";
-import type { CommandName, ImageType, MessageView, PromptImage, Snapshot } from "../protocol/index.js";
+import type { CommandName, ExtensionUiState, ImageType, MessageView, PromptImage, Snapshot } from "../protocol/index.js";
 import { IMAGE_TYPES, LIMITS, applyProjectionEvent, boundedTools, decodeBase64, encodedSize, inspectImage, isTextContent, mergeOlderPage } from "../protocol/index.js";
 import type { WorkbenchAction, WorkbenchValues } from "../protocol/workbench.js";
-import { TreeDraftRecovery } from "./draft-recovery.js";
+import { ForkDraftRecovery } from "./draft-recovery.js";
+import { EditorChangeGuard, extensionText } from "./ui-state.js";
 export type { ContentView, MessageView, Snapshot, ToolView } from "../protocol/index.js";
 
 export type Connection = "connecting" | "login" | "online" | "resyncing" | "switching" | "disconnected" | "fatal";
-type ReceiptStatus = "sent" | "dispatched" | "rejected" | "unknown" | "completed" | "cancelled" | "failed";
+type ReceiptStatus = "sent" | "dispatched" | "started" | "queued" | "handled" | "rejected" | "unknown" | "completed" | "cancelled" | "failed";
 export interface Submission {
   id: string;
   epoch: string;
@@ -26,6 +27,7 @@ export interface Attachment { id: string; name: string; mimeType: ImageType; byt
 /** A history image read through image_page, keyed by `${messageId}#${index}`. */
 export interface LoadedImage { status: "loading" | "ready" | "error"; url?: string; error?: string }
 
+export interface Dialog { id: string; method: "select" | "confirm" | "input" | "editor"; title?: string; message?: string; options?: string[]; placeholder?: string; prefill?: string; expiresAt?: number }
 export interface WebState {
   connection: Connection;
   notice: string;
@@ -47,6 +49,9 @@ export interface WebState {
   attachments: Attachment[];
   attachmentError: string;
   images: Record<string, LoadedImage>;
+  /** Extension requests pending in the foreground RPC host. */
+  dialogs: Dialog[];
+  ui: ExtensionUiState | null;
 }
 
 export const webStore = createStore<WebState>(() => ({
@@ -68,6 +73,8 @@ export const webStore = createStore<WebState>(() => ({
   attachments: [],
   attachmentError: "",
   images: {},
+  dialogs: [],
+  ui: null,
 }));
 
 const TOKEN_KEY = "pi-pane.token";
@@ -83,12 +90,14 @@ let stopped = false;
 let authToken = "";
 let sessionToken = "";
 let opened = false;
+let pendingCredentialRotation = false;
 let requestNo = 0;
 let historyRequest: string | undefined;
 const contentRequests = new Map<string, string>();
 const workbenchRequests = new Map<string, { epoch: string; action: WorkbenchAction; resolve: (value: any) => void; reject: (error: Error) => void; dispose: () => void }>();
-const treeDraftRecovery = new TreeDraftRecovery();
+const forkDraftRecovery = new ForkDraftRecovery();
 let draftRevision = 0;
+const editorChanges = new EditorChangeGuard();
 let assembling: { id: string; parts: number; chunks: string[] } | undefined;
 
 function readSession(key: string): string | null {
@@ -130,14 +139,14 @@ async function detectAuthMode(): Promise<"local" | "password"> {
   return body.mode === "password" ? "password" : "local";
 }
 function requireLogin(notice: string) {
-  treeDraftRecovery.cancel();
+  forkDraftRecovery.cancel();
   cancelWorkbenchReads();
   stopped = true;
   sessionToken = "";
   clearSession(SESSION_KEY);
   clearSession(CLIENT_KEY);
-  webStore.setState({ connection: authToken ? "login" : "fatal", clientId: null, loginBusy: false,
-    notice: authToken ? notice : "缺少访问链接。请使用终端 /web 给出的链接或 /web qr 的二维码打开。" });
+  webStore.setState({ connection: authToken ? "login" : "fatal", clientId: null, loginBusy: false, dialogs: [],
+    notice: authToken ? notice : "缺少访问链接。请使用终端 /web 给出的链接或 交接横幅的二维码打开。" });
 }
 export async function login(password: string) {
   if (!authToken || webStore.getState().loginBusy) return;
@@ -188,7 +197,7 @@ function uncertainSubmissions(epoch?: string) {
   webStore.setState(state => ({
     submissions: state.submissions.map(item =>
       (item.status === "sent" || (epoch && item.epoch !== epoch && item.status === "dispatched"))
-        ? { ...item, status: "unknown", explanation: "连接或会话已改变；结果未知。请检查终端，勿直接重复发送。" }
+        ? { ...item, status: "unknown", explanation: "连接或会话已改变；结果未知。请检查会话和提交记录，勿直接重复发送。" }
         : item,
     ),
   }));
@@ -202,7 +211,7 @@ function send(frame: unknown): boolean {
 
 function resync(message: string) {
   if (webStore.getState().connection === "resyncing") return;
-  treeDraftRecovery.cancel();
+  forkDraftRecovery.cancel();
   resetReads();
   webStore.setState({ connection: "resyncing", notice: message });
   send({ t: "resync" });
@@ -269,13 +278,22 @@ function capHistory(snapshot: Snapshot): Snapshot {
   return { ...snapshot, session: { ...snapshot.session, messages: kept, olderCursor: cursor } };
 }
 
-function restoreTreeDraft() {
+function restoreForkDraft() {
   const state = webStore.getState();
   if (state.connection !== "online" || !state.snapshot) return;
-  const recovery = treeDraftRecovery.reconcile(state.snapshot.session, state.draft, draftRevision);
+  const recovery = forkDraftRecovery.reconcile(state.snapshot.session, state.draft, draftRevision);
   if (!recovery) return;
   if (recovery.restore) setDraft(recovery.text);
-  else webStore.setState({ notice: "已返回所选消息之前。原输入保存在提交记录中，可点“恢复到输入框”；当前草稿已保留。" });
+  else webStore.setState({ notice: "已从所选用户消息之前创建分叉。原输入保存在提交记录中，可点“恢复到输入框”；当前草稿已保留。" });
+}
+
+function applyUiState(ui: ExtensionUiState | undefined, epoch: string) {
+  if (!ui) { webStore.setState({ ui: null }); return; }
+  if (!Number.isSafeInteger(ui.revision) || !ui.statuses || !ui.widgets) return;
+  webStore.setState({ ui });
+  if (typeof document !== "undefined") document.title = extensionText(ui.title || "pi-pane");
+  const editorText = editorChanges.read(epoch, ui);
+  if (editorText !== undefined) setDraft(editorText);
 }
 
 function handleFrame(raw: unknown) {
@@ -295,7 +313,9 @@ function handleFrame(raw: unknown) {
       resetReads();
       const snapshot = capHistory({ ...frame, state: { ...frame.state, tools: boundedTools(frame.state.tools) } } as Snapshot);
       webStore.setState(state => ({ snapshot, lastAppliedSeq: frame.seq, connection: "online", notice: "", snapshotCount: state.snapshotCount + 1 }));
-      restoreTreeDraft();
+      webStore.setState({ dialogs: [] });
+      applyUiState(snapshot.ui, snapshot.epoch);
+      restoreForkDraft();
       attempt = 0;
       break;
     }
@@ -366,11 +386,11 @@ function handleFrame(raw: unknown) {
     case "session_reset":
       uncertainSubmissions(frame.epoch);
       resetReads();
-      webStore.setState({ snapshot: null, lastAppliedSeq: 0, connection: "switching", notice: "终端已切换会话或分支，等待新快照…" });
+      webStore.setState({ snapshot: null, lastAppliedSeq: 0, connection: "switching", notice: "会话已切换，等待新快照…" });
       break;
     case "switching":
       cancelWorkbenchReads();
-      webStore.setState({ connection: "switching", notice: "终端正在切换会话，写操作暂时暂停…" });
+      webStore.setState({ connection: "switching", notice: "宿主正在切换会话，写操作暂时暂停…" });
       break;
     case "ack": {
       if (typeof frame.id !== "string") throw new Error("ack id");
@@ -379,20 +399,42 @@ function handleFrame(raw: unknown) {
         status: frame.status === "dispatched" ? "dispatched" : "rejected",
         explanation: frame.error?.message,
       });
-      if (frame.status !== "dispatched") treeDraftRecovery.cancel(frame.id);
+      if (frame.status !== "dispatched") forkDraftRecovery.cancel(frame.id);
       break;
     }
     case "command_result": {
       const submission = current.submissions.find(item => item.id === frame.id);
-      const restored = submission?.command === "session_tree" && frame.status === "completed" && typeof frame.value?.draftText === "string" ? frame.value.draftText as string : undefined;
-      updateSubmission(frame.id, { status: frame.status === "completed" ? frame.value?.cancelled === true ? "cancelled" : "completed" : "failed", explanation: frame.error?.message });
+      const restored = submission?.command === "session_fork" && frame.status === "completed" && typeof frame.value?.draftText === "string" ? frame.value.draftText as string : undefined;
+      updateSubmission(frame.id, { status: frame.status === "completed" ? frame.value?.cancelled === true ? "cancelled" : ["started", "queued", "handled"].includes(frame.value?.disposition ?? frame.value?.status) ? (frame.value.disposition ?? frame.value.status) : "completed" : "failed", explanation: frame.error?.message });
+      if (submission?.command === "access_rotate" && frame.status === "completed" && typeof frame.value?.url === "string") {
+        try {
+          const rotated = new URL(frame.value.url, location.href);
+          const token = new URLSearchParams(rotated.hash.slice(1)).get("t");
+          if (token && /^[A-Za-z0-9_-]+$/.test(token)) {
+            authToken = token; saveSession(TOKEN_KEY, token); sessionToken = "";
+            clearSession(SESSION_KEY); clearSession(CLIENT_KEY); pendingCredentialRotation = true;
+            webStore.setState({ clientId: null, notice: "访问凭据已轮换，正在更新本页连接。其他访客需使用交接终端的新链接。" });
+          }
+        } catch { webStore.setState({ notice: "访问凭据已轮换，请使用交接终端的新链接重新打开。" }); }
+      }
       if (restored !== undefined) {
         updateSubmission(frame.id, { text: restored });
-        treeDraftRecovery.complete(frame.id, frame.value);
-        restoreTreeDraft();
-      } else treeDraftRecovery.cancel(frame.id);
+        forkDraftRecovery.complete(frame.id, frame.value);
+        restoreForkDraft();
+      } else forkDraftRecovery.cancel(frame.id);
       break;
     }
+    case "ui_state":
+      if (current.snapshot) applyUiState(frame as ExtensionUiState, current.snapshot.epoch);
+      break;
+    case "ui_request":
+      if (typeof frame.id === "string" && !current.dialogs.some(dialog => dialog.id === frame.id))
+        webStore.setState({ dialogs: [...current.dialogs, frame as unknown as Dialog] });
+      break;
+    case "ui_resolved":
+      webStore.setState({ dialogs: current.dialogs.filter(dialog => dialog.id !== frame.id),
+        ...(frame.reason === "timeout" ? { notice: "扩展请求已超时。" } : frame.reason === "session_changed" ? { notice: "会话已变化，扩展请求已取消。" } : {}) });
+      break;
     case "notice":
       webStore.setState({ notice: frame.message ?? frame.notice ?? "请检查终端提示。" });
       break;
@@ -423,7 +465,7 @@ function handleFrame(raw: unknown) {
       }
       if (Number.isSafeInteger(frame.nextCommandNo)) webStore.setState({ nextCommandNo: frame.nextCommandNo });
       if (code === "client_expired" || code === "unauthorized") {
-        treeDraftRecovery.cancel();
+        forkDraftRecovery.cancel();
         stopped = true;
         uncertainSubmissions();
         webStore.setState({ connection: "fatal", notice: message });
@@ -487,6 +529,7 @@ function connect() {
   ws.onopen = () => {
     if (socket !== ws) return;
     opened = true;
+    pendingCredentialRotation = false;
     // Measured by the A6 benchmark: WS open → snapshot applied and rendered.
     try { performance.clearMarks("pi-pane:snapshot-rendered"); performance.mark("pi-pane:ws-open"); } catch { /* optional */ }
     send({ t: "hello", ...(readSession(CLIENT_KEY) ? { clientId: readSession(CLIENT_KEY) } : {}) });
@@ -501,7 +544,7 @@ function connect() {
     const wasOpen = opened;
     socket = null;
     assembling = undefined;
-    treeDraftRecovery.cancel();
+    forkDraftRecovery.cancel();
     uncertainSubmissions();
     cancelWorkbenchReads();
     if (stopped) return;
@@ -518,13 +561,23 @@ function connect() {
       webStore.setState({ connection: "fatal", notice: "当前状态超过单帧资源上限，请在终端查看当前会话。" });
       return;
     }
+    if (pendingCredentialRotation) {
+      pendingCredentialRotation = false; stopped = false; attempt = 0;
+      // The host may have to terminate a slow socket before its close reason arrives.
+      // Wait past the rotation activation delay before using the replacement credential.
+      retryTimer = setTimeout(() => {
+        if (mode === "password") requireLogin("访问凭据已轮换。请重新输入访问密码；本页已更新为新凭据。");
+        else connect();
+      }, 150);
+      return;
+    }
     if (event.reason === "token_rotated") {
       stopped = true;
       clearSession(TOKEN_KEY);
       clearSession(SESSION_KEY);
       authToken = "";
       sessionToken = "";
-      webStore.setState({ connection: "fatal", notice: "访问凭据已轮换。请在终端运行 /web（或 /web qr），打开新的链接。" });
+      webStore.setState({ connection: "fatal", notice: "访问凭据已轮换。请在终端运行 /web，打开新的链接。" });
       return;
     }
     if (event.code === 4401) {
@@ -564,7 +617,7 @@ export function startConnection() {
 }
 
 export function reconnect() {
-  treeDraftRecovery.cancel();
+  forkDraftRecovery.cancel();
   cancelWorkbenchReads();
   clearTimeout(retryTimer);
   socket?.close();
@@ -587,6 +640,12 @@ if (typeof document !== "undefined") document.addEventListener("visibilitychange
 
 export function setDraft(draft: string) { draftRevision++; webStore.setState({ draft }); }
 
+export function answerDialog(id: string, response: { value?: string; confirmed?: boolean; cancelled?: true }) {
+  if (typeof response.value === "string" && new TextEncoder().encode(response.value).byteLength > 65536) {
+    webStore.setState({ notice: "对话框输入超过 64 KiB，请缩短后再提交。" }); return;
+  }
+  if (webStore.getState().connection === "online" && send({ t: "ui_response", id, ...response })) webStore.setState(state => ({ dialogs: state.dialogs.filter(dialog => dialog.id !== id) }));
+}
 export function issueCommand(command: CommandName, args: Record<string, unknown> = {}, text?: string, mode?: "followUp" | "steer") {
   const state = webStore.getState();
   const snapshot = state.snapshot;
@@ -598,8 +657,8 @@ export function issueCommand(command: CommandName, args: Record<string, unknown>
     ...(attached.length ? { images: attached.map(item => item.name) } : {}) };
   if (!send({ t: "command", clientId: state.clientId, commandNo, id, epoch: snapshot.epoch,
     sessionId: snapshot.session.id, branchRevision: snapshot.session.branchRevision, command, args })) return;
-  if (command.startsWith("session_")) treeDraftRecovery.cancel();
-  if (command === "session_tree") treeDraftRecovery.start(id, snapshot.session, draftRevision);
+  if (command.startsWith("session_")) forkDraftRecovery.cancel();
+  if (command === "session_fork") forkDraftRecovery.start(id, snapshot.session, draftRevision);
   webStore.setState({
     notice: "",
     nextCommandNo: commandNo + 1,
@@ -610,8 +669,8 @@ export function issueCommand(command: CommandName, args: Record<string, unknown>
   setTimeout(() => {
     const item = webStore.getState().submissions.find(entry => entry.id === id);
     if (item?.status === "sent") {
-      treeDraftRecovery.cancel(id);
-      updateSubmission(id, { status: "unknown", explanation: "尚未收到回执，请检查终端。原文已保留；不会自动重发。" });
+      forkDraftRecovery.cancel(id);
+      updateSubmission(id, { status: "unknown", explanation: "尚未收到回执，请检查会话和提交记录。原文已保留；不会自动重发。" });
     }
   }, 15_000);
 }
@@ -748,13 +807,13 @@ export function retryImage(messageId: string, index: number) {
 }
 
 export function queryReceipt(id: string) {
-  treeDraftRecovery.cancel(id);
+  forkDraftRecovery.cancel(id);
   const clientId = webStore.getState().clientId;
   if (clientId) send({ t: "receipt_query", clientId, id });
 }
 
 export function forgetSubmission(id: string) {
-  treeDraftRecovery.cancel(id);
+  forkDraftRecovery.cancel(id);
   webStore.setState(state => ({ submissions: state.submissions.filter(item => item.id !== id) }));
 }
 

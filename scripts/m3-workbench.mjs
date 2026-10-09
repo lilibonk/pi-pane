@@ -7,17 +7,22 @@ import { randomUUID } from "node:crypto";
 import { openClient, waitFor, textOf } from "./m0-smoke.mjs";
 import { startWorkbenchFixture } from "./m3-fixture.mjs";
 
-const out = resolve(process.env.PI_M3_REPORT_DIR || "build-artifacts/m3/workbench");
+const out = resolve(process.env.PI_M3_REPORT_DIR || "build-artifacts/m3/handoff/workbench");
 const serve = process.argv.includes("--serve");
 const redact = value => String(value).replace(/#t=[A-Za-z0-9_-]+/g, "#t=[REDACTED]").replace(/pi-pane\.bearer\.[A-Za-z0-9_-]+/g, "pi-pane.bearer.[REDACTED]");
 await mkdir(out, { recursive: true });
 const report = { startedAt: new Date().toISOString(), realTui: true, realModelCalls: 0,
   isolation: "Task-owned HOME, agent directory, session directory and Git workspace; credential-free deterministic provider",
-  checks: [], limitations: ["No remote provider calls", "Interactive approvals/settings mutations and process handoff are separate M3-C/D work"] };
-let fixture, client, observer;
+  checks: [], limitations: ["No remote provider calls", "Resource tool controls and native tree navigation await pi RPC support"] };
+let fixture, client, observer, preserveFixture = false;
 const cleanup = async () => {
   await Promise.allSettled([client?.close(), observer?.close()].filter(Boolean));
-  await fixture?.close(); await fixture?.remove();
+  await fixture?.close();
+  if (serve && fixture) {
+    await writeFile(join(out, "preview-final-terminal.log"), redact(fixture.terminal + fixture.processError));
+    await writeFile(join(out, "preview-events.jsonl"), await readFile(fixture.eventPath, "utf8"));
+  }
+  if (!preserveFixture) await fixture?.remove();
   await rm(join(out, "access.json"), { force: true });
 };
 for (const signal of ["SIGINT", "SIGTERM"]) process.on(signal, () => void cleanup().finally(() => process.exit(0)));
@@ -55,7 +60,8 @@ try {
     for (const name of ["new", "resume", "tree", "m3-mark", "m3-template", "skill:m3-reference"]) assert.ok(commands.some(item => item.name === name), `discover ${name}`);
     assert.ok(!commands.some(item => /internal|gateway/.test(item.name)), "private gateway is not advertised");
     const resources = await query("resources");
-    assert.ok(resources.tools.some(item => item.name === "m0_echo" && item.active));
+    assert.equal(resources.tools.length, 0);
+    assert.ok(resources.capabilities.some(item => !item.available && /tool|工具/i.test(item.name + item.detail)));
     assert.ok(resources.models.length >= 1);
     return { commands: commands.length, tools: resources.tools.length };
   });
@@ -89,11 +95,14 @@ try {
     assert.equal(events.filter(event => event.event === "m3_mark").length, 1);
     assert.equal(events.filter(event => event.event === "provider_call").length, before);
   });
-  await check("ordinary prompts preserve literal slash behavior", async () => {
-    const { ack } = await client.command("prompt", { text: "/m3-mark literal prompt", mode: "followUp" });
+  await check("RPC prompts expand registered extension commands and report handled", async () => {
+    const before = (await fixture.events()).filter(event => event.event === "provider_call").length;
+    const { ack, frame } = await client.command("prompt", { text: "/m3-mark rpc prompt", mode: "followUp" });
     assert.equal(ack.status, "dispatched");
-    await client.settled("/m3-mark literal prompt");
-    assert.equal((await fixture.events()).filter(event => event.event === "m3_mark").length, 1);
+    const result = await waitFor(() => client.frames.find(item => item.t === "command_result" && item.id === frame.id), "handled RPC prompt");
+    assert.equal(result.value.disposition, "handled");
+    await waitFor(async () => (await fixture.events()).filter(event => event.event === "m3_mark").length === 2, "second extension invocation");
+    assert.equal((await fixture.events()).filter(event => event.event === "provider_call").length, before);
   });
   await check("selected prompt template expands through the real host", async () => {
     const count = (await fixture.events()).filter(event => event.event === "provider_call").length;
@@ -130,7 +139,7 @@ try {
     assert.equal(client.snapshot.session.id, id);
     assert.equal((await query("file", { path: "src/greet.ts" })).path, "src/greet.ts", "queries continue after cancellation");
   });
-  await check("pending session change rejects prompts before the host replaces context", async () => {
+  await check("serialized session change rejects a prompt captured against the prior session", async () => {
     const before = (await fixture.events()).filter(event => event.event === "provider_call").length;
     assert.equal((await client.command("run_command", { name: "m3-delay-next" })).ack.status, "dispatched");
     await fixture.waitEvent("m3_delay_ready");
@@ -138,27 +147,29 @@ try {
     assert.equal(moving.ack.status, "dispatched");
     await fixture.waitEvent("m3_switch_waiting");
     const prompt = await observer.command("prompt", { text: "M3_SWITCH_RACE_MUST_NOT_EXECUTE" });
-    assert.equal(prompt.ack.status, "rejected");
-    assert.equal(prompt.ack.error.code, "busy");
+    if (prompt.ack.status === "dispatched") {
+      const refused = await waitFor(() => observer.frames.find(item => item.t === "command_result" && item.id === prompt.frame.id), "scope-fenced serialized prompt");
+      assert.equal(refused.status, "failed"); assert.match(refused.error.code, /stale|busy/);
+    } else { assert.equal(prompt.ack.status, "rejected"); assert.match(prompt.ack.error.code, /stale|busy/); }
     const result = await waitFor(() => client.frames.find(item => item.t === "command_result" && item.id === moving.frame.id), "delayed switch result");
     assert.equal(result.status, "completed");
     assert.equal((await fixture.events()).filter(event => event.event === "provider_call").length, before);
     assert.equal(client.snapshot.session.messages.length, 0);
   });
-  await check("resume uses the discovered session ID and fresh command context", async () => {
+  await check("RPC resume uses only a discovered session ID", async () => {
     const catalog = await query("sessions");
     assert.ok(catalog.sessions.some(item => item.id === originalId));
     const { result } = await mutate("session_switch", { sessionId: originalId });
     assert.equal(result.status, "completed");
     await waitFor(() => client.snapshot?.session.id === originalId && observer.snapshot?.session.id === originalId, "both clients resumed");
-    assert.ok(client.snapshot.session.messages.some(item => textOf(item) === "/m3-mark literal prompt"));
+    assert.ok(client.snapshot.session.messages.some(item => textOf(item).includes("M3_TEMPLATE_EXPANDED")));
     const invalid = await client.command("session_switch", { sessionId: "not-a-discovered-session" });
     if (invalid.ack.status === "dispatched") {
       const result = await waitFor(() => client.frames.find(item => item.t === "command_result" && item.id === invalid.frame.id), "invalid resume result");
       assert.equal(result.status, "failed");
     } else assert.equal(invalid.ack.status, "rejected");
   });
-  await check("cross-workspace resume rebuilds context, files and command gateway together", async () => {
+  await check("cross-workspace RPC resume follows the active session cwd for files and Git", async () => {
     const sessions = await query("sessions", { scope: "all", query: "另一工作区" });
     assert.ok(sessions.sessions.some(item => item.id === fixture.foreignSessionId));
     assert.equal((await mutate("session_switch", { sessionId: fixture.foreignSessionId })).result.status, "completed");
@@ -171,42 +182,53 @@ try {
     await waitFor(() => client.snapshot?.session.id === originalId, "original workspace restored");
     assert.match((await query("file", { path: "src/greet.ts" })).text, /Welcome/);
   });
-  await check("fork from a real branch entry and navigate the tree", async () => {
+  await check("RPC fork accepts only a real user entry and returns its input draft", async () => {
     const tree = await query("tree");
-    const assistant = tree.entries.find(entry => entry.role === "assistant");
-    assert.ok(assistant);
-    assert.equal((await mutate("session_fork", { entryId: assistant.id, position: "at" })).result.status, "completed");
-    await waitFor(() => client.snapshot?.session.id !== originalId && observer.snapshot?.session.id === client.snapshot?.session.id, "fork synchronized");
-    const forkTree = await query("tree");
-    const user = forkTree.entries.find(entry => entry.role === "user");
+    const user = tree.entries.find(entry => entry.role === "user" && entry.preview.includes("M3_TEMPLATE_EXPANDED"));
     assert.ok(user);
-    const navigated = (await mutate("session_tree", { entryId: user.id })).result;
-    assert.equal(navigated.status, "completed");
-    assert.equal(navigated.value.draftText, user.preview, "user navigation restores its input text");
-    // pi navigates to the parent of a user message and restores that message to the editor.
-    await waitFor(() => client.snapshot?.session.leafId === user.parentId && observer.snapshot?.session.leafId === user.parentId, "tree synchronized");
+    const fork = (await mutate("session_fork", { entryId: user.id })).result;
+    assert.equal(fork.status, "completed");
+    assert.equal(fork.value.draftText, user.preview);
+    await waitFor(() => client.snapshot?.session.id !== originalId && observer.snapshot?.session.id === client.snapshot?.session.id, "fork synchronized");
+    assert.equal(client.snapshot.caps.commands.includes("session_tree"), false);
+    const commands = (await query("commands")).commands;
+    assert.ok(commands.find(item => item.name === "tree")?.reason);
+    const assistant = (await query("tree")).entries.find(entry => entry.role === "assistant");
+    if (assistant) {
+      const invalid = await client.command("session_fork", { entryId: assistant.id });
+      if (invalid.ack.status === "dispatched") assert.equal((await waitFor(() => client.frames.find(item => item.t === "command_result" && item.id === invalid.frame.id), "assistant fork refused")).status, "failed");
+      else assert.equal(invalid.ack.status, "rejected");
+    }
   });
-  await check("session mutations are deduplicated even after epoch replacement", async () => {
-    const count = (await fixture.events()).filter(event => event.event === "session_start" && event.reason === "new").length;
+  await check("session mutations are deduplicated and reconnect does not replay them", async () => {
+    const count = new Set((await fixture.events()).filter(event => event.event === "session_start" && event.reason === "new").map(event => event.sessionId)).size;
     const { frame, result } = await mutate("session_new");
     assert.equal(result.status, "completed");
     const id = client.snapshot?.session.id;
     client.send(frame);
     await waitFor(() => client.frames.filter(item => item.t === "ack" && item.id === frame.id).length === 2, "new session duplicate receipt");
     assert.equal(client.snapshot.session.id, id);
-    assert.equal((await fixture.events()).filter(event => event.event === "session_start" && event.reason === "new").length, count + 1);
+    assert.equal(new Set((await fixture.events()).filter(event => event.event === "session_start" && event.reason === "new").map(event => event.sessionId)).size, count + 1);
     const lease = client.clientId;
     await client.close(); client = await openClient(fixture.url, lease);
-    client.send({ t: "receipt_query", clientId: lease, id: frame.id });
-    const retained = await waitFor(() => client.frames.find(item => item.t === "command_result" && item.id === frame.id), "old-epoch receipt survives reconnect");
-    assert.equal(retained.status, "completed");
-    assert.equal(retained.epoch, frame.epoch);
+    // Reconnection must preserve state and never replay an old-session mutation.
+    assert.equal(client.snapshot.session.id, id);
+    assert.equal(client.snapshot.session.messages.length, 0);
   });
   await check("busy mutation rejects while live messages and reconnection survive", async () => {
     assert.equal((await client.command("prompt", { text: "M0_SLOW_M3_LIVE" })).ack.status, "dispatched");
     await waitFor(() => client.snapshot?.state.running, "fixture streaming");
+    const currentSession = client.snapshot.session.id;
     const busy = await client.command("session_new");
-    assert.equal(busy.ack.status, "rejected");
+    if (busy.ack.status === "dispatched") {
+      const refused = await waitFor(() => client.frames.find(frame => frame.t === "command_result" && frame.id === busy.frame.id), "busy session mutation result");
+      assert.equal(refused.status, "failed");
+      assert.match(refused.error.code, /busy/);
+    } else {
+      assert.equal(busy.ack.status, "rejected");
+      assert.match(busy.ack.error.code, /busy/);
+    }
+    assert.equal(client.snapshot.session.id, currentSession);
     const lease = client.clientId;
     await client.close(); client = await openClient(fixture.url, lease);
     assert.equal(client.clientId, lease);
@@ -216,15 +238,42 @@ try {
     assert.ok(currentQuery.files.length);
     assert.equal(client.protocolErrors.length, 0); assert.equal(observer.protocolErrors.length, 0);
   });
+  await check("native clone refusal on an empty fork preserves the session and its next reply", async () => {
+    const tree = await query("tree");
+    const firstUser = tree.entries.find(entry => entry.role === "user");
+    assert.ok(firstUser, "the latest new session contains a real first user input");
+    const fork = await mutate("session_fork", { entryId: firstUser.id });
+    assert.equal(fork.result.status, "completed");
+    await waitFor(() => client.snapshot.session.messages.length === 0, "empty fork snapshot");
+    const forkId = client.snapshot.session.id;
+    await new Promise(done => setTimeout(done, 1100));
+    const cloned = await mutate("session_clone");
+    assert.equal(cloned.result.status, "failed");
+    assert.match(cloned.result.error.message, /clone|empty|persist|save/i, "native empty-session limitation is explicit");
+    assert.equal(client.snapshot.session.id, forkId);
+    assert.equal(client.snapshot.session.messages.length, 0);
+    await client.command("prompt", { text: "M0_EMPTY_FORK_CLONE_COMPLETE" });
+    await client.settled("M0_EMPTY_FORK_CLONE_COMPLETE");
+    assert.equal(client.users("M0_EMPTY_FORK_CLONE_COMPLETE").length, 1);
+  });
   report.status = "passed";
   report.completedAt = new Date().toISOString();
   await writeFile(join(out, "report.json"), JSON.stringify(report, null, 2) + "\n");
   if (serve) {
-    fixture.command("/name M3 工作台验收");
+    await client.command("session_rename", { name: "M3 工作台验收" });
     await writeFile(join(out, "access.json"), JSON.stringify({ pi: fixture.url }), { mode: 0o600 });
     await writeFile(join(out, "runtime.json"), JSON.stringify({ pid: process.pid, piPort: fixture.port, piVersion: fixture.piVersion, workspace: fixture.cwd, realModelCalls: 0 }, null, 2) + "\n");
     console.log(`READY local workbench preview; ${report.checks.length} checks passed; access.json is private.`);
-    await new Promise(() => {});
+    // Keep a referenced timer so a host crash cannot end Node before diagnostics
+    // are saved. A crashed preview remains available on disk for investigation.
+    while (true) {
+      await new Promise(done => setTimeout(done, 1000));
+      if (fixture.exitCode !== undefined) {
+        preserveFixture = true;
+        throw new Error(`Preview foreground host exited unexpectedly (${fixture.exitCode}); fixture retained at ${fixture.directory}`);
+      }
+      await writeFile(join(out, "preview-terminal.log"), redact(fixture.terminal));
+    }
   }
 } catch (error) {
   report.status = "failed";

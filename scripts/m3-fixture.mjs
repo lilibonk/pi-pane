@@ -11,7 +11,7 @@ export async function startWorkbenchFixture() {
   const fixture = await startFixture({
     loadSkills: true,
     loadPromptTemplates: true,
-    extraExtensions: ["tests/fixtures/workbench.ts"],
+    extraExtensions: ["tests/fixtures/workbench.ts", "tests/fixtures/handoff-fixture.ts"],
     async prepareAgentDir(agentDir) {
       const skillDir = join(agentDir, "skills", "m3-reference");
       const promptDir = join(agentDir, "prompts");
