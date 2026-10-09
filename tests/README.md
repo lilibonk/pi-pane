@@ -69,7 +69,15 @@ npm run m2:install
 
 `m2:external` (A10, A11 mobile) generates a test certificate with `openssl`, maps a public host name to loopback with Chrome's host resolver rules and accepts the certificate with `ignoreHTTPSErrors`. A local TLS reverse proxy preserving Host, Origin and the WebSocket subprotocol stands in for a same-machine proxy such as Tailscale Serve. It covers refusals, login, bootstrap-only upgrades, logout, `/web qr`, rotation, direct TLS, and a Pixel 7 touch viewport including reconnect after the proxy cuts every connection.
 
-`m2:install` (A11) runs `npm pack` (which rebuilds through `prepack`), checks the tarball, serves it from a local registry that proxies other packages to npmjs, runs `pi install npm:pi-pane@<version>` into a clean agent directory and npm cache, and starts the installed package with `--web`. It needs network access for the runtime dependencies. Publication and gallery listing are not covered.
+`m2:install` (A11) runs `npm pack` (which rebuilds through `prepack`), checks the tarball, serves it from a local registry that proxies other packages to npmjs, runs `pi install npm:@lilibonk/pi-pane@<version>` into a clean agent directory and npm cache, and starts the installed package with `--web`. It needs network access for the runtime dependencies. Publication and gallery listing are not covered.
+
+For a published version, set `PI_M2_PUBLISHED_TARBALL` to the absolute path of the frozen release tarball. This skips pack/prepack, verifies the public registry's version and integrity, and installs from `https://registry.npmjs.org/` with empty npm configuration, a fresh HOME, agent directory and cache. The npm lock must record that public source and the same integrity. The browser checks also cover refresh, restored history and a new prompt after reconnect; gallery and real-provider conversations remain separate checks.
+
+```sh
+PI_M0_CLI=/path/to/pi-coding-agent/dist/cli.js \
+PI_M2_PUBLISHED_TARBALL=/absolute/path/lilibonk-pi-pane-0.1.0.tgz \
+PI_M2_REPORT_DIR=./build-artifacts/m2/npm-release/install-published npm run m2:install
+```
 
 Unit tests add image structure and limit validation (`images.test.ts`), external access with real HTTP/WS and HTTPS/WSS listeners (`external.test.ts`), and a QR round trip through jsQR (`qr.test.ts`).
 

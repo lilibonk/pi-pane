@@ -2,7 +2,7 @@
 
 在 pi 终端里输入 `/web`，浏览器就接上**正在运行的这个会话**：完整历史、实时输出、工具卡片和 diff 都会显示出来，也可以在网页里发消息（含图片）、steer、中止、切模型。终端照常可用，两边看到的是同一个会话。
 
-![pi-pane 在浏览器中显示当前 pi 会话](docs/preview.png)
+![pi-pane 在浏览器中显示当前 pi 会话](https://raw.githubusercontent.com/lilibonk/pi-pane/main/docs/preview.png)
 
 宿主基线为 pi 1.0.4（Node ≥ 22.19）。设计见 [docs/design.md](docs/design.md)，验收记录见 [M0](docs/m0-status.md)、[M1](docs/m1-status.md)、[M2](docs/m2-status.md)、[M1/M2 收尾](docs/m2-followup-status.md)。
 
@@ -10,7 +10,15 @@ pi 1.1.0 的关键兼容回归及 Qwen3.7 Max 真实模型双端对话、工具�
 
 ## 安装
 
-项目已在 [GitHub](https://github.com/lilibonk/pi-pane) 公开，npm 包尚未发布。从源码试用：
+通过 pi 安装：
+
+```sh
+pi install npm:@lilibonk/pi-pane
+```
+
+发布包内带预构建网页，安装时不需要构建。启动 `pi` 后输入 `/web` 即可使用；已经运行的 pi 可用 `/reload` 加载。
+
+项目已在 [GitHub](https://github.com/lilibonk/pi-pane) 公开。也可以从源码试用：
 
 ```sh
 git clone https://github.com/lilibonk/pi-pane.git
@@ -22,7 +30,7 @@ pi -e .
 
 日常终端使用时，在构建后的项目目录运行 `pi install .`，之后直接启动 `pi` 即可加载扩展和包内主题；已经运行的 pi 可用 `/reload` 加载。
 
-发布后可用 `pi install npm:pi-pane` 安装。发布包内带预构建网页，安装时不需要构建。本项目采用 MIT 许可证。
+本项目采用 MIT 许可证。
 
 ## 使用
 

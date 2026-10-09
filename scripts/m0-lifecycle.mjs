@@ -336,10 +336,11 @@ async function isolatedPackageInstall() {
       await writeFile(join(installDir, "package.json"), JSON.stringify({ name: "pi-pane-m0-isolated-install", private: true, type: "module" }));
       await run("npm", ["install", "--ignore-scripts", "--omit=dev", "--no-audit", "--no-fund", join(directory, packageInfo.filename),
         `@earendil-works/pi-coding-agent@${host.version}`, `@earendil-works/pi-ai@${host.version}`], { cwd: installDir, env: npmEnv });
-      const packageRoot = join(installDir, "node_modules/pi-pane");
+      const packageRoot = join(installDir, "node_modules", packageInfo.name);
       const ws = JSON.parse(await readFile(join(installDir, "node_modules/ws/package.json"), "utf8"));
       assert.equal(ws.version, "8.22.0");
       const manifest = JSON.parse(await readFile(join(packageRoot, "package.json"), "utf8"));
+      assert.equal(manifest.name, packageInfo.name, "installed package matches the packed name, including npm scopes");
       assert.deepEqual(manifest.pi.extensions, ["./dist/extension/index.js"]);
       const installedHostRoot = join(installDir, "node_modules/@earendil-works/pi-coding-agent");
       const installedHostVersion = JSON.parse(await readFile(join(installedHostRoot, "package.json"), "utf8")).version;

@@ -22,7 +22,7 @@ pi 生态里现在已经有完整的桌面端（pi-gui）和 Web 端（PI WEB、
 - G3：终端和浏览器**同时**连在同一个会话上，终端切换会话或分支时网页同步重置。待发队列只同步是否非空，不承诺完整队列内容。
 - G4：网页外观沿用用户当前的 pi 主题。
 - G5：默认安全：只监听本机，用 token 鉴权，局域网访问需要显式开启。
-- G6：`pi install npm:pi-pane` 一步装好，本机模式零配置；按 pi package 规范发布并核验 gallery 收录。
+- G6：`pi install npm:@lilibonk/pi-pane` 一步装好，本机模式零配置；按 pi package 规范发布并核验 gallery 收录。
 
 ### 参考实现：Kimi Code（MoonshotAI/kimi-code，MIT，TypeScript）
 
@@ -380,7 +380,7 @@ M0 Spike 的有界预览（200 条/512 KiB、无分页）已由 M1 替换为上�
 
 ```jsonc
 {
-  "name": "pi-pane",
+  "name": "@lilibonk/pi-pane",
   "keywords": ["pi-package"],
   "pi": {
     "extensions": ["./dist/extension/index.js"],
