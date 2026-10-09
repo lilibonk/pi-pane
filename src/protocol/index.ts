@@ -116,6 +116,8 @@ export interface Caps {
   terminalDialogs: true;
   history: "paged";
   content: "paged";
+  /** Present after a /web handoff: the browser can list and change sessions and answer extension dialogs. */
+  host?: boolean;
 }
 export interface Snapshot {
   t: "snapshot";
@@ -222,6 +224,9 @@ export interface ContentPage {
 export type ClientMessage =
   | { t: "hello"; clientId?: string }
   | { t: "resync" }
+  /** Session host only (after a /web handoff). */
+  | { t: "host_read"; reqId: string; action: "sessions" }
+  | { t: "ui_response"; id: string; value?: string; confirmed?: boolean; cancelled?: true }
   | { t: "receipt_query"; clientId: string; id: string }
   | HistoryPageRequest
   | ContentPageRequest
@@ -266,6 +271,12 @@ export function parseClientMessage(value: unknown): ClientMessage {
   if (value.t === "hello" && exactKeys(value, ["t", "clientId"]) &&
       (value.clientId === undefined || shortString(value.clientId))) return value as ClientMessage;
   if (value.t === "resync" && exactKeys(value, ["t"])) return { t: "resync" };
+  if (value.t === "host_read" && exactKeys(value, ["t", "reqId", "action"]) && shortString(value.reqId, 64) && value.action === "sessions")
+    return value as unknown as ClientMessage;
+  if (value.t === "ui_response" && exactKeys(value, ["t", "id", "value", "confirmed", "cancelled"]) && shortString(value.id) &&
+      (value.value === undefined || (typeof value.value === "string" && value.value.length <= 64_000)) &&
+      (value.confirmed === undefined || typeof value.confirmed === "boolean") && (value.cancelled === undefined || value.cancelled === true))
+    return value as unknown as ClientMessage;
   if (value.t === "receipt_query" && exactKeys(value, ["t", "clientId", "id"]) &&
       shortString(value.clientId) && shortString(value.id)) return value as ClientMessage;
   if (value.t === "history_page" && exactKeys(value, ["t", "reqId", "epoch", "sessionId", "branchRevision", "before"]) &&

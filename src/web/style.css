@@ -258,3 +258,23 @@ div.code-block > pre.shiki { white-space: pre; }
   .image-block img, .image-placeholder { max-height: 360px; }
 }
 @media (prefers-reduced-motion: reduce) { .running-indicator { animation: none; } }
+
+/* Session host (after /web handoff): session list and extension dialogs. */
+.sessions-button { margin-right: 10px; font-size: 11px; }
+.sessions-panel { flex-shrink: 0; max-height: 40vh; overflow-y: auto; border-bottom: 1px solid var(--border); padding: 10px max(28px, calc((100vw - 940px) / 2)); }
+.sessions-header { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; }
+.sessions-header strong { margin-right: auto; }
+.sessions-panel ul { list-style: none; margin: 0; padding: 0; }
+.sessions-panel li { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 8px 0; border-top: 1px solid var(--border); }
+.sessions-panel li.current strong { color: var(--accent); }
+.sessions-panel li div { min-width: 0; display: flex; flex-direction: column; gap: 3px; }
+.sessions-panel li strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 500; font-size: 13px; }
+.sessions-panel li .mono { color: var(--fg-dim); font-size: 10px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.dialog-backdrop { position: fixed; inset: 0; z-index: 20; display: flex; align-items: center; justify-content: center; padding: 16px; background: color-mix(in srgb, var(--bg) 60%, transparent); }
+.dialog { width: min(480px, 100%); background: var(--bg); border: 1px solid var(--border); border-radius: 10px; padding: 18px; box-shadow: 0 12px 40px rgb(0 0 0 / 35%); }
+.dialog h2 { font-size: 15px; margin: 0 0 8px; font-weight: 600; }
+.dialog p { color: var(--fg-muted); font-size: 13px; line-height: 1.6; margin: 0 0 12px; white-space: pre-wrap; }
+.dialog textarea { width: 100%; box-sizing: border-box; font: inherit; font-size: 14px; padding: 8px; border: 1px solid var(--border); border-radius: 6px; background: transparent; color: var(--fg); }
+.dialog-options { display: flex; flex-direction: column; gap: 6px; margin-bottom: 8px; }
+.dialog-options button { text-align: left; padding: 8px 10px; }
+.dialog-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 12px; }

@@ -8,6 +8,7 @@ import { Bridge } from "./bridge.js";
 import { Hub, type ExternalAccess } from "./hub.js";
 import { missingHostCapabilities, readPaneSettings } from "./config.js";
 import { qrLines, qrWidth } from "./qr.js";
+import { HandoffHost, type HandoffTarget } from "./handoff.js";
 
 export const IMPLEMENTATION_VERSION = "m2.0";
 const QR_WIDGET = "pi-pane-qr";
@@ -21,6 +22,9 @@ export interface ProcessState {
   hub?: Hub;
   bridge?: Bridge;
   starting?: Promise<Hub>;
+  /** Set by `/web handoff`; consumed once pi has shut the TUI down. */
+  handoff?: HandoffTarget & { open: boolean };
+  host?: HandoffHost;
 }
 /** This record survives stop/reload. It owns no sockets until /web or initial --web. */
 export function getProcessState(): ProcessState {
@@ -31,7 +35,7 @@ export function getProcessState(): ProcessState {
 }
 
 interface WebArgs {
-  action: "start" | "stop" | "status" | "rotate" | "qr";
+  action: "start" | "stop" | "status" | "rotate" | "qr" | "handoff";
   host?: string;
   port?: number;
   noOpen: boolean;
@@ -44,7 +48,7 @@ const ADDRESS_KEYS = ["host", "port", "publicOrigin", "tlsCert", "tlsKey", "prox
 export function parseWebArgs(text: string): WebArgs {
   const parts = text.trim() ? text.trim().split(/\s+/) : [];
   const args: WebArgs = { action: "start", noOpen: false };
-  if (["stop", "status", "qr"].includes(parts[0] ?? "")) args.action = parts.shift() as "stop" | "status" | "qr";
+  if (["stop", "status", "qr", "handoff"].includes(parts[0] ?? "")) args.action = parts.shift() as "stop" | "status" | "qr" | "handoff";
   const value = (name: string, index: number): string => {
     const next = parts[index];
     if (!next || next.startsWith("--")) throw new ProtocolError("invalid_args", `${name} needs a value.`);
@@ -210,6 +214,26 @@ export default function piPane(pi: ExtensionAPI): void {
     qrTimer.unref?.();
   };
 
+  /**
+   * Kimi-style handoff: the TUI shuts down normally, then this process stays in the foreground as
+   * the web service while a pi RPC child owns the session. Ctrl+C returns the session to the terminal.
+   */
+  const handoff = async (ctx: ExtensionContext, noOpen: boolean): Promise<void> => {
+    if (!ctx.isIdle() || ctx.hasPendingMessages()) throw new ProtocolError("busy", "Wait until pi is idle and the queue is empty before handing off.");
+    const sessionFile = ctx.sessionManager.getSessionFile();
+    if (!sessionFile) throw new ProtocolError("no_session_file", "Handoff needs a saved session (not --no-session).");
+    const hadViewers = !!state.hub?.running && state.hub.connectionCount > 0;
+    if (!state.hub?.running) {
+      const defaults = flagArgs();
+      await start(ctx, { ...defaults, action: "start", noOpen: true });
+    }
+    state.handoff = { sessionFile, sessionDir: ctx.sessionManager.getSessionDir(), cwd: ctx.cwd, argv: process.argv.slice(2), theme: ctx.ui.theme, themes: ctx.ui.getAllThemes(),
+      open: !noOpen && !hadViewers };
+    installExitTakeover(() => runHandoff(state));
+    notify(ctx, "pi-pane: handing this session to the browser…");
+    ctx.shutdown();
+  };
+
   pi.registerCommand("web", {
     description: "Mirror this TUI in a browser. /web [--no-open], stop, status, qr, --rotate; external access: --public-origin with --tls-cert/--tls-key or --proxy.",
     handler: async (text, ctx) => {
@@ -227,6 +251,8 @@ export default function piPane(pi: ExtensionAPI): void {
           try { noOpen = explicit.noOpen || flagArgs().noOpen; } catch { /* Invalid startup config cannot block revocation. */ }
           hideQr();
           state.hub.rotateToken(); showUrl(ctx, state.hub, noOpen);
+        } else if (explicit.action === "handoff") {
+          await handoff(ctx, explicit.noOpen);
         } else if (explicit.action === "qr") {
           if (!state.hub?.running) throw new ProtocolError("not_running", "pi-pane is stopped. Run /web first.");
           showQr(ctx, state.hub);
@@ -280,7 +306,11 @@ export default function piPane(pi: ExtensionAPI): void {
     state.bridge = undefined;
     bridge.dispose();
     ownedBridge = undefined;
-    if (event.reason === "quit") await stop();
+    if (event.reason === "quit" && state.handoff && state.hub?.running) {
+      // Keep the listener and its token: the browser stays on the same URL across the handoff.
+      const hub = state.hub;
+      hub.suspend("handoff", () => { if (state.hub === hub) { state.desiredRunning = false; state.hub = undefined; } }, 60_000);
+    } else if (event.reason === "quit") await stop();
     else if (state.hub?.running) {
       const hub = state.hub;
       const generation = state.generation;
@@ -302,5 +332,63 @@ export default function piPane(pi: ExtensionAPI): void {
   ]) observe(name, (event) => {
     try { ownedBridge?.handleEvent(event); }
     catch { /* Projection failures must not interrupt the host agent. Integration tests exercise this boundary. */ }
+  });
+}
+
+/**
+ * pi has no public "run this instead of exiting" hook (Kimi's TUI has setExitForegroundTask), so the
+ * first process.exit after a handoff request is intercepted. By then the TUI is stopped, every
+ * extension has handled session_shutdown and the TUI's session is disposed: the child is the only writer.
+ */
+function installExitTakeover(run: () => Promise<number>): void {
+  const original = process.exit;
+  process.exit = ((code?: number) => {
+    process.exit = original;
+    run().then((final) => original(final), () => original(code ?? 1));
+    return undefined as never;
+  }) as typeof process.exit;
+}
+function write(text: string): void {
+  try { process.stdout.write(text); } catch { /* the terminal may be gone */ }
+}
+async function runHandoff(state: ProcessState): Promise<number> {
+  const target = state.handoff;
+  state.handoff = undefined;
+  const hub = state.hub;
+  if (!target || !hub?.running) { write("pi-pane: the web service stopped before the handoff completed.\n"); return 1; }
+  process.stdout.on("error", () => { /* closed terminal */ });
+  const host = new HandoffHost(hub, target, (line) => write(`${line}\n`));
+  try { await host.start(); }
+  catch (error) {
+    write(`pi-pane: handoff failed: ${error instanceof Error ? error.message : String(error)}\n`);
+    await host.stop(); await hub.close(); state.hub = undefined;
+    write(`To resume this session: pi --session ${target.sessionFile}\n`);
+    return 1;
+  }
+  state.host = host;
+  write(`\npi-pane: this session now runs in the browser.\n  ${hub.url}\n  Press Ctrl+C to stop the web service and return the session to the terminal.\n`);
+  if (target.open) {
+    const executable = process.platform === "darwin" ? "open" : process.platform === "win32" ? "rundll32" : "xdg-open";
+    const args = process.platform === "win32" ? ["url.dll,FileProtocolHandler", hub.url] : [hub.url];
+    try { spawn(executable, args, { detached: true, stdio: "ignore" }).on("error", () => {}).unref(); } catch { /* the URL is printed */ }
+  }
+  return new Promise<number>((resolve) => {
+    let stopping = false;
+    const signals: NodeJS.Signals[] = ["SIGINT", "SIGTERM", "SIGHUP"];
+    const finish = async (code: number, message?: string): Promise<void> => {
+      if (stopping) return;
+      stopping = true;
+      for (const signal of signals) process.off(signal, onSignal);
+      if (message) write(`\n${message}\n`);
+      const sessionFile = host.sessionFile;
+      await host.stop();
+      await hub.close();
+      state.hub = undefined; state.host = undefined; state.desiredRunning = false;
+      if (sessionFile) write(`To resume this session: pi --session ${sessionFile}\n`);
+      resolve(code);
+    };
+    const onSignal = (signal: NodeJS.Signals) => { void finish(0, signal === "SIGINT" ? "pi-pane: stopping the web service…" : undefined); };
+    for (const signal of signals) process.on(signal, onSignal);
+    void host.childExited?.then((code) => finish(1, `pi-pane: the pi session host exited (${code}).`));
   });
 }

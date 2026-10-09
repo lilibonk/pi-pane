@@ -24,6 +24,16 @@ export interface ExternalAccess {
   /** Absolute lifetime of a login session. */
   authTtlMs?: number;
 }
+/**
+ * The process that owns the session after a `/web` handoff. Session listing, session changes and
+ * extension dialog answers go to it; ordinary commands still go through the bound Bridge.
+ */
+export interface HostHandler {
+  read(action: string): Promise<unknown>;
+  command(name: string, args: unknown): Promise<unknown>;
+  answer(id: string, response: Record<string, unknown>): void;
+  pendingDialogs(): unknown[];
+}
 export interface HubOptions {
   host?: string;
   port?: number;
@@ -373,7 +383,7 @@ export class Hub {
     let input: unknown;
     try { input = JSON.parse(raw.toString()); } catch { throw new ProtocolError("invalid_json", "Malformed JSON."); }
     const message = parseClientMessage(input);
-    if (message.t !== "command" && Buffer.byteLength(raw.toString()) > 8192) throw new ProtocolError("invalid_frame", "Control frame exceeds 8 KiB.");
+    if (message.t !== "command" && Buffer.byteLength(raw.toString()) > (message.t === "ui_response" ? 160 * 1024 : 8192)) throw new ProtocolError("invalid_frame", "Control frame exceeds 8 KiB.");
     if (message.t === "hello") {
       if (peer.lease) throw new ProtocolError("already_initialized", "This connection already completed hello.");
       this.pruneLeases();
@@ -396,6 +406,13 @@ export class Hub {
     }
     const lease = this.validLease(peer);
     if (message.t === "resync") { this.sendSnapshot(peer); return; }
+    if (message.t === "host_read") { void this.hostRead(peer, message.reqId, message.action); return; }
+    if (message.t === "ui_response") {
+      if (!this.hostHandler) throw new ProtocolError("unsupported", "No dialog is open.");
+      const { t: _t, id, ...response } = message;
+      this.hostHandler.answer(id, response);
+      return;
+    }
     if (message.t === "history_page" || message.t === "content_page" || message.t === "image_page") { this.page(peer, message); return; }
     if (message.clientId !== lease.id) throw new ProtocolError("client_mismatch", "Command does not belong to this connection.");
     if (message.t === "receipt_query") {
@@ -444,7 +461,16 @@ export class Hub {
     try {
       if (!bridge || this._switching || !bridge.isCurrent() || command.epoch !== this._epoch || command.sessionId !== bridge.sessionId || command.branchRevision !== bridge.branchRevision)
         throw new ProtocolError("stale_session", "Refresh the session snapshot before submitting.");
-      bridge.dispatch(command.command, command.args, (result) => {
+      if (command.command.startsWith("host_")) {
+        // Session changes replace the epoch; their result still belongs to the originating command.
+        if (!this.hostHandler) throw new ProtocolError("unsupported", "Session control needs a /web handoff.");
+        this.hostHandler.command(command.command, command.args).then(
+          (value) => ({ status: "completed" as const, value }), (error: unknown) => ({ status: "failed" as const, error: toWireError(error) }),
+        ).then((result) => {
+          receipt.result = { t: "command_result", id: command.id, epoch: command.epoch, ...result };
+          if (ackSent) this.send(peer, receipt.result);
+        });
+      } else bridge.dispatch(command.command, command.args, (result) => {
         if (this.boundBridge !== bridge || this._epoch !== command.epoch || !bridge.isCurrent()) return;
         receipt.result = { t: "command_result", id: command.id, epoch: command.epoch, ...result };
         if (ackSent) this.send(peer, receipt.result);
@@ -512,12 +538,27 @@ export class Hub {
   private broadcast(message: ServerMessage): void {
     for (const peer of this.peers) if (peer.lease) this.send(peer, message);
   }
+  private hostHandler?: HostHandler;
+  setHostHandler(handler: HostHandler | undefined): void { this.hostHandler = handler; }
+  get hosted(): boolean { return !!this.hostHandler; }
+  /** Unsequenced notices from the session host (dialogs), delivered to every authenticated viewer. */
+  notifyAll(message: Record<string, unknown> & { t: string }): void { this.broadcast(message as unknown as ServerMessage); }
+  private async hostRead(peer: Peer, reqId: string, action: string): Promise<void> {
+    try {
+      if (!this.hostHandler) throw new ProtocolError("unsupported", "Session listing needs a /web handoff.");
+      this.send(peer, { t: "host_result", reqId, value: await this.hostHandler.read(action) } as unknown as ServerMessage);
+    } catch (error) {
+      this.send(peer, { t: "error", error: toWireError(error), reqId });
+    }
+  }
   private sendSnapshot(peer: Peer): void {
     const bridge = this.boundBridge;
     if (!bridge || this._switching) { this.send(peer, { t: "switching", reason: "waiting_for_session" }); return; }
     // snapshot() and watermark capture contain no await, so incrementing events cannot interleave.
     const body = bridge.snapshot();
-    this.send(peer, { t: "snapshot", epoch: this._epoch, seq: this._seq, ...body });
+    this.send(peer, { t: "snapshot", epoch: this._epoch, seq: this._seq, ...body, ...(this.hostHandler ? { caps: { ...body.caps, host: true } } : {}) });
+    // Open dialogs follow the snapshot so a viewer that (re)connects can answer them.
+    for (const dialog of this.hostHandler?.pendingDialogs() ?? []) this.send(peer, dialog as ServerMessage);
   }
   bindBridge(bridge: Bridge, reason = "session_start"): void {
     if (this.rebindTimer) { clearTimeout(this.rebindTimer); this.rebindTimer = undefined; }

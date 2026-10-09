@@ -3,11 +3,57 @@ import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "preact/ho
 import type { JSX } from "preact";
 import { IMAGE_TYPES } from "../protocol/index.js";
 import {
-  addImages, forgetSubmission, issueCommand, loadOlder, login, logout, queryReceipt, reconnect, removeAttachment, setDraft,
-  startConnection, submitPrompt, webStore, type Attachment, type MessageView, type Submission, type ToolView, type WebState,
+  addImages, answerDialog, forgetSubmission, issueCommand, loadSessions, loadOlder, login, logout, queryReceipt, reconnect, removeAttachment, setDraft,
+  startConnection, submitPrompt, webStore, type Attachment, type Dialog, type MessageView, type Submission, type ToolView, type WebState,
 } from "./store.js";
 import { Message, ToolCard, type ToolContext } from "./messages.js";
 import "./style.css";
+
+/** Session host: sessions from every project, newest first. Opening one replaces the current session. */
+function SessionsPanel({ state, onClose }: { state: WebState; onClose: () => void }) {
+  const idle = !!state.snapshot?.state.idle;
+  return (
+    <section class="sessions-panel" aria-label="会话">
+      <div class="sessions-header">
+        <strong>会话</strong>
+        <button type="button" onClick={() => issueCommand("host_new")} disabled={!idle}>新建会话</button>
+        <button type="button" class="quiet" onClick={loadSessions}>刷新</button>
+        <button type="button" class="quiet" onClick={onClose}>关闭</button>
+      </div>
+      {!idle && <p class="subtle">pi 运行中，空闲后才能切换会话。</p>}
+      {state.sessionsLoading && <p class="subtle">正在读取会话…</p>}
+      <ul>
+        {(state.sessions ?? []).map(session => (
+          <li key={session.id} class={session.current ? "current" : ""} data-session-id={session.id}>
+            <div><strong>{session.name || session.preview || "（空会话）"}</strong><span class="mono">{session.cwd} · {new Date(session.modified).toLocaleString("zh-CN", { hour12: false })} · {session.messages} 条</span></div>
+            {session.current ? <span class="subtle">当前</span> : <button type="button" disabled={!idle} onClick={() => issueCommand("host_switch", { sessionId: session.id })}>打开</button>}
+          </li>
+        ))}
+      </ul>
+    </section>
+  );
+}
+
+/** An extension dialog forwarded by the session host. The first answer from any viewer wins. */
+function DialogView({ dialog }: { dialog: Dialog }) {
+  const [text, setText] = useState(dialog.prefill ?? "");
+  const cancel = () => answerDialog(dialog.id, { cancelled: true });
+  return (
+    <div class="dialog-backdrop" role="dialog" aria-modal="true" aria-label={dialog.title ?? "pi 请求确认"}>
+      <div class="dialog">
+        <h2>{dialog.title ?? "pi 请求输入"}</h2>
+        {dialog.message && <p>{dialog.message}</p>}
+        {dialog.method === "select" && <div class="dialog-options">{(dialog.options ?? []).map(option => <button type="button" key={option} onClick={() => answerDialog(dialog.id, { value: option })}>{option}</button>)}</div>}
+        {(dialog.method === "input" || dialog.method === "editor") && <textarea aria-label="对话框输入" rows={dialog.method === "editor" ? 10 : 2} placeholder={dialog.placeholder} value={text} onInput={event => setText(event.currentTarget.value)} />}
+        <div class="dialog-actions">
+          <button type="button" class="quiet" onClick={cancel}>取消</button>
+          {dialog.method === "confirm" && <button type="button" class="send-button" onClick={() => answerDialog(dialog.id, { confirmed: true })}>确认</button>}
+          {(dialog.method === "input" || dialog.method === "editor") && <button type="button" class="send-button" onClick={() => answerDialog(dialog.id, { value: text })}>提交</button>}
+        </div>
+      </div>
+    </div>
+  );
+}
 
 function useWebState(): WebState {
   const [state, setState] = useState(webStore.getState());
@@ -108,6 +154,7 @@ function App() {
   const feed = useRef<HTMLDivElement>(null);
   const feedInner = useRef<HTMLDivElement>(null);
   const [windowSize, setWindowSize] = useState(WINDOW);
+  const [showSessions, setShowSessions] = useState(false);
   const [dragging, setDragging] = useState(false);
   const previousCount = useRef(0);
   const anchor = useRef<{ height: number; top: number } | null>(null);
@@ -252,11 +299,14 @@ function App() {
       <div class="session-bar">
         <div class="session-identity"><h1>{snapshot?.session.name || "当前 pi 会话"}</h1><p title={snapshot?.session.cwd}>{snapshot?.session.cwd || "在浏览器中继续当前终端会话"}</p></div>
         <div class="session-details">
+          {snapshot?.caps.host && <button type="button" class="sessions-button" onClick={() => { setShowSessions(value => !value); loadSessions(); }}>会话</button>}
           <span>{host?.compacting ? "压缩上下文中" : host?.running ? "正在运行" : host?.idle ? "空闲" : "状态未知"}</span>
           {host?.hasPendingMessages && <span class="queue-badge">存在待发消息</span>}
           {snapshot && <span class="mono">分支 {snapshot.session.branchRevision} · seq {state.lastAppliedSeq}</span>}
         </div>
       </div>
+      {showSessions && snapshot?.caps.host && <SessionsPanel state={state} onClose={() => setShowSessions(false)} />}
+      {state.dialogs[0] && <DialogView key={state.dialogs[0].id} dialog={state.dialogs[0]} />}
       {connection === "login" ? <div class="timeline"><div class="timeline-inner"><Login state={state} />{state.notice && <p class="login-notice" role="status">{state.notice}</p>}</div></div> : <>
       {state.notice && <div class={`notice notice-${connection}`} role="status"><span>{state.notice}</span>{(connection === "disconnected" || connection === "fatal") && <button type="button" onClick={reconnect}>重新连接</button>}</div>}
       {!!host?.uiPrompts.length && <div class="terminal-notice" role="status"><strong>请在终端处理对话框</strong>{host.uiPrompts.map((prompt, i) => <span key={i}>{prompt.title || prompt.kind}</span>)}</div>}
@@ -289,7 +339,7 @@ function App() {
             <input ref={fileInput} type="file" accept={IMAGE_TYPES.join(",")} multiple hidden onChange={event => { attachImages([...(event.currentTarget.files ?? [])]); event.currentTarget.value = ""; }} />
             <div class="composer-actions"><span class="input-hint">{coarsePointer ? "Enter 换行 · 按钮发送" : "Enter 发送 · Shift + Enter 换行 · 可粘贴或拖入图片"}</span><div class="action-buttons"><button type="button" class="attach-button" disabled={!canAttach || state.attachments.length >= 4} onClick={() => fileInput.current?.click()} aria-label="添加图片">图片</button>{host && !host.idle && <button type="button" class="abort-button" disabled={!online || !snapshot?.caps.commands.includes("abort")} onClick={() => issueCommand("abort")}>■ 中止</button>}<button type="button" class="steer-button" disabled={!canPrompt || (!state.draft.trim() && !state.attachments.length)} onClick={() => submit("steer")} title="⌘ / Ctrl + Enter">steer</button><button type="button" class="send-button" disabled={!canPrompt || (!state.draft.trim() && !state.attachments.length)} onClick={() => submit("followUp")}>{host?.running ? "请求 followUp ↗" : "发送 ↗"}</button></div></div>
           </div>
-          <p class="scope-note">网页按原文提交，不执行 slash 命令，也不展开模板 / skill。回执只确认已交给 pi。</p>
+          <p class="scope-note">{snapshot?.caps.host ? "会话已交给浏览器：输入与终端相同，slash 命令、模板和 skill 会被执行或展开。在终端按 Ctrl+C 交还会话。" : "网页按原文提交，不执行 slash 命令，也不展开模板 / skill。回执只确认已交给 pi。"}</p>
           <Receipts items={state.submissions} online={online} onRecover={text => { setDraft(text); textarea.current?.focus(); }} />
         </div>
       </footer>

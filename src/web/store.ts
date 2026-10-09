@@ -24,6 +24,8 @@ export interface Attachment { id: string; name: string; mimeType: ImageType; byt
 /** A history image read through image_page, keyed by `${messageId}#${index}`. */
 export interface LoadedImage { status: "loading" | "ready" | "error"; url?: string; error?: string }
 
+export interface Dialog { id: string; method: "select" | "confirm" | "input" | "editor"; title?: string; message?: string; options?: string[]; placeholder?: string; prefill?: string }
+export interface HostSession { id: string; name?: string; cwd: string; modified: string; preview: string; current: boolean; messages: number }
 export interface WebState {
   connection: Connection;
   notice: string;
@@ -45,6 +47,10 @@ export interface WebState {
   attachments: Attachment[];
   attachmentError: string;
   images: Record<string, LoadedImage>;
+  /** After a /web handoff: extension dialogs waiting for an answer, and the session list. */
+  dialogs: Dialog[];
+  sessions: HostSession[] | null;
+  sessionsLoading: boolean;
 }
 
 export const webStore = createStore<WebState>(() => ({
@@ -66,6 +72,9 @@ export const webStore = createStore<WebState>(() => ({
   attachments: [],
   attachmentError: "",
   images: {},
+  dialogs: [],
+  sessions: null,
+  sessionsLoading: false,
 }));
 
 const TOKEN_KEY = "pi-pane.token";
@@ -320,6 +329,16 @@ function handleFrame(raw: unknown) {
     case "command_result":
       updateSubmission(frame.id, { status: frame.status === "completed" ? "completed" : "failed", explanation: frame.error?.message });
       break;
+    case "ui_request":
+      if (typeof frame.id === "string" && !current.dialogs.some(dialog => dialog.id === frame.id))
+        webStore.setState({ dialogs: [...current.dialogs, frame as unknown as Dialog] });
+      break;
+    case "ui_resolved":
+      webStore.setState({ dialogs: current.dialogs.filter(dialog => dialog.id !== frame.id) });
+      break;
+    case "host_result":
+      if (frame.reqId === sessionsRequest) { sessionsRequest = undefined; webStore.setState({ sessions: Array.isArray(frame.value) ? frame.value : [], sessionsLoading: false }); }
+      break;
     case "notice":
       webStore.setState({ notice: frame.message ?? frame.notice ?? "请检查终端提示。" });
       break;
@@ -507,10 +526,22 @@ if (typeof document !== "undefined") document.addEventListener("visibilitychange
 
 export function setDraft(draft: string) { webStore.setState({ draft }); }
 
-export function issueCommand(command: CommandName, args: Record<string, unknown> = {}, text?: string, mode?: "followUp" | "steer") {
+let sessionsRequest: string | undefined;
+/** Session host only: lists sessions from every project directory. */
+export function loadSessions() {
+  const reqId = `s${++requestNo}`;
+  if (!send({ t: "host_read", reqId, action: "sessions" })) return;
+  sessionsRequest = reqId;
+  webStore.setState({ sessionsLoading: true });
+}
+export function answerDialog(id: string, response: { value?: string; confirmed?: boolean; cancelled?: true }) {
+  if (send({ t: "ui_response", id, ...response })) webStore.setState(state => ({ dialogs: state.dialogs.filter(dialog => dialog.id !== id) }));
+}
+export function issueCommand(command: CommandName | "host_new" | "host_switch", args: Record<string, unknown> = {}, text?: string, mode?: "followUp" | "steer") {
   const state = webStore.getState();
   const snapshot = state.snapshot;
-  if (state.connection !== "online" || !snapshot || !state.clientId || !snapshot.caps.commands.includes(command)) return;
+  const hostCommand = command.startsWith("host_") && !!snapshot?.caps.host;
+  if (state.connection !== "online" || !snapshot || !state.clientId || (!hostCommand && !snapshot.caps.commands.includes(command as CommandName))) return;
   const commandNo = state.nextCommandNo;
   const id = `${state.clientId}:${commandNo}`;
   const attached = command === "prompt" ? state.attachments : [];

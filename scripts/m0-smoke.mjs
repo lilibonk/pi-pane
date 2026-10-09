@@ -54,7 +54,7 @@ async function freePort() {
 }
 
 export async function startFixture({ autoWeb = true, extraExtensions = [], settings = {}, envOverrides = {}, disablePane = false,
-  provider = "pi-pane-m0", model = "deterministic", packaged = false, loadThemes = false, prepareAgentDir, cli: selectedCli } = {}) {
+  provider = "pi-pane-m0", model = "deterministic", packaged = false, loadThemes = false, prepareAgentDir, cli: selectedCli, controllingTty = false } = {}) {
   if (process.platform === "win32") throw new Error("The M0 real-TUI harness requires a POSIX PTY (macOS or Linux).");
   for (const key of Object.keys(envOverrides)) if (!key.startsWith("PI_M0_") && key !== "PI_PANE_PASSWORD") throw new Error(`Fixture env override is not allowed: ${key}`);
   const host = await readPiHost(selectedCli);
@@ -117,7 +117,7 @@ export async function startFixture({ autoWeb = true, extraExtensions = [], setti
       if (item.data.includes("\u001b[6n")) fixture.write("\u001b[1;1R");
     } else if (item.type === "exit") fixture.exitCode = item.code;
   });
-  proc.stdin.write(`${JSON.stringify({ argv, env, cwd })}\n`);
+  proc.stdin.write(`${JSON.stringify({ argv, env, cwd, controllingTty })}\n`);
   try {
     if (autoWeb && !disablePane) await waitFor(() => {
       if (fixture.exitCode !== undefined) throw new Error(`pi exited at startup (${fixture.exitCode}): ${redact(stripAnsi(fixture.terminal + fixture.processError)).slice(-6000)}`);
