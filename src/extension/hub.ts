@@ -7,7 +7,7 @@ import type { AddressInfo } from "node:net";
 import type { Duplex } from "node:stream";
 import { WebSocket, WebSocketServer, type RawData } from "ws";
 import {
-  LIMITS, PROTOCOL, WS_PATH, ProtocolError, parseClientMessage, toWireError,
+  LIMITS, PROTOCOL, WS_PATH, ProtocolError, isRecord, parseClientMessage, toWireError,
   type Ack, type ClientMessage, type CommandEnvelope, type CommandResult, type ProjectionEvent, type ServerMessage,
 } from "../protocol/index.js";
 import type { Bridge } from "./bridge.js";
@@ -40,7 +40,7 @@ export interface HubOptions {
 }
 /** A password login. Only the token digest is retained. */
 interface AuthSession { digest: string; expiresAt: number; timer?: ReturnType<typeof setTimeout> }
-interface Receipt { digest: string; ack: Ack; result?: CommandResult }
+interface Receipt { digest: string; ack: Ack; result?: CommandResult; sessionMutation?: boolean }
 interface Lease {
   id: string;
   auth?: AuthSession;
@@ -56,6 +56,7 @@ interface Peer {
   helloTimer: ReturnType<typeof setTimeout>;
   rateStart: number;
   rateCount: number;
+  workbenchReads?: number;
 }
 function canonical(value: unknown): string {
   if (Array.isArray(value)) return `[${value.map(canonical).join(",")}]`;
@@ -104,6 +105,7 @@ export class Hub {
   private closePromise?: Promise<void>;
   private upgradeRate = { start: Date.now(), count: 0 };
   private commandRate = { start: Date.now(), count: 0 };
+  private workbenchReads = 0;
   private loginRate = { start: Date.now(), count: 0 };
   private loginFailures = new Map<string, { start: number; count: number }>();
   private authSessions = new Map<string, AuthSession>();
@@ -397,6 +399,7 @@ export class Hub {
     const lease = this.validLease(peer);
     if (message.t === "resync") { this.sendSnapshot(peer); return; }
     if (message.t === "history_page" || message.t === "content_page" || message.t === "image_page") { this.page(peer, message); return; }
+    if (message.t === "workbench_query") { void this.workbench(peer, message); return; }
     if (message.clientId !== lease.id) throw new ProtocolError("client_mismatch", "Command does not belong to this connection.");
     if (message.t === "receipt_query") {
       const prefix = `${lease.id}:`;
@@ -404,7 +407,8 @@ export class Hub {
       if (!Number.isSafeInteger(number) || number < 1) throw new ProtocolError("invalid_envelope", "Invalid receipt ID.");
       const receipt = lease.receipts.get(number);
       if (!receipt) throw new ProtocolError(number < lease.nextCommandNo ? "result_unavailable" : "not_seen", "No retained receipt; the host will not be called again.");
-      if (receipt.ack.epoch !== this._epoch) throw new ProtocolError("result_unavailable", "The session changed; this operation's result is unknown.");
+      if (receipt.ack.epoch !== this._epoch && !(receipt.sessionMutation && receipt.result))
+        throw new ProtocolError("result_unavailable", "The session changed; this operation's result is unknown.");
       this.send(peer, receipt.ack);
       if (receipt.result) this.send(peer, receipt.result);
       return;
@@ -437,6 +441,8 @@ export class Hub {
     if (lease.nextCommandNo >= Number.MAX_SAFE_INTEGER) throw new ProtocolError("client_expired", "Command sequence exhausted; create a new client lease.");
     lease.nextCommandNo++;
     const receipt: Receipt = { digest, ack: { t: "ack", id: command.id, epoch: command.epoch, nextCommandNo: lease.nextCommandNo, status: "rejected" } };
+    receipt.sessionMutation = ["session_new", "session_switch", "session_fork", "session_tree"].includes(command.command) ||
+      (command.command === "run_command" && isRecord(command.args) && command.args.name === "new");
     lease.receipts.set(command.commandNo, receipt);
     while (lease.receipts.size > (this.options.receiptLimit ?? 128)) lease.receipts.delete(lease.receipts.keys().next().value!);
     let ackSent = false;
@@ -445,7 +451,9 @@ export class Hub {
       if (!bridge || this._switching || !bridge.isCurrent() || command.epoch !== this._epoch || command.sessionId !== bridge.sessionId || command.branchRevision !== bridge.branchRevision)
         throw new ProtocolError("stale_session", "Refresh the session snapshot before submitting.");
       bridge.dispatch(command.command, command.args, (result) => {
-        if (this.boundBridge !== bridge || this._epoch !== command.epoch || !bridge.isCurrent()) return;
+        // Session lifecycle commands report the observed command-context outcome against their original receipt.
+        // Other asynchronous completions retain the strict generation/epoch fence.
+        if (!receipt.sessionMutation && (this.boundBridge !== bridge || this._epoch !== command.epoch || !bridge.isCurrent())) return;
         receipt.result = { t: "command_result", id: command.id, epoch: command.epoch, ...result };
         if (ackSent) this.send(peer, receipt.result);
       });
@@ -456,6 +464,27 @@ export class Hub {
     this.send(peer, receipt.ack);
     ackSent = true;
     if (receipt.result) this.send(peer, receipt.result);
+  }
+  private async workbench(peer: Peer, message: Extract<ClientMessage, { t: "workbench_query" }>): Promise<void> {
+    const bridge = this.boundBridge;
+    let counted = false;
+    try {
+      if ((peer.workbenchReads ?? 0) >= 8 || this.workbenchReads >= 16) throw new ProtocolError("busy", "Too many workbench reads are in progress.");
+      peer.workbenchReads = (peer.workbenchReads ?? 0) + 1;
+      this.workbenchReads++;
+      counted = true;
+      if (!bridge || this._switching || !bridge.isCurrent() || message.epoch !== this._epoch ||
+          message.sessionId !== bridge.sessionId || message.branchRevision !== bridge.branchRevision)
+        throw new ProtocolError("stale_session", "Refresh the session snapshot before reading the workbench.");
+      const value = await bridge.workbenchQuery(message.action, message.args, message.branchRevision);
+      if (this.boundBridge !== bridge || this._switching || !bridge.isCurrent() || message.epoch !== this._epoch ||
+          message.branchRevision !== bridge.branchRevision) throw new ProtocolError("stale_session", "The session changed while reading the workbench.");
+      this.send(peer, { t: "workbench_result", reqId: message.reqId, epoch: message.epoch, action: message.action, value });
+    } catch (error) {
+      this.send(peer, { t: "workbench_result", reqId: message.reqId, epoch: message.epoch, action: message.action, error: toWireError(error) });
+    } finally {
+      if (counted) { peer.workbenchReads!--; this.workbenchReads--; }
+    }
   }
   /** Directed read-only responses. They never consume seq and never call the host's write APIs. */
   private page(peer: Peer, message: Extract<ClientMessage, { t: "history_page" | "content_page" | "image_page" }>): void {

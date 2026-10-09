@@ -1,4 +1,6 @@
 /** Wire contract. Only broadcast events consume sequence numbers. */
+import { WORKBENCH_ACTIONS, type WorkbenchQuery, type WorkbenchResult } from "./workbench.js";
+export * from "./workbench.js";
 export const PROTOCOL = "pi-pane.v1";
 export const WS_PATH = "/ws";
 
@@ -48,7 +50,7 @@ export const LIMITS = {
 export const IMAGE_TYPES = ["image/png", "image/jpeg", "image/webp"] as const;
 export type ImageType = (typeof IMAGE_TYPES)[number];
 
-export const COMMANDS = ["prompt", "abort", "set_model", "set_thinking", "compact"] as const;
+export const COMMANDS = ["prompt", "abort", "set_model", "set_thinking", "compact", "session_new", "session_switch", "session_fork", "session_tree", "run_command"] as const;
 export type CommandName = (typeof COMMANDS)[number];
 
 /** `total` is present when `text` is a prefix of a longer block readable through content_page. */
@@ -90,6 +92,8 @@ export interface StateView {
   idle: boolean;
   running: boolean;
   compacting: boolean;
+  /** A host control operation is pending; all write commands are temporarily blocked. */
+  mutating?: boolean;
   hasPendingMessages: boolean;
   model?: ModelView;
   thinking: string;
@@ -116,6 +120,8 @@ export interface Caps {
   terminalDialogs: true;
   history: "paged";
   content: "paged";
+  /** Omitted on hosts which cannot supply a fresh command context and workspace reads. */
+  workbench?: true;
 }
 export interface Snapshot {
   t: "snapshot";
@@ -226,6 +232,7 @@ export type ClientMessage =
   | HistoryPageRequest
   | ContentPageRequest
   | ImagePageRequest
+  | WorkbenchQuery
   | CommandEnvelope;
 export type ServerMessage =
   | { t: "welcome"; clientId: string; leaseExpiresAt: number; nextCommandNo: number }
@@ -239,7 +246,8 @@ export type ServerMessage =
   | CommandResult
   | HistoryPage
   | ContentPage
-  | ImagePage;
+  | ImagePage
+  | WorkbenchResult;
 /** Transport framing for logical frames above LIMITS.frameBytes. Never interleaved with other frames. */
 export type ChunkFrame =
   | { t: "frame_begin"; id: string; parts: number }
@@ -261,6 +269,10 @@ function shortString(value: unknown, max = 256): value is string {
 function nonNegativeInt(value: unknown): value is number {
   return Number.isSafeInteger(value) && (value as number) >= 0;
 }
+/** Slash invocation names may be Unicode, but cannot contain separators or control characters. */
+export function isCommandInvocationName(value: unknown): value is string {
+  return shortString(value, 128) && !/[\s/\u0000-\u001f\u007f]/u.test(value);
+}
 export function parseClientMessage(value: unknown): ClientMessage {
   if (!isRecord(value)) throw new ProtocolError("invalid_envelope", "Expected a JSON object.");
   if (value.t === "hello" && exactKeys(value, ["t", "clientId"]) &&
@@ -277,12 +289,33 @@ export function parseClientMessage(value: unknown): ClientMessage {
   if (value.t === "image_page" && exactKeys(value, ["t", "reqId", "epoch", "messageId", "index"]) &&
       shortString(value.reqId, 64) && shortString(value.epoch) && shortString(value.messageId) &&
       nonNegativeInt(value.index) && (value.index as number) < 1024) return value as unknown as ImagePageRequest;
+  if (value.t === "workbench_query" && exactKeys(value, ["t", "reqId", "epoch", "sessionId", "branchRevision", "action", "args"]) &&
+      shortString(value.reqId, 64) && shortString(value.epoch) && shortString(value.sessionId) && nonNegativeInt(value.branchRevision) &&
+      WORKBENCH_ACTIONS.includes(value.action as WorkbenchQuery["action"])) {
+    workbenchArgs(value.action as WorkbenchQuery["action"], value.args);
+    return value as unknown as WorkbenchQuery;
+  }
   if (value.t === "command" && exactKeys(value, ["t", "clientId", "commandNo", "id", "epoch", "sessionId", "branchRevision", "command", "args"]) &&
       shortString(value.clientId) && shortString(value.id) && shortString(value.epoch) && shortString(value.sessionId) &&
       shortString(value.command, 64) && Number.isSafeInteger(value.commandNo) && (value.commandNo as number) >= 1 &&
       nonNegativeInt(value.branchRevision) && "args" in value &&
       value.id === `${value.clientId}:${value.commandNo}`) return value as unknown as CommandEnvelope;
   throw new ProtocolError("invalid_envelope", "Invalid message envelope or command ID.");
+}
+export function workbenchArgs(action: WorkbenchQuery["action"], value: unknown): Record<string, unknown> {
+  if (!isRecord(value)) throw new ProtocolError("invalid_args", "Query args must be an object.");
+  if (action === "sessions") {
+    if (!exactKeys(value, ["query", "scope"]) || (value.query !== undefined && (typeof value.query !== "string" || value.query.length > 256)) ||
+        (value.scope !== undefined && value.scope !== "workspace" && value.scope !== "all"))
+      throw new ProtocolError("invalid_args", "Provide a search query and workspace or all scope.");
+  } else if (action === "files") {
+    if (!exactKeys(value, ["query"]) || (value.query !== undefined && (typeof value.query !== "string" || value.query.length > 256)))
+      throw new ProtocolError("invalid_args", "File search is limited to 256 characters.");
+  } else if (action === "file" || action === "git_diff") {
+    if (!exactKeys(value, ["path"]) || !shortString(value.path, 4096))
+      throw new ProtocolError("invalid_args", "Provide one workspace-relative file path.");
+  } else if (Object.keys(value).length) throw new ProtocolError("invalid_args", "This query takes no arguments.");
+  return value;
 }
 export function commandArgs(command: string, value: unknown): Record<string, unknown> {
   if (!isRecord(value)) throw new ProtocolError("invalid_args", "Command args must be an object.");
@@ -298,7 +331,19 @@ export function commandArgs(command: string, value: unknown): Record<string, unk
   } else if (command === "set_thinking") {
     if (!exactKeys(value, ["level"]) || !["off", "minimal", "low", "medium", "high", "xhigh", "max"].includes(String(value.level)))
       throw new ProtocolError("invalid_args", "Invalid thinking level.");
-  } else if (command === "abort" || command === "compact") {
+  } else if (command === "session_switch") {
+    if (!exactKeys(value, ["sessionId"]) || !shortString(value.sessionId)) throw new ProtocolError("invalid_args", "Provide a session ID from the catalog.");
+  } else if (command === "session_fork") {
+    if (!exactKeys(value, ["entryId", "position"]) || !shortString(value.entryId) ||
+        (value.position !== undefined && value.position !== "before" && value.position !== "at"))
+      throw new ProtocolError("invalid_args", "Provide a session entry and before or at position.");
+  } else if (command === "session_tree") {
+    if (!exactKeys(value, ["entryId"]) || !shortString(value.entryId)) throw new ProtocolError("invalid_args", "Provide a session entry ID.");
+  } else if (command === "run_command") {
+    if (!exactKeys(value, ["name", "args"]) || !isCommandInvocationName(value.name) ||
+        (value.args !== undefined && (typeof value.args !== "string" || new TextEncoder().encode(value.args).length > 8192)))
+      throw new ProtocolError("invalid_args", "Provide a registered command name and up to 8 KiB of arguments.");
+  } else if (command === "abort" || command === "compact" || command === "session_new") {
     if (Object.keys(value).length) throw new ProtocolError("invalid_args", "This command takes no arguments.");
   } else throw new ProtocolError("unknown_command", "Unknown command.");
   return value;

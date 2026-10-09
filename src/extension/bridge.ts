@@ -1,11 +1,13 @@
 import { randomUUID } from "node:crypto";
-import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { SessionManager, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { WorkspaceService } from "./workspace.js";
 import { ThinkingTimings } from "./thinking.js";
 import { ThemeMapper } from "./theme.js";
 import {
-  COMMANDS, LIMITS, ProtocolError, base64Length, commandArgs, decodeBase64, diffMessage, encodedSize, inspectImage, isRecord, toWireError,
+  COMMANDS, LIMITS, ProtocolError, base64Length, commandArgs, decodeBase64, diffMessage, encodedSize, inspectImage, isCommandInvocationName, isRecord, toWireError,
   type CommandResult, type ContentPage, type ContentView, type HistoryPage, type ImagePage, type MessageView, type ModelView, type PromptImage,
-  type ProjectionEvent, type Snapshot, type StateView, type ToolView,
+  type ProjectionEvent, type Snapshot, type StateView, type ToolView, workbenchArgs,
+  type WorkbenchAction, type WorkbenchValues, type WorkbenchCommand, type SessionCatalogItem, type SessionTreeItem,
 } from "../protocol/index.js";
 
 export interface BridgeObserver {
@@ -14,7 +16,7 @@ export interface BridgeObserver {
   switching(reason: string): void;
 }
 export interface BridgeOptions {
-  pi: Pick<ExtensionAPI, "sendUserMessage" | "getThinkingLevel" | "setThinkingLevel" | "setModel">;
+  pi: Pick<ExtensionAPI, "sendUserMessage" | "getThinkingLevel" | "setThinkingLevel" | "setModel"> & Partial<Pick<ExtensionAPI, "getCommands" | "getAllTools" | "getActiveTools">>;
   ctx: ExtensionContext;
   generation: number;
   isCurrent?: () => boolean;
@@ -26,10 +28,33 @@ export interface BridgeOptions {
   pollMs?: number;
   /** Monotonic clock for observed thinking intervals; injectable for deterministic tests. */
   now?: () => number;
+  /** Each invocation must obtain its own fresh ExtensionCommandContext from the host. */
+  sessionCommand?: (command: "session_new" | "session_switch" | "session_fork" | "session_tree", args: Record<string, unknown>, expected: { sessionId: string; generation: number; branchRevision: number }, complete: Completion) => void;
+  /** A session command can outlive the outgoing Bridge; the process owns this write fence. */
+  isSessionMutationPending?: () => boolean;
+  /** Private nonce command is filtered from browser discovery. */
+  internalCommand?: string;
+  /** Host-owned recent directories, bounded to 32 by the process lifecycle. Never supplied by a browser. */
+  sessionDirectories?: readonly string[];
 }
 type EventLike = { type: string; [key: string]: unknown };
 type SnapshotBody = Omit<Snapshot, "t" | "epoch" | "seq">;
 type Completion = (result: Pick<CommandResult, "status" | "value" | "error">) => void;
+const SESSION_COMMANDS = new Set(["session_new", "session_switch", "session_fork", "session_tree"]);
+const BUILTIN_COMMANDS: WorkbenchCommand[] = [
+  ["new", "新建会话", "new"], ["resume", "查找并恢复历史会话", "sessions"],
+  ["tree", "切换会话分支", "tree"], ["fork", "从历史消息创建分叉", "tree"],
+  ["model", "选择已配置的模型", "model"], ["thinking", "调整思考强度", "thinking"],
+  ["compact", "压缩当前会话上下文", "compact"], ["settings", "查看模型、工具和扩展资源", "resources"],
+  ["session", "查看当前会话信息", "status"],
+].map(([name, description, browserAction]) => ({ name: name!, description: description!, source: "builtin", available: true, browserAction: browserAction as WorkbenchCommand["browserAction"] }));
+for (const [name, description] of [
+  ["scoped-models", "配置终端快捷切换的模型"], ["export", "导出会话"], ["import", "导入会话文件"],
+  ["share", "分享会话"], ["bug", "报告问题"], ["copy", "复制最后一条回复"], ["name", "重命名会话"],
+  ["changelog", "查看更新日志"], ["hotkeys", "查看终端快捷键"], ["clone", "克隆当前会话"],
+  ["trust", "管理项目可信状态"], ["login", "登录模型供应商"], ["logout", "退出模型供应商登录"],
+  ["reload", "重新加载扩展和资源"], ["quit", "退出 pi"],
+]) BUILTIN_COMMANDS.push({ name: name!, description: description!, source: "builtin", available: false, terminalOnly: true, reason: "此命令目前需要在终端执行。" });
 type RawBlock =
   | { type: "text" | "diff"; text: string }
   | { type: "thinking"; text: string; contentIndex: number }
@@ -96,12 +121,15 @@ export class Bridge {
   private readonly themeMapper = new ThemeMapper();
   private readonly timer: ReturnType<typeof setInterval>;
   private refreshTimer?: ReturnType<typeof setTimeout>;
+  private sessionPaths = new Map<string, string>();
+  private readonly workspace: WorkspaceService;
 
   constructor(options: BridgeOptions) {
     this.options = options;
     this.thinkingTimings = new ThinkingTimings(options.now ?? (() => performance.now()), MAX_BLOCKS);
     this.generation = options.generation;
     this.sessionId = options.ctx.sessionManager.getSessionId();
+    this.workspace = new WorkspaceService(options.ctx.cwd);
     this.refreshBranch();
     this.timer = setInterval(() => {
       if (!this.isCurrent() || (!this.observer && !this.treePending)) return;
@@ -118,6 +146,14 @@ export class Bridge {
 
   isCurrent(): boolean { return !this.disposed && (this.options.isCurrent?.() ?? true); }
   get blocked(): boolean { return this.treePending; }
+  private get mutating(): boolean { return this.mutationPending || !!this.options.isSessionMutationPending?.(); }
+  /** Lifecycle completions use the currently bound Bridge to clear the shared write fence promptly. */
+  refreshState(): void { this.publishState(); }
+  get hasWorkbench(): boolean {
+    return !!this.options.sessionCommand && typeof this.options.pi.getCommands === "function" &&
+      typeof this.options.pi.getAllTools === "function" && typeof this.options.pi.getActiveTools === "function" &&
+      ["getEntries", "getEntry", "getLabel", "getSessionDir"].every((method) => typeof (this.options.ctx.sessionManager as unknown as Record<string, unknown>)[method] === "function");
+  }
   setObserver(observer?: BridgeObserver): void {
     this.observer = observer;
     this.lastState = "";
@@ -515,7 +551,7 @@ export class Bridge {
     const ctx = this.options.ctx;
     const idle = ctx.isIdle();
     return {
-      idle, running: !idle, compacting: this.compactPending,
+      idle, running: !idle, compacting: this.compactPending, mutating: this.mutating,
       hasPendingMessages: ctx.hasPendingMessages(),
       ...(ctx.model ? { model: this.modelView(ctx.model) } : {}),
       thinking: this.options.pi.getThinkingLevel(),
@@ -549,7 +585,7 @@ export class Bridge {
         messages: window.messages, olderCursor: window.olderCursor,
       },
       state: this.state(), theme: this.theme(),
-      caps: { commands: COMMANDS, images: true, promptReceipt: "dispatch_only", queueView: "boolean", terminalDialogs: true, history: "paged", content: "paged" },
+      caps: { commands: this.hasWorkbench ? COMMANDS : COMMANDS.slice(0, 5), images: true, promptReceipt: "dispatch_only", queueView: "boolean", terminalDialogs: true, history: "paged", content: "paged", ...(this.hasWorkbench ? { workbench: true } : {}) },
     });
   }
   /** Older persisted messages strictly before `before`, newest page first in budget, returned in order. */
@@ -606,6 +642,104 @@ export class Bridge {
     if (!info) throw new ProtocolError("invalid_image", "The stored image is not a PNG, JPEG or WebP file.");
     return { messageId, index, mimeType: info.mimeType, data: block.data };
   }
+  private commands(): WorkbenchCommand[] {
+    const registered = this.options.pi.getCommands?.() ?? [];
+    const reserved = new Set(BUILTIN_COMMANDS.map((command) => command.name));
+    const priority = { extension: 0, skill: 1, prompt: 2 };
+    const names = new Set<string>();
+    const commands = registered.filter((command) => command.name !== this.options.internalCommand).slice(0, 512)
+      .sort((a, b) => priority[a.source] - priority[b.source]).map((command): WorkbenchCommand => {
+        const collision = !isCommandInvocationName(command.name) ? "此命令名称目前无法在网页中调用。" :
+          reserved.has(command.name) ? "此名称由 pi 内置命令使用，请通过对应工作台入口操作。" :
+          names.has(command.name) ? "另一项同名资源会优先执行，因此此入口不可用。" : undefined;
+        names.add(command.name);
+        return { name: command.name.slice(0, 128), description: (command.description ?? "").slice(0, 2048), source: command.source, available: !collision, ...(collision ? { reason: collision } : {}) };
+      });
+    return [...BUILTIN_COMMANDS, ...commands].sort((a, b) => a.name.localeCompare(b.name));
+  }
+  /** Bounded metadata only: never return raw session entries, tool parameters or arbitrary settings. */
+  async workbenchQuery<A extends WorkbenchAction>(action: A, input: unknown, revision: number): Promise<WorkbenchValues[A]> {
+    this.assertCurrent();
+    if (!this.hasWorkbench) throw new ProtocolError("unsupported_host", "This host cannot provide workbench commands.");
+    if (this.treePending || revision !== this.branchRevision) throw new ProtocolError("stale_session", "Refresh the session snapshot before reading the workbench.");
+    const args = workbenchArgs(action, input);
+    const ctx = this.options.ctx;
+    let value: WorkbenchValues[WorkbenchAction];
+    if (action === "sessions") {
+      const signal = AbortSignal.timeout(8000);
+      let sessions;
+      if (args.scope === "all") {
+        // The default catalog scans per-workspace subdirectories, while an explicit
+        // --session-dir can store transcripts directly at its root. Resume also
+        // changes getSessionDir() to the destination's parent, so retain recent roots.
+        const directories = [...new Set([...(this.options.sessionDirectories ?? []), ctx.sessionManager.getSessionDir()])].slice(-32);
+        const catalogs = await Promise.all([SessionManager.listAll(undefined, signal),
+          ...directories.map((directory) => SessionManager.listAll(directory, undefined, signal))]);
+        const unique = new Map<string, (typeof catalogs)[number][number]>();
+        for (const session of catalogs.flat()) {
+          const previous = unique.get(session.id);
+          if (!previous || session.modified.getTime() > previous.modified.getTime()) unique.set(session.id, session);
+        }
+        sessions = [...unique.values()];
+      } else sessions = await SessionManager.list(ctx.cwd, ctx.sessionManager.getSessionDir(), undefined, signal);
+      const search = (typeof args.query === "string" ? args.query : "").trim().toLocaleLowerCase();
+      const filtered = sessions.filter((session) => !search || [session.name, session.cwd, session.firstMessage, session.allMessagesText].some((text) => text?.toLocaleLowerCase().includes(search)))
+        .sort((a, b) => b.modified.getTime() - a.modified.getTime());
+      const retained = filtered.slice(0, 200);
+      // Resolve browser IDs only from the host catalog. A browser can never pass an arbitrary session path.
+      this.sessionPaths = new Map(sessions.map((session) => [session.id, session.path]));
+      const items: SessionCatalogItem[] = retained.map((session) => ({
+        id: session.id, cwd: session.cwd, ...(session.name ? { name: session.name.slice(0, 256) } : {}),
+        created: session.created.toISOString(), modified: session.modified.toISOString(), messageCount: session.messageCount,
+        firstMessage: session.firstMessage.slice(0, 256), current: session.id === this.sessionId,
+      }));
+      if (!search && !items.some((session) => session.current)) items.unshift({ id: this.sessionId, cwd: ctx.cwd, name: ctx.sessionManager.getSessionName(),
+        created: "", modified: "", messageCount: this.branch.length, firstMessage: "", current: true });
+      value = { sessions: items, truncated: filtered.length > retained.length };
+    } else if (action === "commands") value = { commands: this.commands() };
+    else if (action === "resources") {
+      const active = new Set(this.options.pi.getActiveTools?.() ?? []);
+      value = {
+        tools: (this.options.pi.getAllTools?.() ?? []).slice(0, 256).map((tool) => ({ name: tool.name, description: tool.description.slice(0, 2048), active: active.has(tool.name),
+          ...(tool.exposure ? { exposure: tool.exposure } : {}) })),
+        commands: this.commands(), models: ctx.modelRegistry.getAvailable().slice(0, 256).map((model) => this.modelView(model)),
+        capabilities: [
+          { name: "session", available: true, detail: "新建、恢复、分叉并切换会话分支。" },
+          { name: "workspace", available: true, detail: "预览当前工作区文件和 Git 改动。" },
+          { name: "dialogs", available: false, detail: "扩展的交互式提问仍需在终端完成。" },
+          { name: "authentication", available: false, detail: "在终端使用 /login 登录后，可在此选择已配置的模型。" },
+          { name: "resource-management", available: false, detail: "可查看工具、技能和模板；安装和配置扩展仍需在终端完成。" },
+        ],
+      };
+    } else if (action === "tree") {
+      const entries = ctx.sessionManager.getEntries().filter((entry) => {
+        const raw = entry as unknown as Record<string, unknown>;
+        const message = isRecord(raw.message) ? raw.message : undefined;
+        // Match the conversation projection: structured system updates with no
+        // visible body belong to host state, rather than the reader's branch tree.
+        return message?.role !== "system" || this.rawBlocks(message).blocks.some((block) =>
+          block.type === "toolCall" || block.type === "image" || block.text.trim().length > 0);
+      });
+      const retained = entries.slice(-2000);
+      const leaf = ctx.sessionManager.getLeafId();
+      const items: SessionTreeItem[] = retained.map((entry) => {
+        const raw = entry as unknown as Record<string, unknown>;
+        const message = isRecord(raw.message) ? raw.message : undefined;
+        const preview = message ? typeof message.content === "string" ? message.content : Array.isArray(message.content) ? textOf(message) : ""
+          : textOf(raw.summary ?? raw.content ?? raw.type);
+        return { id: entry.id, parentId: entry.parentId, type: entry.type, preview: preview.slice(0, 256),
+          ...(message && typeof message.role === "string" ? { role: message.role } : {}), ...(typeof raw.timestamp === "string" ? { timestamp: raw.timestamp } : {}),
+          ...(ctx.sessionManager.getLabel(entry.id) ? { label: ctx.sessionManager.getLabel(entry.id) } : {}), current: entry.id === leaf };
+      });
+      value = { entries: items, leafId: leaf, truncated: retained.length !== entries.length };
+    } else if (action === "files") value = await this.workspace.files(args.query as string | undefined);
+    else if (action === "file") value = await this.workspace.file(args.path as string);
+    else if (action === "git_status") value = await this.workspace.gitStatus();
+    else value = await this.workspace.gitDiff(args.path as string);
+    this.assertCurrent();
+    if (this.treePending || revision !== this.branchRevision) throw new ProtocolError("stale_session", "The session changed while reading the workbench.");
+    return value as WorkbenchValues[A];
+  }
   /** Validation / host dispatch is synchronous. Never waits for a model turn. */
   dispatch(command: string, input: unknown, complete: Completion): void {
     this.assertCurrent();
@@ -613,41 +747,87 @@ export class Bridge {
     const args = commandArgs(command, input);
     const ctx = this.options.ctx;
     const pi = this.options.pi;
+    if (this.mutating) throw new ProtocolError("busy", "Wait until the pending host operation has completed before submitting.");
     if (command !== "prompt" && command !== "abort" &&
-      (!ctx.isIdle() || this.compactPending || this.mutationPending || this.uiPrompts.length > 0))
+      (!ctx.isIdle() || this.compactPending || this.uiPrompts.length > 0))
       throw new ProtocolError("busy", "Wait until the session and terminal dialogs are idle.");
     const revision = this.branchRevision;
     const done: Completion = (result) => {
       if (this.isCurrent() && revision === this.branchRevision) complete(result);
     };
+    if (SESSION_COMMANDS.has(command)) {
+      if (!this.hasWorkbench) throw new ProtocolError("unsupported_host", "Session commands are unavailable on this host.");
+      if (ctx.hasPendingMessages()) throw new ProtocolError("busy", "Queued messages must settle before changing sessions.");
+      const gatewayArgs = { ...args };
+      if (command === "session_switch") {
+        const path = this.sessionPaths.get(args.sessionId as string);
+        if (!path) throw new ProtocolError("unknown_session", "Refresh the session catalog before resuming this session.");
+        if (args.sessionId === this.sessionId) { done({ status: "completed", value: { cancelled: false, unchanged: true } }); return; }
+        gatewayArgs.sessionPath = path;
+      }
+      if (command === "session_fork" || command === "session_tree") {
+        if (!ctx.sessionManager.getEntry(args.entryId as string)) throw new ProtocolError("unknown_entry", "This entry is not in the current session.");
+      }
+      this.mutationPending = true;
+      this.publishState();
+      try {
+        this.options.sessionCommand!(command as Parameters<NonNullable<BridgeOptions["sessionCommand"]>>[0], gatewayArgs,
+          { sessionId: this.sessionId, generation: this.generation, branchRevision: revision }, (result) => {
+            this.mutationPending = false;
+            // A fresh command handler observes the actual lifecycle result. Its original receipt remains correlated even after replacement.
+            complete(result);
+            if (this.isCurrent()) { this.publishState(); this.refreshLater(); }
+          });
+      } catch (error) { this.mutationPending = false; this.publishState(); throw error; }
+      return;
+    }
     if (command === "prompt") {
       const images = (args.images ?? []) as PromptImage[];
       const text = args.text as string;
       const options = { deliverAs: (args.mode ?? "followUp") as "steer" | "followUp", expandPromptTemplates: false };
       if (!images.length) pi.sendUserMessage(text, options);
       else pi.sendUserMessage([...(text ? [{ type: "text" as const, text }] : []), ...images.map((image) => ({ type: "image" as const, ...image }))], options);
+    } else if (command === "run_command") {
+      if (!this.hasWorkbench) throw new ProtocolError("unsupported_host", "Slash discovery is unavailable on this host.");
+      const commands = this.commands();
+      const known = commands.find((entry) => entry.name === args.name && entry.available) ?? commands.find((entry) => entry.name === args.name);
+      if (!known) throw new ProtocolError("unknown_command", "This command is not registered in the active session.");
+      if (!known.available) throw new ProtocolError(known.terminalOnly ? "terminal_required" : "command_collision", known.reason ?? "This command is unavailable.");
+      if (known.source === "builtin") {
+        if (known.name === "new") this.dispatch("session_new", {}, complete);
+        else if (known.name === "compact") this.dispatch("compact", {}, complete);
+        else if (known.name === "session") done({ status: "completed", value: { id: this.sessionId, cwd: ctx.cwd, name: ctx.sessionManager.getSessionName() } });
+        else throw new ProtocolError("picker_required", "Use the workbench picker for this command.");
+      } else {
+        pi.sendUserMessage(`/${known.name}${args.args ? ` ${args.args}` : ""}`, { deliverAs: "followUp", expandPromptTemplates: true });
+      }
     } else if (command === "abort") {
       ctx.abort();
     } else if (command === "set_model") {
       const model = ctx.modelRegistry.find(args.provider as string, args.id as string);
       if (!model) throw new ProtocolError("unknown_model", "Model is not registered.");
       this.mutationPending = true;
-      void pi.setModel(model).then((ok) => {
-        done(ok ? { status: "completed", value: this.modelView(model) } : { status: "failed", error: { code: "model_auth_unavailable", message: "Model authentication is not configured." } });
-      }, (error: unknown) => done({ status: "failed", error: toWireError(error) })).finally(() => {
-        this.mutationPending = false;
-        if (this.isCurrent()) this.publishState();
-      });
+      this.publishState();
+      try {
+        void pi.setModel(model).then((ok) => {
+          done(ok ? { status: "completed", value: this.modelView(model) } : { status: "failed", error: { code: "model_auth_unavailable", message: "Model authentication is not configured." } });
+        }, (error: unknown) => done({ status: "failed", error: toWireError(error) })).finally(() => {
+          this.mutationPending = false;
+          if (this.isCurrent()) this.publishState();
+        });
+      } catch (error) { this.mutationPending = false; this.publishState(); throw error; }
     } else if (command === "set_thinking") {
       pi.setThinkingLevel(args.level as Parameters<ExtensionAPI["setThinkingLevel"]>[0]);
       done({ status: "completed", value: { level: pi.getThinkingLevel() } });
     } else if (command === "compact") {
       if (ctx.hasPendingMessages()) throw new ProtocolError("busy", "Queued messages must settle before compaction.");
       this.compactPending = true;
-      ctx.compact({
-        onComplete: () => { this.compactPending = false; done({ status: "completed" }); this.refreshLater(); },
-        onError: (error) => { this.compactPending = false; done({ status: "failed", error: toWireError(error) }); this.refreshLater(); },
-      });
+      try {
+        ctx.compact({
+          onComplete: () => { this.compactPending = false; done({ status: "completed" }); this.refreshLater(); },
+          onError: (error) => { this.compactPending = false; done({ status: "failed", error: toWireError(error) }); this.refreshLater(); },
+        });
+      } catch (error) { this.compactPending = false; throw error; }
     }
     this.refreshLater();
   }

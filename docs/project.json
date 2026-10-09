@@ -1,7 +1,7 @@
 {
   "name": "pi pane",
-  "stage": "M2",
-  "stageStatus": "published-awaiting-stable-daily-use",
+  "stage": "M3",
+  "stageStatus": "first-increment-verified-with-followup",
   "m0CompletedDate": "2026-10-08",
   "m1LocalAcceptanceCompletedDate": "2026-10-08",
   "m2LocalAcceptanceCompletedDate": "2026-10-08",
@@ -19,12 +19,12 @@
   "localFollowUpAutomationId": "pi-pane-m0-space",
   "localFollowUpStatus": "PAUSED",
   "evidenceDirectory": "build-artifacts/m2/pi-1.1-trial",
-  "liveTaskStatusSource": "docs/m2-trial-status.md",
+  "liveTaskStatusSource": "docs/m3-status.md",
   "nextSteps": [
-    "Verify pi 1.1.0 compatibility and load pi-pane in the daily terminal",
-    "Exercise /web, terminal/browser conversation, tools and refresh/reconnect with a real model",
-    "Fix trial issues, publish to npm and verify installation from the public registry",
-    "Advance M3 after stable daily-use feedback"
+    "Exercise the unreleased M3 workbench source with a real provider",
+    "Reproduce and diagnose the recorded slow-reconnect acceptance timeout using persisted failure evidence",
+    "Resolve follow-up issues before a new npm release and formal installation verification",
+    "Continue M3-C resource writes and interactive decisions, then M3-D ownership and handoff; retain daily stability feedback"
   ],
   "pi110CompatibilityStatus": "key-regressions-passed",
   "dailyPackageLoadStatus": "verified",
@@ -39,7 +39,7 @@
   "npmPublishAttemptStatus": "published",
   "releaseCandidateStatus": "published-and-integrity-verified",
   "publicationEvidenceDirectory": "build-artifacts/m2/npm-release",
-  "m3Status": "not-started",
+  "m3Status": "in-progress",
   "npmPackageName": "@lilibonk/pi-pane",
   "npmPackageVersion": "0.1.0",
   "npmPackageUrl": "https://www.npmjs.com/package/@lilibonk/pi-pane",
@@ -50,5 +50,78 @@
   "publishedRealModelTrialStatus": "passed",
   "publishedRealModelTrialCompletedDate": "2026-10-09",
   "galleryLastCheckedDate": "2026-10-09",
-  "formalInstallationCompletedDate": "2026-10-09"
+  "formalInstallationCompletedDate": "2026-10-09",
+  "m3ImplementationStatus": "m3-a-core-b-first-increment-verified-with-followup",
+  "uiParityStatus": "first-increment-verified-full-parity-incomplete",
+  "uiAuditEvidenceDirectory": "build-artifacts/kimi-alignment/current",
+  "m3Reference": {
+    "package": "@moonshot-ai/kimi-code",
+    "version": "2.1.1",
+    "commit": "242ac230006447f8601e1678c49182bfbae89fe9",
+    "selection": "official-current-version",
+    "verifiedDate": "2026-10-09"
+  },
+  "m3PriorityOrder": [
+    "Workbench information architecture and capability mapping",
+    "Session, command, context and file/diff workflows",
+    "Resources, settings and interactive decisions",
+    "Ownership, handoff and recovery"
+  ],
+  "m3StartedDate": "2026-10-09",
+  "m3ImplementationBranch": "codex/m3-workbench",
+  "m3EvidenceDirectory": "build-artifacts/m3/workbench",
+  "m3SourcePublicationStatus": "unreleased",
+  "m3AStatus": "first-increment-verified",
+  "m3BStatus": "first-increment-verified",
+  "m3CStatus": "resource-overview-only-controls-and-decisions-pending",
+  "m3DStatus": "not-started",
+  "m3Verification": {
+    "hostVersion": "1.1.0",
+    "typecheck": "passed",
+    "build": "passed",
+    "unitTests": {
+      "passed": 92,
+      "total": 92,
+      "status": "passed"
+    },
+    "existingTuiSmoke": {
+      "passed": 21,
+      "total": 21,
+      "status": "passed",
+      "report": "build-artifacts/m3/smoke/smoke-report.json"
+    },
+    "workbenchTui": {
+      "definedChecks": 15,
+      "passed": 15,
+      "total": 15,
+      "status": "passed-independent-final-rerun",
+      "report": "build-artifacts/m3/workbench/report.json"
+    },
+    "browser": {
+      "passed": 22,
+      "total": 22,
+      "status": "passed",
+      "method": "CUA",
+      "widths": [1280, 843, 390],
+      "consoleErrors": 0,
+      "report": "build-artifacts/m3/workbench/browser-report.json"
+    },
+    "realModelCalls": 0,
+    "summary": "build-artifacts/m3/workbench/validation.json",
+    "cleanup": {
+      "status": "verified",
+      "report": "build-artifacts/m3/workbench/cleanup.json"
+    }
+  },
+  "m3VerifiedDate": "2026-10-09",
+  "m3RealProviderTrialStatus": "pending",
+  "m3FollowUps": [
+    {
+      "name": "slow-reconnect-acceptance-timeout",
+      "status": "unresolved-root-cause",
+      "report": "build-artifacts/m3/workbench/report-reconnect-first.json",
+      "evidenceLimit": "Original provider/client evidence was insufficient; passing reruns do not establish a cause",
+      "diagnostics": "Failure terminal, provider events and client state persistence added for reproduction"
+    }
+  ]
 }

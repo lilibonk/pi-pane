@@ -50,9 +50,12 @@ test("model completion after generation replacement cannot publish a new-session
   try {
     const results: unknown[] = [];
     f.bridge.dispatch("set_model", { provider: "fixture", id: "fixture" }, (result) => results.push(result));
+    assert.ok(f.events.some((event) => event.type === "agent_state" && event.state.mutating === true),
+      "the current session must immediately publish the pending control state");
+    const dispatchedEventCount = f.events.length;
     f.stale(); f.resolveModel(true); await tick();
     assert.deepEqual(results, []);
-    assert.equal(f.events.length, 0);
+    assert.equal(f.events.length, dispatchedEventCount, "the stale completion must not publish any further events");
   } finally { f.bridge.dispose(); }
 });
 

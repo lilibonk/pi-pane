@@ -57,6 +57,78 @@ function envelope(clientId: string, hub: Hub, commandNo: number): CommandEnvelop
     sessionId: "fixture-session", branchRevision: 0, command: "prompt", args: { text: "test" } };
 }
 
+test("workbench queries are directed and discard results after an epoch change", async () => {
+  let resolveRead: (value: unknown) => void = () => {};
+  const requests: unknown[] = [];
+  const f = await fixture({}, { workbenchQuery: (action: string, args: unknown, revision: number) => {
+    requests.push([action, args, revision]); return new Promise((resolve) => { resolveRead = resolve; });
+  } });
+  try {
+    const a = await client(f.hub); const b = await client(f.hub);
+    await a.wait("snapshot"); await b.wait("snapshot");
+    const originalEpoch = f.hub.epoch;
+    a.send({ t: "workbench_query", reqId: "w1", epoch: originalEpoch, sessionId: "fixture-session", branchRevision: 0, action: "commands", args: {} });
+    await until(() => requests.length === 1, "query invoked");
+    f.observer()?.reset("branch_change");
+    resolveRead({ commands: [] });
+    const result = await a.wait("workbench_result");
+    assert.ok(result.t === "workbench_result");
+    assert.equal(result.reqId, "w1"); assert.equal(result.epoch, originalEpoch); assert.equal(result.error?.code, "stale_session");
+    assert.equal(f.calls(), 0);
+    assert.equal(f.hub.seq, 0);
+    assert.equal(b.frames.some((frame) => frame.t === "workbench_result"), false);
+    const from = a.frames.length;
+    a.send({ t: "workbench_query", reqId: "w2", epoch: f.hub.epoch, sessionId: "fixture-session", branchRevision: 99, action: "commands", args: {} });
+    const stale = await a.wait("workbench_result", from);
+    assert.ok(stale.t === "workbench_result"); assert.equal(stale.error?.code, "stale_session");
+    assert.equal(requests.length, 1);
+  } finally { await f.close(); }
+});
+
+test("observed session lifecycle outcomes retain receipts after reset and reconnect", async () => {
+  let completions = 0;
+  let f: Awaited<ReturnType<typeof fixture>>;
+  f = await fixture({}, { dispatch: (_command: string, _args: unknown, complete: (result: unknown) => void) => {
+    completions++; f.observer()?.reset("new"); complete({ status: "completed", value: { cancelled: false } });
+  } });
+  try {
+    const c = await client(f.hub);
+    const welcome = c.frames.find((frame) => frame.t === "welcome"); assert.ok(welcome?.t === "welcome");
+    const command = { ...envelope(welcome.clientId, f.hub, 1), command: "session_new", args: {} };
+    c.send(command);
+    const result = await c.wait("command_result");
+    assert.ok(result.t === "command_result"); assert.equal(result.epoch, command.epoch); assert.equal(result.status, "completed");
+    await c.close();
+    const connected = await client(f.hub, welcome.clientId);
+    const from = connected.frames.length;
+    connected.send({ t: "receipt_query", clientId: welcome.clientId, id: command.id });
+    const queried = await connected.wait("command_result", from);
+    assert.deepEqual(queried, result);
+    connected.send(command);
+    await connected.wait("ack", connected.frames.length - 1);
+    assert.equal(completions, 1, "old envelope replay never repeats a session lifecycle action");
+  } finally { await f.close(); }
+});
+
+test("ordinary asynchronous completions remain fenced by the original epoch", async () => {
+  let complete: ((result: unknown) => void) | undefined;
+  const f = await fixture({}, { dispatch: (_command: string, _args: unknown, callback: typeof complete) => { complete = callback; } });
+  try {
+    const c = await client(f.hub);
+    const welcome = c.frames.find((frame) => frame.t === "welcome"); assert.ok(welcome?.t === "welcome");
+    const command = { ...envelope(welcome.clientId, f.hub, 1), command: "set_model", args: { provider: "fixture", id: "model" } };
+    c.send(command); await c.wait("ack");
+    f.observer()?.reset("replaced");
+    complete?.({ status: "completed", value: { provider: "fixture", id: "model" } });
+    await delay(10);
+    assert.equal(c.frames.some((frame) => frame.t === "command_result"), false);
+    const from = c.frames.length;
+    c.send({ t: "receipt_query", clientId: welcome.clientId, id: command.id });
+    const result = await c.wait("error", from);
+    assert.ok(result.t === "error"); assert.equal(result.error.code, "result_unavailable");
+  } finally { await f.close(); }
+});
+
 test("dedupe high-water mark survives receipt eviction and rejected commands consume their number", async () => {
   const f = await fixture({ receiptLimit: 2 });
   try {

@@ -7,6 +7,7 @@ import {
   startConnection, submitPrompt, webStore, type Attachment, type MessageView, type Submission, type ToolView, type WebState,
 } from "./store.js";
 import { Message, ToolCard, type ToolContext } from "./messages.js";
+import { CommandMenu, Workbench, useWorkbenchQuery, type WorkbenchController } from "./workbench.js";
 import "./style.css";
 
 function useWebState(): WebState {
@@ -24,7 +25,8 @@ function useWebState(): WebState {
 
 function receiptLabel(item: Submission): string {
   if (item.command === "prompt" && item.status === "dispatched") return "已交给 pi；提交结果未确认";
-  return ({ sent: "等待桥接回执", dispatched: "已调用；等待状态变化", rejected: "桥接拒绝", unknown: "结果未知，请检查终端", completed: "操作已完成", failed: "操作失败" })[item.status];
+  if (item.command === "run_command" && item.status === "dispatched") return "已交给 pi；执行结果见会话输出";
+  return ({ sent: "等待桥接回执", dispatched: "已调用；等待状态变化", rejected: "桥接拒绝", unknown: "结果未知，请检查终端", completed: "操作已完成", cancelled: "操作已取消", failed: "操作失败" })[item.status];
 }
 
 function Receipts({ items, online, onRecover }: { items: Submission[]; online: boolean; onRecover: (text: string) => void }) {
@@ -105,6 +107,7 @@ function App() {
   const { snapshot, connection } = state;
   const textarea = useRef<HTMLTextAreaElement>(null);
   const fileInput = useRef<HTMLInputElement>(null);
+  const workbench = useRef<WorkbenchController>();
   const feed = useRef<HTMLDivElement>(null);
   const feedInner = useRef<HTMLDivElement>(null);
   const [windowSize, setWindowSize] = useState(WINDOW);
@@ -118,8 +121,12 @@ function App() {
   const themeKeys = useRef<string[]>([]);
   const online = connection === "online" && !!snapshot && !!state.clientId;
   const host = snapshot?.state;
-  const canPrompt = online && !!snapshot?.caps.commands.includes("prompt") && !host?.compacting && !host?.uiPrompts.length;
-  const canConfigure = online && !!host?.idle && !host.compacting && !host.uiPrompts.length;
+  const controlPending = state.submissions.some(item => item.epoch === snapshot?.epoch &&
+    (item.command.startsWith("session_") || item.command === "set_model" || item.command === "compact") &&
+    (item.status === "sent" || item.status === "dispatched"));
+  const canPrompt = online && !controlPending && !!snapshot?.caps.commands.includes("prompt") && !host?.mutating && !host?.compacting && !host?.uiPrompts.length;
+  const canConfigure = online && !controlPending && !!host?.idle && !host.mutating && !host.compacting && !host.uiPrompts.length;
+  const commandCatalog = useWorkbenchQuery(state, "commands");
   const messages = snapshot?.session.messages;
   // Pair each tool call with its result and live progress; paired results render inside the call.
   const view = useMemo(() => {
@@ -231,6 +238,23 @@ function App() {
   }
   function submit(mode: "followUp" | "steer") {
     if (!canPrompt || composing.current) return;
+    const slash = /^\/([^\s]+)(?:\s+([\s\S]*))?$/.exec(state.draft.trim());
+    if (snapshot?.caps.workbench && slash && (commandCatalog.loading || !commandCatalog.value)) {
+      webStore.setState({ notice: "命令清单尚未加载，正在重新读取；请稍后再提交。" });
+      if (commandCatalog.error) commandCatalog.reload();
+      return;
+    }
+    const command = snapshot?.caps.workbench && slash ? commandCatalog.value?.commands.find(item => item.name === slash[1] && item.available) || commandCatalog.value?.commands.find(item => item.name === slash[1]) : undefined;
+    if (command && slash) {
+      if (state.attachments.length) { webStore.setState({ notice: "执行命令前请移除图片；命令与图片消息需要分别提交。" }); return; }
+      if (!command.available) { webStore.setState({ notice: command.reason || "此命令需要在终端使用。" }); return; }
+      if (!workbench.current?.execute(command, slash[2] || "")) { webStore.setState({ notice: "当前无法执行此命令，请等待运行结束，或使用对应面板完成操作。" }); return; }
+      webStore.setState({ notice: "" });
+      setDraft("");
+      // Picker commands own focus; clearing their syntax must not return it to the composer.
+      if (!command.browserAction || command.browserAction === "new" || command.browserAction === "compact") textarea.current?.focus();
+      return;
+    }
     submitPrompt(mode); goLatest(); textarea.current?.focus();
   }
   function onKeyDown(event: JSX.TargetedKeyboardEvent<HTMLTextAreaElement>) {
@@ -243,18 +267,18 @@ function App() {
   return (
     <div class="app-shell">
       <header class="topbar">
-        <div class="brand"><span class="brand-icon">π</span><span>pi-pane</span><span class="milestone">M2</span></div>
+        <div class="brand"><span class="brand-icon">π</span><span>pi-pane</span></div>
         <div class="connection">
           <span class={`status-dot status-${connection}`} /><span>{labels[connection]}</span>
           {state.authMode === "password" && connection !== "login" && <button type="button" class="quiet logout-button" onClick={() => void logout()}>退出登录</button>}
         </div>
       </header>
+      <Workbench state={state} canConfigure={canConfigure} commands={commandCatalog.value?.commands ?? []} controller={workbench} onFocusComposer={() => textarea.current?.focus()}>
       <div class="session-bar">
         <div class="session-identity"><h1>{snapshot?.session.name || "当前 pi 会话"}</h1><p title={snapshot?.session.cwd}>{snapshot?.session.cwd || "在浏览器中继续当前终端会话"}</p></div>
         <div class="session-details">
-          <span>{host?.compacting ? "压缩上下文中" : host?.running ? "正在运行" : host?.idle ? "空闲" : "状态未知"}</span>
+          <span>{host?.mutating || controlPending ? "正在处理会话或模型操作" : host?.compacting ? "压缩上下文中" : host?.running ? "正在运行" : host?.idle ? "空闲" : "状态未知"}</span>
           {host?.hasPendingMessages && <span class="queue-badge">存在待发消息</span>}
-          {snapshot && <span class="mono">分支 {snapshot.session.branchRevision} · seq {state.lastAppliedSeq}</span>}
         </div>
       </div>
       {connection === "login" ? <div class="timeline"><div class="timeline-inner"><Login state={state} />{state.notice && <p class="login-notice" role="status">{state.notice}</p>}</div></div> : <>
@@ -278,22 +302,26 @@ function App() {
             <label><span>thinking</span><select aria-label="thinking 等级" value={host?.thinking ?? "off"} disabled={!canConfigure || !snapshot?.caps.commands.includes("set_thinking")} onChange={event => issueCommand("set_thinking", { level: event.currentTarget.value })}>{["off", "minimal", "low", "medium", "high", "xhigh", "max"].map(level => <option value={level} key={level}>{level}</option>)}</select></label>
             <button type="button" class="compact-button" disabled={!canConfigure || !!host?.hasPendingMessages || !snapshot?.caps.commands.includes("compact")} onClick={() => issueCommand("compact")}>压缩上下文</button>
           </div>
+          <div class="composer-wrap">
+          {snapshot?.caps.workbench && <CommandMenu commands={commandCatalog.value?.commands ?? []} draft={state.draft} onChoose={command => { setDraft(`/${command.name} `); textarea.current?.focus(); }} />}
           <div class={`composer ${!canPrompt ? "composer-disabled" : ""} ${dragging ? "composer-dragging" : ""}`}
             onDragOver={event => { if (canAttach && event.dataTransfer?.types.includes("Files")) { event.preventDefault(); setDragging(true); } }}
             onDragLeave={() => setDragging(false)}
             onDrop={event => { setDragging(false); if (!canAttach || !event.dataTransfer?.files.length) return; event.preventDefault(); attachImages([...event.dataTransfer.files]); }}>
             <Attachments items={state.attachments} error={state.attachmentError} />
             {!!state.attachments.length && host?.model?.images === false && <p class="warn-text">当前模型未声明支持图片输入，pi 可能会忽略这些图片。</p>}
-            <textarea ref={textarea} aria-label="消息" rows={3} placeholder={host?.running ? coarsePointer ? "补充下一步…" : "补充下一步… Enter 请求 followUp；⌘ / Ctrl + Enter 请求 steer" : "给 pi 发送消息…"} value={state.draft} onInput={event => setDraft(event.currentTarget.value)} onKeyDown={onKeyDown}
+            <textarea ref={textarea} aria-label="消息" rows={3} placeholder={host?.running ? coarsePointer ? "补充下一步…" : "补充下一步… Enter 请求 followUp；⌘ / Ctrl + Enter 请求 steer" : snapshot?.caps.workbench ? "给 pi 发送消息… / 命令 · @ 文件" : "给 pi 发送消息…"} value={state.draft} onInput={event => { const draft = event.currentTarget.value; setDraft(draft); const mention = /(?:^|\s)@([^\s]*)$/.exec(draft); if (snapshot?.caps.workbench && mention && !composing.current) workbench.current?.files(true, mention[1]); }} onKeyDown={onKeyDown}
               onPaste={event => { if (canAttach && event.clipboardData?.files.length && attachImages([...event.clipboardData.files])) event.preventDefault(); }} />
             <input ref={fileInput} type="file" accept={IMAGE_TYPES.join(",")} multiple hidden onChange={event => { attachImages([...(event.currentTarget.files ?? [])]); event.currentTarget.value = ""; }} />
-            <div class="composer-actions"><span class="input-hint">{coarsePointer ? "Enter 换行 · 按钮发送" : "Enter 发送 · Shift + Enter 换行 · 可粘贴或拖入图片"}</span><div class="action-buttons"><button type="button" class="attach-button" disabled={!canAttach || state.attachments.length >= 4} onClick={() => fileInput.current?.click()} aria-label="添加图片">图片</button>{host && !host.idle && <button type="button" class="abort-button" disabled={!online || !snapshot?.caps.commands.includes("abort")} onClick={() => issueCommand("abort")}>■ 中止</button>}<button type="button" class="steer-button" disabled={!canPrompt || (!state.draft.trim() && !state.attachments.length)} onClick={() => submit("steer")} title="⌘ / Ctrl + Enter">steer</button><button type="button" class="send-button" disabled={!canPrompt || (!state.draft.trim() && !state.attachments.length)} onClick={() => submit("followUp")}>{host?.running ? "请求 followUp ↗" : "发送 ↗"}</button></div></div>
+            <div class="composer-actions"><div class="context-buttons"><button type="button" class="attach-button" disabled={!canAttach || state.attachments.length >= 4} onClick={() => fileInput.current?.click()} aria-label="添加图片">图片</button>{snapshot?.caps.workbench && <button type="button" disabled={!online} onClick={() => workbench.current?.files(true)} aria-label="引用工作区文件">@ 文件</button>}</div><div class="action-buttons">{host && !host.idle && <button type="button" class="abort-button" disabled={!online || !snapshot?.caps.commands.includes("abort")} onClick={() => issueCommand("abort")}>■ 中止</button>}<button type="button" class="steer-button" disabled={!canPrompt || (!state.draft.trim() && !state.attachments.length)} onClick={() => submit("steer")} title="⌘ / Ctrl + Enter">steer</button><button type="button" class="send-button" disabled={!canPrompt || (!state.draft.trim() && !state.attachments.length)} onClick={() => submit("followUp")}>{host?.running ? "请求 followUp ↗" : "发送 ↗"}</button></div></div>
           </div>
-          <p class="scope-note">网页按原文提交，不执行 slash 命令，也不展开模板 / skill。回执只确认已交给 pi。</p>
+          </div>
+          <p class="scope-note">{snapshot?.caps.workbench ? coarsePointer ? "Enter 换行 · 按钮发送 · / 查看命令" : "Enter 发送 · Shift + Enter 换行 · / 查看命令 · @ 引用文件" : "网页按原文提交；回执确认已交给 pi。"}</p>
           <Receipts items={state.submissions} online={online} onRecover={text => { setDraft(text); textarea.current?.focus(); }} />
         </div>
       </footer>
       </>}
+      </Workbench>
     </div>
   );
 }

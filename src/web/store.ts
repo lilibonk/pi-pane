@@ -1,10 +1,12 @@
 import { createStore } from "zustand/vanilla";
 import type { CommandName, ImageType, MessageView, PromptImage, Snapshot } from "../protocol/index.js";
 import { IMAGE_TYPES, LIMITS, applyProjectionEvent, boundedTools, decodeBase64, encodedSize, inspectImage, isTextContent, mergeOlderPage } from "../protocol/index.js";
+import type { WorkbenchAction, WorkbenchValues } from "../protocol/workbench.js";
+import { TreeDraftRecovery } from "./draft-recovery.js";
 export type { ContentView, MessageView, Snapshot, ToolView } from "../protocol/index.js";
 
 export type Connection = "connecting" | "login" | "online" | "resyncing" | "switching" | "disconnected" | "fatal";
-type ReceiptStatus = "sent" | "dispatched" | "rejected" | "unknown" | "completed" | "failed";
+type ReceiptStatus = "sent" | "dispatched" | "rejected" | "unknown" | "completed" | "cancelled" | "failed";
 export interface Submission {
   id: string;
   epoch: string;
@@ -84,6 +86,9 @@ let opened = false;
 let requestNo = 0;
 let historyRequest: string | undefined;
 const contentRequests = new Map<string, string>();
+const workbenchRequests = new Map<string, { epoch: string; action: WorkbenchAction; resolve: (value: any) => void; reject: (error: Error) => void; dispose: () => void }>();
+const treeDraftRecovery = new TreeDraftRecovery();
+let draftRevision = 0;
 let assembling: { id: string; parts: number; chunks: string[] } | undefined;
 
 function readSession(key: string): string | null {
@@ -125,6 +130,8 @@ async function detectAuthMode(): Promise<"local" | "password"> {
   return body.mode === "password" ? "password" : "local";
 }
 function requireLogin(notice: string) {
+  treeDraftRecovery.cancel();
+  cancelWorkbenchReads();
   stopped = true;
   sessionToken = "";
   clearSession(SESSION_KEY);
@@ -195,6 +202,7 @@ function send(frame: unknown): boolean {
 
 function resync(message: string) {
   if (webStore.getState().connection === "resyncing") return;
+  treeDraftRecovery.cancel();
   resetReads();
   webStore.setState({ connection: "resyncing", notice: message });
   send({ t: "resync" });
@@ -202,6 +210,7 @@ function resync(message: string) {
 
 /** Read requests belong to one epoch; a new snapshot discards their pending state. */
 function resetReads() {
+  cancelWorkbenchReads();
   historyRequest = undefined;
   contentRequests.clear();
   // Loaded images stay cached (their bytes do not change); unfinished reads are retried when visible.
@@ -209,6 +218,39 @@ function resetReads() {
   imageRequests.clear();
   imageQueue.length = 0;
   webStore.setState({ historyLoading: false, historyError: "", expansions: {} });
+}
+
+/** A directed workbench read is bounded and is never replayed after a reconnect. */
+function cancelWorkbenchReads() {
+  for (const request of workbenchRequests.values()) {
+    request.dispose();
+    request.reject(new Error("会话或连接已变化，请重新加载。"));
+  }
+  workbenchRequests.clear();
+}
+
+export function queryWorkbench<A extends WorkbenchAction>(action: A, args: Record<string, unknown> = {}, signal?: AbortSignal): Promise<WorkbenchValues[A]> {
+  const state = webStore.getState();
+  const snapshot = state.snapshot;
+  if (state.connection !== "online" || !snapshot?.caps.workbench) return Promise.reject(new Error("工作台未连接，请稍后重试。"));
+  if (signal?.aborted) return Promise.reject(new Error("读取已取消。"));
+  return new Promise((resolve, reject) => {
+    const reqId = `workbench:${++requestNo}`;
+    const finishError = (message: string) => {
+      const request = workbenchRequests.get(reqId);
+      if (!request) return;
+      workbenchRequests.delete(reqId);
+      request.dispose();
+      reject(new Error(message));
+    };
+    const onAbort = () => finishError("读取已取消。");
+    const timer = setTimeout(() => finishError("读取超时，请重新加载。"), 15_000);
+    const dispose = () => { clearTimeout(timer); signal?.removeEventListener("abort", onAbort); };
+    workbenchRequests.set(reqId, { epoch: snapshot.epoch, action, resolve, reject, dispose });
+    signal?.addEventListener("abort", onAbort, { once: true });
+    if (!send({ t: "workbench_query", reqId, epoch: snapshot.epoch, sessionId: snapshot.session.id,
+      branchRevision: snapshot.session.branchRevision, action, args })) finishError("连接已断开，请重新加载。");
+  });
 }
 
 /** Keeps the retained history within the browser cache by evicting the oldest persisted messages. */
@@ -225,6 +267,15 @@ function capHistory(snapshot: Snapshot): Snapshot {
   const kept = messages.slice(first);
   const cursor = kept.find(message => message.entryId)?.entryId ?? snapshot.session.olderCursor;
   return { ...snapshot, session: { ...snapshot.session, messages: kept, olderCursor: cursor } };
+}
+
+function restoreTreeDraft() {
+  const state = webStore.getState();
+  if (state.connection !== "online" || !state.snapshot) return;
+  const recovery = treeDraftRecovery.reconcile(state.snapshot.session, state.draft, draftRevision);
+  if (!recovery) return;
+  if (recovery.restore) setDraft(recovery.text);
+  else webStore.setState({ notice: "已返回所选消息之前。原输入保存在提交记录中，可点“恢复到输入框”；当前草稿已保留。" });
 }
 
 function handleFrame(raw: unknown) {
@@ -244,6 +295,7 @@ function handleFrame(raw: unknown) {
       resetReads();
       const snapshot = capHistory({ ...frame, state: { ...frame.state, tools: boundedTools(frame.state.tools) } } as Snapshot);
       webStore.setState(state => ({ snapshot, lastAppliedSeq: frame.seq, connection: "online", notice: "", snapshotCount: state.snapshotCount + 1 }));
+      restoreTreeDraft();
       attempt = 0;
       break;
     }
@@ -300,12 +352,24 @@ function handleFrame(raw: unknown) {
       pumpImages();
       break;
     }
+    case "workbench_result": {
+      const request = workbenchRequests.get(frame.reqId);
+      if (!request) return;
+      workbenchRequests.delete(frame.reqId);
+      request.dispose();
+      if (frame.epoch !== request.epoch || frame.epoch !== current.snapshot?.epoch || frame.action !== request.action) request.reject(new Error("会话已变化，请重新加载。"));
+      else if (frame.error) request.reject(new Error(typeof frame.error.message === "string" ? frame.error.message : "读取失败。"));
+      else if (frame.value === undefined) request.reject(new Error("未收到工作台数据。"));
+      else request.resolve(frame.value);
+      break;
+    }
     case "session_reset":
       uncertainSubmissions(frame.epoch);
       resetReads();
       webStore.setState({ snapshot: null, lastAppliedSeq: 0, connection: "switching", notice: "终端已切换会话或分支，等待新快照…" });
       break;
     case "switching":
+      cancelWorkbenchReads();
       webStore.setState({ connection: "switching", notice: "终端正在切换会话，写操作暂时暂停…" });
       break;
     case "ack": {
@@ -315,11 +379,20 @@ function handleFrame(raw: unknown) {
         status: frame.status === "dispatched" ? "dispatched" : "rejected",
         explanation: frame.error?.message,
       });
+      if (frame.status !== "dispatched") treeDraftRecovery.cancel(frame.id);
       break;
     }
-    case "command_result":
-      updateSubmission(frame.id, { status: frame.status === "completed" ? "completed" : "failed", explanation: frame.error?.message });
+    case "command_result": {
+      const submission = current.submissions.find(item => item.id === frame.id);
+      const restored = submission?.command === "session_tree" && frame.status === "completed" && typeof frame.value?.draftText === "string" ? frame.value.draftText as string : undefined;
+      updateSubmission(frame.id, { status: frame.status === "completed" ? frame.value?.cancelled === true ? "cancelled" : "completed" : "failed", explanation: frame.error?.message });
+      if (restored !== undefined) {
+        updateSubmission(frame.id, { text: restored });
+        treeDraftRecovery.complete(frame.id, frame.value);
+        restoreTreeDraft();
+      } else treeDraftRecovery.cancel(frame.id);
       break;
+    }
     case "notice":
       webStore.setState({ notice: frame.message ?? frame.notice ?? "请检查终端提示。" });
       break;
@@ -327,6 +400,8 @@ function handleFrame(raw: unknown) {
       const code = frame.error?.code;
       const message = frame.error?.message ?? "连接发生错误。";
       if (typeof frame.reqId === "string") {
+        const workbench = workbenchRequests.get(frame.reqId);
+        if (workbench) { workbenchRequests.delete(frame.reqId); workbench.dispose(); workbench.reject(new Error(message)); }
         if (frame.reqId === historyRequest) {
           historyRequest = undefined;
           webStore.setState({ historyLoading: false, historyError: code === "stale_session" ? "会话已变化，请稍候重试。" : message });
@@ -348,6 +423,7 @@ function handleFrame(raw: unknown) {
       }
       if (Number.isSafeInteger(frame.nextCommandNo)) webStore.setState({ nextCommandNo: frame.nextCommandNo });
       if (code === "client_expired" || code === "unauthorized") {
+        treeDraftRecovery.cancel();
         stopped = true;
         uncertainSubmissions();
         webStore.setState({ connection: "fatal", notice: message });
@@ -425,7 +501,9 @@ function connect() {
     const wasOpen = opened;
     socket = null;
     assembling = undefined;
+    treeDraftRecovery.cancel();
     uncertainSubmissions();
+    cancelWorkbenchReads();
     if (stopped) return;
     if (event.reason === "connection_replaced" || event.reason === "client_expired") {
       stopped = true;
@@ -486,6 +564,8 @@ export function startConnection() {
 }
 
 export function reconnect() {
+  treeDraftRecovery.cancel();
+  cancelWorkbenchReads();
   clearTimeout(retryTimer);
   socket?.close();
   socket = null;
@@ -505,7 +585,7 @@ if (typeof document !== "undefined") document.addEventListener("visibilitychange
   if (document.visibilityState === "visible" && !stopped && webStore.getState().connection === "disconnected") reconnect();
 });
 
-export function setDraft(draft: string) { webStore.setState({ draft }); }
+export function setDraft(draft: string) { draftRevision++; webStore.setState({ draft }); }
 
 export function issueCommand(command: CommandName, args: Record<string, unknown> = {}, text?: string, mode?: "followUp" | "steer") {
   const state = webStore.getState();
@@ -518,7 +598,10 @@ export function issueCommand(command: CommandName, args: Record<string, unknown>
     ...(attached.length ? { images: attached.map(item => item.name) } : {}) };
   if (!send({ t: "command", clientId: state.clientId, commandNo, id, epoch: snapshot.epoch,
     sessionId: snapshot.session.id, branchRevision: snapshot.session.branchRevision, command, args })) return;
+  if (command.startsWith("session_")) treeDraftRecovery.cancel();
+  if (command === "session_tree") treeDraftRecovery.start(id, snapshot.session, draftRevision);
   webStore.setState({
+    notice: "",
     nextCommandNo: commandNo + 1,
     submissions: [...state.submissions, submission].slice(-32),
     ...(command === "prompt" ? { draft: "", attachments: [], attachmentError: "" } : {}),
@@ -526,7 +609,10 @@ export function issueCommand(command: CommandName, args: Record<string, unknown>
   if (command === "prompt") for (const item of attached) URL.revokeObjectURL(item.url);
   setTimeout(() => {
     const item = webStore.getState().submissions.find(entry => entry.id === id);
-    if (item?.status === "sent") updateSubmission(id, { status: "unknown", explanation: "尚未收到回执，请检查终端。原文已保留；不会自动重发。" });
+    if (item?.status === "sent") {
+      treeDraftRecovery.cancel(id);
+      updateSubmission(id, { status: "unknown", explanation: "尚未收到回执，请检查终端。原文已保留；不会自动重发。" });
+    }
   }, 15_000);
 }
 
@@ -662,11 +748,13 @@ export function retryImage(messageId: string, index: number) {
 }
 
 export function queryReceipt(id: string) {
+  treeDraftRecovery.cancel(id);
   const clientId = webStore.getState().clientId;
   if (clientId) send({ t: "receipt_query", clientId, id });
 }
 
 export function forgetSubmission(id: string) {
+  treeDraftRecovery.cancel(id);
   webStore.setState(state => ({ submissions: state.submissions.filter(item => item.id !== id) }));
 }
 

@@ -1,15 +1,16 @@
 import { spawn } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { ProtocolError } from "../protocol/index.js";
-import { Bridge } from "./bridge.js";
+import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { LIMITS, ProtocolError, isRecord, toWireError } from "../protocol/index.js";
+import { Bridge, type BridgeOptions } from "./bridge.js";
 import { Hub, type ExternalAccess } from "./hub.js";
 import { missingHostCapabilities, readPaneSettings } from "./config.js";
 import { qrLines, qrWidth } from "./qr.js";
 
-export const IMPLEMENTATION_VERSION = "m2.0";
+export const IMPLEMENTATION_VERSION = "m3.0";
 const QR_WIDGET = "pi-pane-qr";
 const QR_VISIBLE_MS = 120_000;
 export const PROCESS_STATE_KEY = Symbol.for("pi-pane.process.v1");
@@ -21,6 +22,13 @@ export interface ProcessState {
   hub?: Hub;
   bridge?: Bridge;
   starting?: Promise<Hub>;
+  /** Recent host-owned session directories survive resume/reload and /web stop within this process. */
+  sessionDirectories?: string[];
+  /** One-use actions remain fenced across session replacement until their actual completion. */
+  sessionMutations?: Set<string>;
+}
+export function rememberSessionDirectory(state: ProcessState, directory: string): void {
+  state.sessionDirectories = [...(state.sessionDirectories ?? []).filter((item) => item !== directory), directory].slice(-32);
 }
 /** This record survives stop/reload. It owns no sockets until /web or initial --web. */
 export function getProcessState(): ProcessState {
@@ -41,6 +49,89 @@ interface WebArgs {
   proxy?: boolean;
 }
 const ADDRESS_KEYS = ["host", "port", "publicOrigin", "tlsCert", "tlsKey", "proxy"] as const;
+/**
+ * pi's event context has no session-control methods. Dispatching a registered command creates
+ * a fresh command context in the host. Only the one-use nonce can select a pending operation;
+ * no context is cached and no browser-controlled slash command can call this private gateway.
+ */
+export function createSessionCommandGateway(pi: Pick<ExtensionAPI, "registerCommand" | "sendUserMessage">, current: () => Bridge | undefined, sessionMutations = new Set<string>()) {
+  const commandName = `pi-pane-internal-${randomUUID()}`;
+  type Pending = { command: Parameters<NonNullable<BridgeOptions["sessionCommand"]>>[0]; args: Record<string, unknown>;
+    expected: Parameters<NonNullable<BridgeOptions["sessionCommand"]>>[2]; complete: Parameters<NonNullable<BridgeOptions["sessionCommand"]>>[3];
+    timer: ReturnType<typeof setTimeout> };
+  const pending = new Map<string, Pending>();
+  const consume = async (nonce: string, ctx: ExtensionCommandContext): Promise<void> => {
+    const request = pending.get(nonce);
+    if (!request) return;
+    pending.delete(nonce); clearTimeout(request.timer);
+    try {
+      const bridge = current();
+      if (!bridge?.isCurrent() || bridge.generation !== request.expected.generation || bridge.sessionId !== request.expected.sessionId ||
+          bridge.branchRevision !== request.expected.branchRevision || ctx.sessionManager.getSessionId() !== request.expected.sessionId)
+        throw new ProtocolError("stale_session", "The session changed before the command could run.");
+      if (!ctx.isIdle() || ctx.hasPendingMessages()) throw new ProtocolError("busy", "The session must be idle before changing sessions.");
+      const method = request.command === "session_new" ? "newSession" : request.command === "session_switch" ? "switchSession" : request.command === "session_fork" ? "fork" : "navigateTree";
+      if (typeof ctx[method] !== "function") throw new ProtocolError("unsupported_host", "This pi host cannot perform the requested session action.");
+      let result: { cancelled: boolean };
+      let draftText: string | undefined;
+      if (request.command === "session_tree") {
+        const entry = ctx.sessionManager.getEntry(request.args.entryId as string);
+        const message = entry?.type === "message" && entry.message.role === "user" ? entry.message : entry?.type === "custom_message" ? entry : undefined;
+        if (message) {
+          const content = message.content;
+          const text = typeof content === "string" ? content : Array.isArray(content) ? content.map((part) => isRecord(part) && typeof part.text === "string" ? part.text : "").join("") : "";
+          const bytes = new TextEncoder().encode(text);
+          draftText = new TextDecoder("utf-8", { fatal: false }).decode(bytes.subarray(0, LIMITS.promptBytes));
+          // Remove an incomplete code point at the byte boundary rather than emitting invalid prompt text.
+          if (bytes.length > LIMITS.promptBytes && draftText.endsWith("\ufffd")) draftText = draftText.slice(0, -1);
+        }
+      }
+      if (request.command === "session_new") result = await ctx.newSession();
+      else if (request.command === "session_switch") result = await ctx.switchSession(request.args.sessionPath as string);
+      else if (request.command === "session_fork") result = await ctx.fork(request.args.entryId as string, { position: request.args.position as "before" | "at" | undefined });
+      else result = await ctx.navigateTree(request.args.entryId as string, { summarize: false });
+      // Only read the returned outcome after replacement. The old pi/ctx is deliberately unused.
+      const freshBridge = current();
+      const scope = !result.cancelled && freshBridge?.isCurrent() ? { sessionId: freshBridge.sessionId, branchRevision: freshBridge.branchRevision } : {};
+      request.complete({ status: "completed", value: { cancelled: result.cancelled, ...scope, ...(!result.cancelled && draftText !== undefined ? { draftText } : {}) } });
+    } catch (error) { request.complete({ status: "failed", error: toWireError(error) }); }
+  };
+  pi.registerCommand(commandName, { description: "Internal one-use pi-pane session action.", handler: consume });
+  const invoke: NonNullable<BridgeOptions["sessionCommand"]> = (command, args, expected, complete) => {
+    const bridge = current();
+    if (!bridge?.isCurrent() || bridge.generation !== expected.generation || bridge.sessionId !== expected.sessionId || bridge.branchRevision !== expected.branchRevision)
+      throw new ProtocolError("stale_session", "The session changed before dispatch.");
+    if (sessionMutations.size) throw new ProtocolError("busy", "Wait until the pending session action has completed.");
+    const nonce = randomUUID();
+    let completed = false;
+    const finish: typeof complete = (result) => {
+      if (completed) return;
+      completed = true;
+      sessionMutations.delete(nonce);
+      try { complete(result); }
+      finally { current()?.refreshState?.(); }
+    };
+    const timer = setTimeout(() => {
+      const request = pending.get(nonce);
+      if (!request) return;
+      pending.delete(nonce);
+      request.complete({ status: "failed", error: { code: "command_timeout", message: "The host did not execute the session command. Refresh before retrying." } });
+    }, 15_000);
+    timer.unref?.();
+    sessionMutations.add(nonce);
+    pending.set(nonce, { command, args, expected, complete: finish, timer });
+    try { pi.sendUserMessage(`/${commandName} ${nonce}`, { expandPromptTemplates: true, deliverAs: "followUp" }); }
+    catch (error) { pending.delete(nonce); sessionMutations.delete(nonce); clearTimeout(timer); throw error; }
+  };
+  const cancelPending = (): void => {
+    for (const request of pending.values()) {
+      clearTimeout(request.timer);
+      request.complete({ status: "failed", error: { code: "stale_session", message: "The session changed before the command could run." } });
+    }
+    pending.clear();
+  };
+  return { commandName, invoke, cancelPending, isPending: () => sessionMutations.size > 0 };
+}
 export function parseWebArgs(text: string): WebArgs {
   const parts = text.trim() ? text.trim().split(/\s+/) : [];
   const args: WebArgs = { action: "start", noOpen: false };
@@ -93,6 +184,10 @@ export default function piPane(pi: ExtensionAPI): void {
   const state = getProcessState();
   let ownedBridge: Bridge | undefined;
   let ownedContext: ExtensionContext | undefined;
+  const sessionMutations = state.sessionMutations ??= new Set<string>();
+  // Replacement loads a new extension closure. The process record, rather than this
+  // outgoing closure's ownedBridge, identifies the fresh Bridge for completion/state.
+  const sessionGateway = createSessionCommandGateway(pi, () => state.bridge, sessionMutations);
   const webRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../../web-dist");
 
   pi.registerFlag("web", { type: "boolean", default: false, description: "Mirror the current TUI session in a local browser." });
@@ -256,8 +351,11 @@ export default function piPane(pi: ExtensionAPI): void {
     }
     state.bridge?.dispose();
     const generation = ++state.generation;
+    if (typeof ctx.sessionManager.getSessionDir === "function") rememberSessionDirectory(state, ctx.sessionManager.getSessionDir());
     ownedContext = ctx;
-    ownedBridge = new Bridge({ pi, ctx, generation, isCurrent: () => state.generation === generation });
+    ownedBridge = new Bridge({ pi, ctx, generation, isCurrent: () => state.generation === generation,
+      sessionCommand: sessionGateway.invoke, internalCommand: sessionGateway.commandName, sessionDirectories: state.sessionDirectories,
+      isSessionMutationPending: sessionGateway.isPending });
     state.bridge = ownedBridge;
     if (state.hub?.running && state.desiredRunning) {
       state.hub.setConnectionListener(updateStatus);
@@ -273,6 +371,7 @@ export default function piPane(pi: ExtensionAPI): void {
     updateStatus();
   });
   pi.on("session_shutdown", async (event) => {
+    sessionGateway.cancelPending();
     hideQr();
     const bridge = ownedBridge;
     if (!bridge || state.bridge !== bridge) { bridge?.dispose(); return; }

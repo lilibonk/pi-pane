@@ -41,7 +41,8 @@
     "m2:images": "node scripts/m2-images.mjs",
     "m2:external": "node scripts/m2-external.mjs",
     "m2:install": "node scripts/m2-install.mjs",
-    "m2:real-model": "node scripts/m2-real-model.mjs"
+    "m2:real-model": "node scripts/m2-real-model.mjs",
+    "m3:workbench": "node scripts/m3-workbench.mjs"
   },
   "peerDependencies": {
     "@earendil-works/pi-ai": "*",
@@ -52,8 +53,8 @@
     "ws": "8.22.0"
   },
   "devDependencies": {
-    "@earendil-works/pi-ai": "1.0.4",
-    "@earendil-works/pi-coding-agent": "1.0.4",
+    "@earendil-works/pi-ai": "1.1.0",
+    "@earendil-works/pi-coding-agent": "1.1.0",
     "@shikijs/langs": "4.5.0",
     "@types/node": "24.7.0",
     "@types/ws": "8.18.1",
