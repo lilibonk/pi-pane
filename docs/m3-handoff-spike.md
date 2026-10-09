@@ -1,12 +1,35 @@
 # M3 Spike：Kimi 式 `/web` 交接
 
-日期：2026-10-09。分支 `spike/m3-handoff`（worktree `../pi-desktop-spike`，基于 `main` 9bbc5fa，开发依赖 pi 1.1.0）。目的：验证 pi-pane 能否像 Kimi Code 的 `/web` 一样，把当前会话**交给浏览器**，并以此决定 M3 工作台建立在哪种后端上。
+日期：2026-10-09（Kimi 参照已按 2.1.1 重新核对）。分支 `spike/m3-handoff`（worktree `../pi-desktop-spike`，基于 `main` 9bbc5fa，开发依赖 pi 1.1.0）。目的：验证 pi-pane 能否像 Kimi Code 的 `/web` 一样，把当前会话**交给浏览器**，并以此决定 M3 工作台建立在哪种后端上。
 
 **结论：可行。** 只用 pi 的公开能力（外加一处进程退出拦截）即可实现与 Kimi 等价的交接，且现有 Hub、Bridge、网页无需重写即可复用。7 项真实 TUI + Chrome 检查全部通过。建议 M3 以交接模式为基础，见文末。
 
-## Kimi 的参照行为（本地二进制 0.38.0，`src/tui/commands/web.ts`）
+## Kimi 的参照行为（Kimi Code 2.1.1）
 
-`/web` → `startNewServerAfterExit(host, sessionId)` 注册 `host.setExitForegroundTask(...)` → `host.stop()` 停止 TUI → 在原本 `process.exit` 的位置，**同一进程**变成 `kimi web` 服务（多会话），前台挂在当前终端直到 Ctrl+C，并打开 `/sessions/<id>#token=…` 深链接。它不是“关掉终端后存活”，也不是镜像。
+基线与 `docs/design.md` 一致：`@moonshot-ai/kimi-code@2.1.1`。来源：本机 `~/.kimi-code/bin/kimi`（`--version` 为 2.1.1）内嵌源码，与官方仓库标签 `@moonshot-ai/kimi-code@2.1.1` 及 commit `242ac23` 的 `apps/kimi-code/src/tui/commands/web.ts` 逐字一致。另核对了 `src/cli/sub/web/run.ts`、`shared.ts`、`packages/kap-server/src/start.ts`、`packages/remote-control/`、TUI 的 `stop()` / `onExit` 和斜杠命令注册。
+
+**`/web`**（`availability: "always"`，回复进行中也可使用）：
+
+1. 没有当前会话时报错。
+2. `startNewServerAfterExit(host, sessionId)` 通过 `host.setExitForegroundTask(...)` 登记退出接管，然后 `host.stop()`。
+3. `stop()` 关闭 TUI：关闭当前会话（进行中的回合随之结束），清空排队消息，关闭 harness，恢复终端。
+4. `onExit` 打印 `Bye!` 和 `To resume this session: kimi -r <id>`，然后**不调用 `process.exit`**，改为等待登记的前台任务。
+5. 前台任务在**同一进程**里启动多会话的 `kimi web` 服务，选项固定为 `parseServerOptions({})`：
+   - 只绑定本机 `127.0.0.1`，默认端口 58627，端口被占用就逐个加一，最多 100 次，因此可以和其他 Kimi 实例共存。
+   - token 取自持久化的 `<KIMI_CODE_HOME>/server.token`（0600），重启后 URL 不变。
+6. 服务就绪后打印就绪横幅（本机地址、`Network: off`、token、`Stop: Ctrl+C`）和 `Session:` 深链接 `/sessions/<id>#token=…`，并打开浏览器。
+7. 前台服务只处理 SIGINT/SIGTERM：关闭服务后 `process.exit(0)`，**不会再打印恢复提示**。关闭终端时由 SIGHUP 的默认行为终止进程。它不会在终端关闭后继续运行，也不是镜像。
+
+**和 0.38.0 相比**，`/web` 本身只多了错误处理和横幅细节，主体没变。周边的变化有：
+
+- **新增 `/remote-control`（别名 `/rc`）和 `kimi web --rc`**：
+  - 交接方式和 `/web` 相同，额外通过 Kimi 云中继 `https://code-rc.kimi.com` 把本机服务转发出去，需要 Kimi OAuth 登录；
+  - 只允许本机绑定，不能和 `--dangerous-bypass-auth` 同时使用；
+  - 每个数据目录只能有一个隧道（锁文件）；
+  - 网页可以通过 `GET/POST /api/v1/remote-control` 开关；
+  - 终端打印二维码，同时生成 PNG。
+- **`--allow-remote-terminals` 被移除**：PTY 终端路由只在本机绑定时可用。
+- kap-server 新增问答（questions）、文件历史、配置变更推送和 v2 MCP 路由，会话与 Web 资源的托管方式不变。网页资源内嵌在二进制里，首次启动时解压到缓存目录。
 
 ## 原型做法
 
@@ -58,7 +81,7 @@ pi 进程（同一终端）
 
 ## 发现的缺口（需上游或后续设计）
 
-1. **没有“退出时接管”钩子**：只能拦截 pi 的 `process.exit`。时序正确（一切关闭后才接管），但属于依赖实现细节。建议向 pi 提议等价于 Kimi `setExitForegroundTask` 的公开 API。同一问题导致 pi 先打印一行“To resume this session”，随后才是交接横幅。
+1. **没有“退出时接管”钩子**：只能拦截 pi 的 `process.exit`。时序正确（一切关闭后才接管），但属于依赖实现细节。建议向 pi 提议等价于 Kimi `setExitForegroundTask` 的公开 API。pi 先打印自己的“To resume this session”再出现交接横幅，这个顺序和 Kimi 2.1.1 相同，不算缺陷。
 2. **CLI 参数解析器未导出**：子进程参数由 `process.argv` 过滤得到；以初始提示启动的 TUI（位置参数）无法可靠区分。建议上游导出 `parseArgs` 或提供“以当前配置启动 RPC 宿主”的方法。
 3. **RPC `prompt` 总是展开 slash/模板/skill**：交接模式下网页输入与终端输入语义相同（与 Kimi 一致），不再是 0.1.0 的“字面提交”。界面已提示；如需字面输入需上游选项。
 4. **RPC 没有 `/tree` 导航**（有 `fork`、`clone`、`get_tree`）：交接模式下分支切换只能先做 fork；需上游命令或另行设计。
@@ -66,6 +89,20 @@ pi 进程（同一终端）
 6. **消息身份对应**：RPC 的事件与条目是不同对象，按角色 + 时间戳把持久化条目换回同一对象；同一毫秒同角色的两条消息理论上可能错配（未观察到）。
 7. 扩展的 TUI `custom()` 组件在 RPC 模式不可用（pi 文档已声明）。
 8. pi 没有会话文件锁：交接期间若另开一个 TUI 打开同一会话，会出现两个写入者——与今天开两个 TUI 的风险相同，可在宿主加文件锁检测。
+
+## 与 Kimi 2.1.1 的剩余差异
+
+| 项 | Kimi 2.1.1 | 原型 | 建议 |
+|---|---|---|---|
+| 命令 | `/web` | `/web handoff`（`/web` 仍是镜像） | 正式版改为 `/web` 默认交接 |
+| 回复进行中 | 可以用，进行中的回合随会话关闭而结束，排队消息丢弃 | 要求空闲且没有排队消息 | 保留空闲要求，或者先确认再中止后交接（需维护者决定） |
+| 交接后的服务 | 多会话的 `kimi web`，覆盖全部工作区 | Hub + 单个 RPC 子进程；会话列表覆盖各项目，一次只打开一个会话 | 多会话同时运行不在 M3 范围内 |
+| 绑定与端口 | 固定 `127.0.0.1`，58627 被占用时逐个加一 | 沿用 Hub：默认 `127.0.0.1:7878`，被占用时逐个加一（已一致） | `--web-*` 外部访问参数在交接后是否继续生效，需要单独验收 |
+| token | 持久化 `server.token`，重启后 URL 不变 | 沿用 Hub 当前 token（交接前后不变，重启 pi 后会变） | 可选：持久化 token |
+| 横幅 | 就绪横幅 + `Session:` 深链接，打开浏览器 | 交接横幅 + 打开浏览器 | 可以补上 URL 与 `Stop: Ctrl+C` |
+| Ctrl+C | 关闭服务，不打印恢复提示 | 关闭服务，打印 `pi --session <最后所在会话>` | 保留：浏览器里可能切换过会话，这条提示有用 |
+| 关闭终端 | SIGHUP 默认终止 | 捕获 SIGHUP，有序关闭子进程 | 保留 |
+| 外部访问 | `/remote-control` 走 Kimi 云中继 | 无云中继；M2 已有 HTTPS/代理 + 密码 + 二维码 | 不做云中继；用 M2 的外部访问对应，补齐外部访问与交接一起用的验收 |
 
 ## 原型未处理
 
