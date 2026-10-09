@@ -8,6 +8,13 @@ function evidence(event: string, data: Record<string, unknown> = {}) {
 }
 
 export default function handoffFixture(pi: ExtensionAPI) {
+  // Like extensions that persist state after an asynchronous step: write well after the turn settled.
+  const appendDelay = Number(process.env.PI_M0_APPEND_DELAY ?? 0);
+  let appended = 0;
+  if (appendDelay > 0) pi.on("agent_end", (_event, ctx) => {
+    if (ctx.mode !== "rpc") return;
+    setTimeout(() => { pi.appendEntry("m3-probe", { run: ++appended }); evidence("m3_probe_append", { pid: process.pid, run: appended }); }, appendDelay);
+  });
   pi.on("session_start", (event, ctx) => {
     evidence("m3_session", { pid: process.pid, mode: ctx.mode, reason: event.reason, sessionId: ctx.sessionManager.getSessionId(), sessionFile: ctx.sessionManager.getSessionFile(), cwd: ctx.cwd });
   });

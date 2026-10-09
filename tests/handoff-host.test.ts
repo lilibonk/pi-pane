@@ -37,8 +37,11 @@ class FakeChild implements RpcConnection {
     if (type === "get_state") value = { model: this.model, thinkingLevel: this.level, isStreaming: this.streaming, isCompacting: this.compacting, pendingMessageCount: this.pending,
       sessionFile: this.reportedPath ?? this.manager.getSessionFile(), sessionId: this.manager.getSessionId(), sessionName: this.manager.getSessionName() };
     else if (type === "get_entries") {
-      const since = this.entries.findIndex(entry => entry.id === payload.since);
-      value = { entries: structuredClone(payload.since ? this.entries.slice(since + 1) : this.entries), leafId: this.entries.at(-1)?.id ?? null };
+      // Like pi, report the session's current entries, including ones appended after startup.
+      const entries = this.manager.getEntries() as unknown as Record<string, unknown>[];
+      const since = entries.findIndex(entry => entry.id === payload.since);
+      if (payload.since && since < 0) throw new Error(`Entry ${String(payload.since)} not found`);
+      value = { entries: structuredClone(payload.since ? entries.slice(since + 1) : entries), leafId: entries.at(-1)?.id ?? null };
     } else if (type === "get_available_models") value = { models: [this.model] };
     else if (type === "get_available_thinking_levels") value = { levels: ["off", "low", "high"] };
     else if (type === "get_commands") value = { commands: this.commands };
@@ -224,6 +227,15 @@ test("idle external transcript modification stops the sole child without restart
   await appendFile(host.sessionFile, "unexpected external write\n");
   await assert.rejects(host.command("prompt", { text: "do not write" }), { code: "session_conflict" }); assert.equal(child.running, false);
   assert(!child.calls.some(call => call.type === "prompt"));
+}));
+test("entries an extension in the child persists later (after agent_end) are its own, not a conflict", async () => withHost(async (host, child) => {
+  await host.command("prompt", { text: "first" });
+  // e.g. an asynchronous agent_end handler calling pi.appendEntry well after the turn settled
+  child.manager.appendCustomEntry("review-probe", { run: 1 });
+  await host.command("prompt", { text: "second" });
+  assert.equal(child.running, true); assert.equal(child.calls.filter(call => call.type === "prompt").length, 2);
+  await appendFile(host.sessionFile, `${JSON.stringify({ type: "custom", id: "not-the-childs", parentId: null })}\n`);
+  await assert.rejects(host.command("prompt", { text: "third" }), { code: "session_conflict" }); assert.equal(child.running, false);
 }));
 test("trusted child startup persistence is acknowledged before first browser command", async () => withHost(async (host, child) => {
   await host.command("prompt", { text: "first" }); assert(child.calls.some(call => call.type === "prompt"));

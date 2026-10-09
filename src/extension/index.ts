@@ -84,8 +84,6 @@ async function externalAccess(args: WebArgs, cwd: string): Promise<ExternalAcces
 export default function piPane(pi: ExtensionAPI): void {
   const state = getProcessState();
   const webRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../../web-dist");
-  let ownedLock: SessionFileLock | undefined;
-  let ownedGeneration = 0;
   // Configuration flags remain; --web startup and the mirror command family are removed.
   pi.registerFlag("web-host", { type: "string", description: "Listen address for /web (loopback by default)." });
   pi.registerFlag("web-port", { type: "string", description: "Explicit port for /web." });
@@ -114,26 +112,15 @@ export default function piPane(pi: ExtensionAPI): void {
   };
 
   pi.on("session_start", async (_event, ctx) => {
-    // The RPC child also loads this extension, but never competes with its owning host's lock.
+    // Ordinary TUIs never take the lock, so several terminals can open one session as in plain pi.
+    // Only a session that a /web host currently owns gets a warning; nothing is closed.
     if (ctx.mode !== "tui") return;
-    ownedGeneration = ++state.generation;
+    state.generation++;
     const file = ctx.sessionManager.getSessionFile();
-    if (!file) return; // --no-session is refused only when /web is requested.
-    try {
-      await state.lock?.release();
-      ownedLock = await SessionFileLock.acquire(file);
-      state.lock = ownedLock;
-    } catch (error) {
-      notify(ctx, `pi-pane: ${error instanceof Error ? error.message : String(error)}. This TUI will close to protect the session.`, true);
-      ctx.shutdown();
-    }
-  });
-  pi.on("session_shutdown", async () => {
-    if (ownedGeneration !== state.generation || !ownedLock) return;
-    if (state.handoff) return; // Transfer ownership; do not create a lock gap at TUI shutdown.
-    await ownedLock.release();
-    if (state.lock === ownedLock) state.lock = undefined;
-    ownedLock = undefined;
+    if (!file) return;
+    const owner = await SessionFileLock.inspect(file).catch(() => undefined);
+    if (owner && owner.pid !== process.pid)
+      notify(ctx, `pi-pane: this session is running in a /web browser host (pid ${owner.pid}). Writing here conflicts with it; stop that host with Ctrl+C first.`, true);
   });
   pi.registerCommand("web", {
     description: "Hand this idle session to a foreground browser service. /web [--no-open]; Ctrl+C stops and prints the terminal resume command.",
@@ -160,9 +147,12 @@ export default function piPane(pi: ExtensionAPI): void {
         assertReady();
         // Validate access configuration and TLS before leaving the TUI; do not listen yet.
         new Hub({ host: args.host ?? "127.0.0.1", port: args.port ?? 7878, webRoot, ...(external ? { external } : {}) });
-        const lock = state.lock ?? await SessionFileLock.acquire(sessionFile);
-        await lock.acceptChanges(); // TUI's own writes are complete before ownership is transferred.
-        assertReady();
+        // Ownership is taken only now. A session another /web host owns refuses the handoff; the TUI stays.
+        const lock = await SessionFileLock.acquire(sessionFile);
+        try {
+          await lock.acceptChanges(); // TUI's own writes are complete before ownership is transferred.
+          assertReady();
+        } catch (error) { await lock.release(); throw error; }
         state.lock = lock;
         state.handoff = { sessionFile, sessionDir: ctx.sessionManager.getSessionDir(), cwd: ctx.cwd, argv,
           theme: ctx.ui.theme, themes: ctx.ui.getAllThemes(), lock, args, external, webRoot };

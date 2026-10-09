@@ -7,7 +7,7 @@ import type { Hub, HostHandler } from "./hub.js";
 import { childArgs } from "./child-args.js";
 import { RpcChild, type RpcConnection, type RpcRecord } from "./rpc-child.js";
 import { RpcSessionMirror } from "./rpc-session.js";
-import { SessionFileLock } from "./session-lock.js";
+import { SessionFileLock, type KnownEntry } from "./session-lock.js";
 import { WorkspaceService } from "./workspace.js";
 export { childArgs } from "./child-args.js";
 export { SessionFileLock } from "./session-lock.js";
@@ -77,7 +77,7 @@ export class HandoffHost implements HostHandler {
   private stopping = false;
   private stopPromise?: Promise<void>;
   private lock?: SessionFileLock;
-  private ownedWrite = false;
+  private verifying: Promise<void> = Promise.resolve();
   private unsubscribe?: () => void;
   private activeCwd: string;
   private lastSessionFile: string;
@@ -102,7 +102,6 @@ export class HandoffHost implements HostHandler {
       this.child = this.dependencies.createChild?.(args, this.target.cwd) ?? new RpcChild(args, this.target.cwd);
       this.unsubscribe = this.child.onRecord(record => {
         if (record.type === "extension_ui_request") this.dialog(record);
-        if (["message_end", "compaction_end", "session_info_changed", "model_select", "thinking_level_changed"].includes(record.type)) this.ownedWrite = true;
         // pi RPC does not emit a separate dialog-cancel event for AbortSignal. Once the
         // agent has settled, orphaned model/tool dialogs cannot still be awaiting a result.
         if (record.type === "agent_settled") for (const id of this.dialogs.keys()) if (!this.dialogOwners.has(id)) this.resolveDialog(id, "cancelled", true);
@@ -119,11 +118,31 @@ export class HandoffHost implements HostHandler {
     catch (error) { await this.stop(); throw error; }
   }
   private rememberDirectory(path: string): void { this.directories = [...this.directories.filter(value => value !== path), path].slice(-32); }
-  private async acceptOwnedChanges(): Promise<void> {
-    if (!this.ownedWrite || this.stopping) return;
-    this.ownedWrite = false;
-    try { await this.lock?.acceptChanges(); }
-    catch (error) { this.log("Session ownership disappeared; stopping the sole RPC writer."); await this.stop(); throw error; }
+  /**
+   * Accepts transcript growth that is the child's own (extensions may persist entries at any time,
+   * e.g. after an asynchronous agent_end handler) and stops the child on anything else.
+   * Serialized: refreshes and commands can ask at the same time.
+   */
+  private verifyOwnedChanges(): Promise<void> {
+    const run = async () => {
+      if (this.stopping || !this.lock) return;
+      try { await this.lock.verifyAppends(since => this.childEntries(since)); }
+      catch (error) {
+        this.log((error as { code?: string }).code === "session_conflict"
+          ? "Session ownership conflict detected; stopping the RPC child without restarting it."
+          : "Session ownership disappeared; stopping the sole RPC writer.");
+        await this.stop(); throw error;
+      }
+    };
+    const result = this.verifying.then(run, run);
+    this.verifying = result.catch(() => undefined);
+    return result;
+  }
+  /** The child's entries after `since` (all of them when the ID is unknown to it). */
+  private async childEntries(since?: string): Promise<KnownEntry[]> {
+    const request = (payload: Record<string, unknown>) => this.child!.request<{ entries: KnownEntry[] }>("get_entries", payload);
+    const result = since ? await request({ since }).catch(() => request({})) : await request({});
+    return result.entries;
   }
   private async rebind(reason: string): Promise<void> {
     this.mirror?.dispose(); this.bridge?.dispose();
@@ -132,7 +151,7 @@ export class HandoffHost implements HostHandler {
     this.lastSessionFile = state.sessionFile ?? this.lastSessionFile;
     this.activeCwd = await sessionCwd(state.sessionFile, this.activeCwd);
     if (state.sessionFile) this.rememberDirectory(dirname(state.sessionFile));
-    const mirror = new RpcSessionMirror(this.child!, this.activeCwd, this.target.theme, () => this.target.themes, () => {}, () => this.acceptOwnedChanges());
+    const mirror = new RpcSessionMirror(this.child!, this.activeCwd, this.target.theme, () => this.target.themes, () => {}, () => this.verifyOwnedChanges());
     try { await mirror.load(); } catch (error) { mirror.dispose(); throw error; }
     if (this.stopping) { mirror.dispose(); throw new Error("The handoff host stopped during startup."); }
     const bridge = new Bridge({ pi: mirror.api(), ctx: mirror.context(), generation, isCurrent: () => this.generation === generation && !this.stopping });
@@ -235,17 +254,14 @@ export class HandoffHost implements HostHandler {
     const result = this.child!.request("abort"); // send before dialog cancellation unblocks a queued command
     this.clearDialogs("cancelled", true);
     const value = await result;
-    this.ownedWrite = true; await this.refreshAfterWrite();
+    await this.refreshAfterWrite();
     return value;
   }
   private async execute(name: string, args: Record<string, unknown>): Promise<unknown> {
     const child = this.child!; await this.mirror!.synchronize();
     if (name !== "prompt" && name !== "abort" && name !== "run_command" && !this.mirror!.idle) throw new ProtocolError("busy", "Wait until replies and queued messages have settled.");
-    if (this.mirror!.idle) {
-      await this.acceptOwnedChanges();
-      try { await this.lock!.assertUnchanged(); }
-      catch (error) { this.log("Session ownership conflict detected; stopping the RPC child without restarting it."); await this.stop(); throw error; }
-    }
+    // Before every write: the transcript may only have grown by the child's own entries.
+    await this.verifyOwnedChanges();
     if (name === "session_tree") throw new ProtocolError("upstream_required", "pi RPC does not support tree navigation.");
     if (SESSION_WRITES.has(name)) {
       let nextLock: SessionFileLock | undefined;
@@ -298,17 +314,17 @@ export class HandoffHost implements HostHandler {
         ...(Array.isArray(args.images) && args.images.length ? { images: args.images.filter(isRecord).map(image => ({ type: "image", ...image })) } : {}),
         streamingBehavior: args.mode === "steer" ? "steer" : "followUp" });
       if (!["started", "queued", "handled"].includes(result?.disposition)) { await this.stop(); throw new Error("pi RPC did not report an authoritative prompt disposition; the child was stopped."); }
-      this.ownedWrite = true; await this.refreshAfterWrite(); return { disposition: result.disposition };
+      await this.refreshAfterWrite(); return { disposition: result.disposition };
     }
     let value: unknown;
     if (name === "abort") value = await child.request("abort");
     else if (name === "set_model") value = await child.request("set_model", { provider: args.provider, modelId: args.id });
     else if (name === "set_thinking") { const available = await child.request<{ levels: string[] }>("get_available_thinking_levels");
       if (!available.levels.includes(String(args.level))) throw new ProtocolError("unsupported_thinking", "This model does not support that thinking level."); value = await child.request("set_thinking_level", { level: args.level });
-    } else if (name === "compact") value = await child.request("compact", {}, 600_000);
+    } else if (name === "compact") value = await child.request("compact");
     else if (name === "session_rename") value = await child.request("set_session_name", { name: args.name });
     else throw new ProtocolError("unknown_command", "Unknown handoff command.");
-    this.ownedWrite = true; await this.refreshAfterWrite();
+    await this.refreshAfterWrite();
     return name === "session_rename" ? { name: this.mirror!.sessionName, sessionId: this.mirror!.sessionId } : value;
   }
   /** Registered RPC extension commands can replace sessions through their public command context. */
@@ -330,7 +346,7 @@ export class HandoffHost implements HostHandler {
       } catch (error) { await this.stop(); throw error; }
       finally { await nextLock?.release(); }
     } else { if (state.sessionFile) this.lastSessionFile = state.sessionFile; await this.mirror!.synchronize(); }
-    await this.acceptOwnedChanges();
+    await this.verifyOwnedChanges();
   }
   uiState(): HostUiState { return structuredClone(this.ui); }
   pendingDialogs(): Dialog[] { return [...this.dialogs.values()].map(dialog => structuredClone(dialog)); }

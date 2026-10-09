@@ -24,6 +24,16 @@ async function check(name, fn) {
   try { const details = await fn(); report.checks.push({ name, status: "passed", durationMs: Date.now() - started, details }); console.log(`PASS ${name}`); }
   catch (error) { report.checks.push({ name, status: "failed", durationMs: Date.now() - started, error: redact(error.stack ?? error) }); throw error; }
 }
+/** A second real TUI on the same pi configuration, opening `sessionFile`. */
+function contender(fixture, sessionFile) {
+  const proc = spawn("python3", [resolve("scripts/pty-host.py")], { stdio: ["pipe", "pipe", "pipe"] }); contenders.push(proc);
+  const state = { proc, text: "", exitCode: undefined, write(data) { proc.stdin.write(`${JSON.stringify({ type: "write", data })}\n`); } };
+  createInterface({ input: proc.stdout }).on("line", line => { const item = JSON.parse(line); if (item.type === "output") { state.text += item.data; if (item.data.includes("\u001b[6n")) state.write("\u001b[1;1R"); } if (item.type === "exit") state.exitCode = item.code; });
+  const argv = [...fixture.argv]; const oldSession = argv.indexOf("--session"); if (oldSession >= 0) argv.splice(oldSession, 2); argv.push("--session", sessionFile);
+  proc.stdin.write(`${JSON.stringify({ argv, cwd: fixture.cwd, env: fixture.env, controllingTty: true })}\n`);
+  return state;
+}
+const plain = text => text.replace(/\u001b\[[0-?]*[ -/]*[@-~]/g, "").replace(/\s+/g, " ");
 async function completed(client, name, args = {}) {
   const operation = await client.command(name, args); assert.equal(operation.ack.status, "dispatched", operation.ack.error?.message);
   const result = await commandResult(client, operation.frame); assert.equal(result.status, "completed", result.error?.message); return result;
@@ -91,16 +101,16 @@ try {
     await completed(client, "session_switch", { sessionId: original }); await waitFor(() => client.snapshot?.session.id === original, "original restored");
     owned = await pids(fixture);
   });
-  await check("cooperative file lock refuses another actual pi-pane TUI on the same session", async () => {
+  await check("another TUI on a /web-owned session is warned but stays open, and its own /web is refused", async () => {
     const active = (await events(fixture, "m3_session")).filter(item => item.mode === "rpc").at(-1);
-    const proc = spawn("python3", [resolve("scripts/pty-host.py")], { stdio: ["pipe", "pipe", "pipe"] }); contenders.push(proc);
-    let text = "", exitCode;
-    createInterface({ input: proc.stdout }).on("line", line => { const item = JSON.parse(line); if (item.type === "output") { text += item.data; if (item.data.includes("\u001b[6n")) proc.stdin.write(`${JSON.stringify({ type: "write", data: "\u001b[1;1R" })}\n`); } if (item.type === "exit") exitCode = item.code; });
-    const argv = [...fixture.argv]; const oldSession = argv.indexOf("--session"); if (oldSession >= 0) argv.splice(oldSession, 2); argv.push("--session", active.sessionFile);
-    proc.stdin.write(`${JSON.stringify({ argv, cwd: fixture.cwd, env: fixture.env, controllingTty: true })}\n`);
-    await waitFor(() => exitCode !== undefined, "conflicting TUI exits", 30_000);
-    assert.match(text, /already owned|protect the session/); assert.equal(fixture.exitCode, undefined);
+    const other = contender(fixture, active.sessionFile);
+    await waitFor(() => plain(other.text).includes("running in a /web browser host"), "ownership warning", 30_000);
+    other.write("/web\r");
+    await waitFor(() => plain(other.text).includes("already running in another /web host"), "second /web refused", 30_000);
+    await new Promise(done => setTimeout(done, 1000));
+    assert.equal(other.exitCode, undefined, "the warned TUI stays open"); assert.equal(fixture.exitCode, undefined);
     assert.equal((await stat(`${active.sessionFile}.pi-pane.lock`)).mode & 0o777, 0o600);
+    other.proc.stdin.write(`${JSON.stringify({ type: "terminate" })}\n`); await waitFor(() => other.exitCode !== undefined, "contender closed", 15_000);
   });
   await check("Ctrl+C stops the service and its writer, and recovery names the browser's latest file", async () => {
     const active = (await events(fixture, "m3_session")).filter(item => item.mode === "rpc").at(-1);
@@ -113,6 +123,39 @@ try {
     const entries = lines.filter(entry => entry.type !== "session"), ids = new Set(entries.map(entry => entry.id));
     assert.ok(entries.every(entry => entry.parentId === null || ids.has(entry.parentId)));
     assert.ok(entries.some(entry => entry.type === "message" && entry.message.role === "user" && textOf(entry.message) === "M3_HOST"));
+  });
+  await check("two ordinary TUIs can open one session; neither takes a lock", async () => {
+    const first = await make({ autoWeb: false });
+    const session = await waitFor(async () => (await events(first, "m3_session")).find(item => item.mode === "tui"), "first TUI session");
+    const second = contender(first, session.sessionFile);
+    await waitFor(async () => (await events(first, "m3_session")).filter(item => item.mode === "tui" && item.sessionFile === session.sessionFile).length >= 2, "second TUI session", 30_000);
+    await new Promise(done => setTimeout(done, 1500));
+    assert.equal(second.exitCode, undefined); assert.equal(first.exitCode, undefined);
+    assert.ok(!plain(second.text).includes("/web browser host"), "no ownership warning without a /web host");
+    await assert.rejects(() => stat(`${session.sessionFile}.pi-pane.lock`), error => error.code === "ENOENT");
+    second.proc.stdin.write(`${JSON.stringify({ type: "terminate" })}\n`); await waitFor(() => second.exitCode !== undefined, "second closed", 15_000);
+  });
+  await check("an extension persisting entries after the turn settled is the RPC writer, not a conflict", async () => {
+    const other = await make({ envOverrides: { PI_M0_APPEND_DELAY: "300" } }); const viewer = await connect(other); const owned = await pids(other);
+    for (const [index, text] of ["M3_PROBE_ONE", "M3_PROBE_TWO", "M3_PROBE_THREE"].entries()) {
+      await completed(viewer, "prompt", { text }); await viewer.settled(text);
+      await waitFor(async () => (await events(other, "m3_probe_append")).length > index, `delayed extension write ${index + 1}`);
+    }
+    assert.equal(other.exitCode, undefined); assert.ok(alive(owned.childPid));
+    assert.equal((await events(other, "provider_call")).filter(item => item.input?.startsWith("M3_PROBE_")).length, 3);
+    assert.ok(!/ownership conflict/.test(plain(other.terminal)));
+    return { appends: (await events(other, "m3_probe_append")).length };
+  });
+  if (process.env.PI_M3_LONG === "1") await check("an extension dialog left open past two minutes still takes the answer (PI_M3_LONG=1)", async () => {
+    const other = await make(); const viewer = await connect(other); const owned = await pids(other);
+    const operation = await viewer.command("prompt", { text: "/m3-confirm" });
+    const dialog = await waitFor(() => viewer.frames.find(frame => frame.t === "ui_request"), "dialog");
+    await new Promise(done => setTimeout(done, 130_000));
+    assert.equal(other.exitCode, undefined); assert.ok(alive(owned.childPid)); assert.equal(viewer.closed, false);
+    viewer.send({ t: "ui_response", id: dialog.id, confirmed: true });
+    assert.equal((await commandResult(viewer, operation.frame)).value.disposition, "handled");
+    const value = await waitFor(async () => (await events(other, "m3_dialog")).at(-1), "answer reached the extension");
+    assert.equal(value.confirmed, true); assert.equal(value.pid, owned.childPid);
   });
   await check("closing the terminal sends SIGHUP and stops host plus RPC child", async () => {
     const other = await make(); const owned = await pids(other); other.proc.kill("SIGKILL");

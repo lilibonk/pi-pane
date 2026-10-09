@@ -26,6 +26,15 @@ export function runningPiRpcEntry(cliPath = process.argv[1]): string | undefined
   return undefined;
 }
 
+/**
+ * Requests that only read state. They are bounded by a timeout; a timed-out read fails on its own and
+ * leaves the child running. Everything else may run extension code (commands, dialogs, session hooks)
+ * for as long as the user takes, so it has no timeout: abort, a dialog answer or Ctrl+C ends it.
+ */
+export const RPC_READS = new Set(["get_state", "get_entries", "get_messages", "get_commands", "get_available_models",
+  "get_available_thinking_levels", "get_tree", "get_fork_messages", "get_session_stats", "get_last_assistant_text"]);
+export const DEFAULT_READ_TIMEOUT_MS = 30_000;
+
 /** One RPC record from the child: a response, a session event or an extension UI request. */
 export type RpcRecord = { type: string; [key: string]: unknown };
 export interface RpcConnection {
@@ -57,7 +66,8 @@ export class RpcChild implements RpcConnection {
   readonly exited: Promise<number | null>;
   private resolveExit!: (code: number | null) => void;
 
-  constructor(private readonly args: string[], private readonly cwd: string, private readonly entry = runningPiRpcEntry(), private readonly env: NodeJS.ProcessEnv = process.env) {
+  constructor(private readonly args: string[], private readonly cwd: string, private readonly entry = runningPiRpcEntry(), private readonly env: NodeJS.ProcessEnv = process.env,
+    private readonly readTimeoutMs = DEFAULT_READ_TIMEOUT_MS) {
     this.exited = new Promise((resolve) => { this.resolveExit = resolve; });
   }
 
@@ -113,17 +123,21 @@ export class RpcChild implements RpcConnection {
     if (!this.process?.stdin?.writable) throw new Error("pi RPC host is not running.");
     this.process.stdin.write(`${JSON.stringify(record)}\n`);
   }
-  /** Sends a command and resolves with its `data`; rejects when the response reports failure. */
-  async request<T = unknown>(type: string, payload: Record<string, unknown> = {}, timeoutMs = 120_000): Promise<T> {
+  /**
+   * Sends a command and resolves with its `data`; rejects when the response reports failure.
+   * Reads time out after `timeoutMs` (default: the read timeout) without stopping the child; other
+   * commands wait for their response, or reject when the child exits.
+   */
+  async request<T = unknown>(type: string, payload: Record<string, unknown> = {}, timeoutMs?: number): Promise<T> {
     const id = `h${++this.nextId}`;
+    const limit = RPC_READS.has(type) ? timeoutMs ?? this.readTimeoutMs : undefined;
     const response = await new Promise<RpcRecord>((resolve, reject) => {
-      const timer = setTimeout(() => {
+      const timer = limit === undefined ? undefined : setTimeout(() => {
+        // A late response is then ignored; reads change nothing, so the child keeps running.
         this.pending.delete(id);
-        reject(new Error(`pi RPC ${type} timed out; the child is stopped to avoid an uncertain second write.`));
-        // A timed-out mutation might still be executing. Fail closed, never retry it.
-        void this.stop();
-      }, timeoutMs);
-      timer.unref?.();
+        reject(new Error(`pi RPC ${type} did not answer within ${Math.round(limit / 1000)} s.`));
+      }, limit);
+      timer?.unref?.();
       this.pending.set(id, { resolve: (value) => { clearTimeout(timer); resolve(value); }, reject: (error) => { clearTimeout(timer); reject(error); } });
       try { this.write({ id, type, ...payload }); } catch (error) { clearTimeout(timer); this.pending.delete(id); reject(error as Error); }
     });
