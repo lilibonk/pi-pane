@@ -366,7 +366,13 @@ async function runHandoff(state: ProcessState): Promise<number> {
     return 1;
   }
   state.host = host;
-  write(`\npi-pane: this session now runs in the browser.\n  ${hub.url}\n  Press Ctrl+C to stop the web service and return the session to the terminal.\n`);
+  write(`\npi-pane: this session now runs in the browser.\n  ${hub.url}\n`);
+  if (hub.mode === "password") {
+    // No TUI is left for /web qr, so external access shows the QR code here, like Kimi's /remote-control.
+    write(`  Login with PI_PANE_PASSWORD · listening on ${hub.listenAddress}\n`);
+    if ((process.stdout.columns ?? 0) >= qrWidth(hub.url)) write(`${qrLines(hub.url).join("\n")}\n  Scan to open ${hub.origin} · enter the password separately\n`);
+  }
+  write("  Press Ctrl+C to stop the web service and return the session to the terminal.\n");
   if (target.open) {
     const executable = process.platform === "darwin" ? "open" : process.platform === "win32" ? "rundll32" : "xdg-open";
     const args = process.platform === "win32" ? ["url.dll,FileProtocolHandler", hub.url] : [hub.url];

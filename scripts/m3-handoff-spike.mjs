@@ -2,9 +2,15 @@
 // M3 handoff spike: Kimi-style `/web` in a real pi TUI (PTY) and system Chrome.
 // The TUI shuts down; the same process stays in the foreground serving the web UI while a pi RPC
 // child owns the session. Checks: continuity, prompts, extension dialogs, session list/switch,
-// Ctrl+C return with a valid single-writer session file, and no orphan after SIGHUP or a crash.
+// Ctrl+C return with a valid single-writer session file, no orphan after SIGHUP or a crash, and
+// external access (TLS proxy + password) carried across the handoff.
 import assert from "node:assert/strict";
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { execFileSync } from "node:child_process";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { request as httpRequest } from "node:http";
+import { createServer as createHttpsServer } from "node:https";
+import { connect, createServer } from "node:net";
+import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { chromium } from "playwright";
@@ -48,7 +54,36 @@ async function handoff(fixture) {
   return { tuiPid: tui.pid, childPid: child.pid, child };
 }
 
-let fixture, browser;
+const PASSWORD = "m3-fixture-password-not-a-secret";
+const PUBLIC_HOST = "pane.example.test";
+const freePort = () => new Promise(done => { const probe = createServer().listen(0, "127.0.0.1", () => { const { port } = probe.address(); probe.close(() => done(port)); }); });
+const listening = port => new Promise(done => { const socket = connect(port, "127.0.0.1"); socket.once("connect", () => { socket.destroy(); done(true); }); socket.once("error", () => done(false)); });
+/** A same-machine TLS reverse proxy forwarding HTTP and WebSocket upgrades unchanged (stand-in for e.g. Tailscale Serve). */
+async function tlsProxy({ cert, key, port, upstream }) {
+  const sockets = new Set();
+  const server = createHttpsServer({ cert, key }, (request, response) => {
+    const forward = httpRequest({ host: "127.0.0.1", port: upstream, method: request.method, path: request.url, headers: request.headers }, (reply) => {
+      response.writeHead(reply.statusCode ?? 502, reply.headers); reply.pipe(response);
+    });
+    forward.on("error", () => { response.writeHead(502); response.end(); });
+    request.pipe(forward);
+  });
+  server.on("connection", socket => { sockets.add(socket); socket.on("close", () => sockets.delete(socket)); });
+  server.on("upgrade", (request, socket, head) => {
+    const backend = connect(upstream, "127.0.0.1", () => {
+      let raw = `${request.method} ${request.url} HTTP/1.1\r\n`;
+      for (let i = 0; i < request.rawHeaders.length; i += 2) raw += `${request.rawHeaders[i]}: ${request.rawHeaders[i + 1]}\r\n`;
+      backend.write(`${raw}\r\n`); backend.write(head);
+      backend.pipe(socket); socket.pipe(backend);
+    });
+    sockets.add(backend); backend.on("close", () => sockets.delete(backend));
+    backend.on("error", () => socket.destroy()); socket.on("error", () => backend.destroy());
+  });
+  await new Promise(done => server.listen(port, "127.0.0.1", done));
+  return { close() { for (const socket of sockets) socket.destroy(); return new Promise(done => server.close(() => done())); } };
+}
+
+let fixture, browser, externalBrowser, proxy, certDir;
 const extra = [];
 try {
   fixture = await startFixture({ extraExtensions: [FIXTURE], controllingTty: true });
@@ -164,6 +199,55 @@ try {
     await waitFor(() => !alive(handed.childPid), "child exits when the host's pipe closes", 15_000);
     return handed;
   });
+
+  await check("external access: a password login survives the handoff, the banner shows the QR code and new viewers still need the password", async () => {
+    certDir = await mkdtemp(join(tmpdir(), "pi-pane-m3-tls-"));
+    execFileSync("openssl", ["req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "1", "-subj", `/CN=${PUBLIC_HOST}`,
+      "-addext", `subjectAltName=DNS:${PUBLIC_HOST}`, "-keyout", join(certDir, "key.pem"), "-out", join(certDir, "cert.pem")], { stdio: "ignore" });
+    const other = await startFixture({ extraExtensions: [FIXTURE], controllingTty: true, autoWeb: false, envOverrides: { PI_PANE_PASSWORD: PASSWORD } });
+    extra.push(other);
+    await sendTui(other, "M3_EXTERNAL");
+    const backend = await freePort();
+    const proxyPort = await freePort();
+    const origin = `https://${PUBLIC_HOST}:${proxyPort}`;
+    other.command(`/web --public-origin ${origin} --proxy --port ${backend} --no-open`);
+    await waitFor(() => other.publicUrl?.startsWith(origin), "public link in terminal");
+    proxy = await tlsProxy({ cert: await readFile(join(certDir, "cert.pem")), key: await readFile(join(certDir, "key.pem")), port: proxyPort, upstream: backend });
+    externalBrowser = await chromium.launch({ channel: "chrome", headless: true, args: [`--host-resolver-rules=MAP ${PUBLIC_HOST} 127.0.0.1`] });
+    const remote = await (await externalBrowser.newContext({ ignoreHTTPSErrors: true, viewport: { width: 1200, height: 860 } })).newPage();
+    remote.on("pageerror", error => pageErrors.push(String(error)));
+    await remote.goto(other.publicUrl);
+    await remote.getByRole("textbox", { name: "访问密码" }).fill(PASSWORD);
+    await remote.getByRole("button", { name: "登录" }).click();
+    await remote.getByText("已连接", { exact: true }).waitFor();
+    await remote.locator(".message-user").filter({ hasText: "M3_EXTERNAL" }).waitFor();
+
+    const handed = await handoff(other);
+    const banner = stripAnsi(other.terminal).slice(stripAnsi(other.terminal).lastIndexOf("this session now runs in the browser"));
+    assert.ok(banner.includes(`${origin}/#t=`), "the banner shows the external link");
+    assert.ok(banner.includes("Login with PI_PANE_PASSWORD"), "the banner names the password login");
+    assert.ok(/[▀▄█]{10}/.test(banner), "the banner draws the QR code");
+    // The logged-in viewer stays logged in and now drives the RPC child.
+    await remote.locator(".sessions-button").waitFor();
+    await remote.getByText("已连接", { exact: true }).waitFor();
+    assert.equal(await remote.getByRole("textbox", { name: "访问密码" }).count(), 0, "no second login");
+    await remote.getByRole("textbox", { name: "消息" }).fill("M3_EXTERNAL_HOST");
+    await remote.getByRole("button", { name: /^(发送 ↗|请求 followUp ↗)$/ }).click();
+    await waitFor(async () => (await events(other, "provider_done")).some(event => event.input === "M3_EXTERNAL_HOST"), "provider ran M3_EXTERNAL_HOST");
+    await remote.locator(".message-assistant").filter({ hasText: "M0_REPLY:M3_EXTERNAL_HOST:complete" }).waitFor();
+    // A new viewer, even with the link, still has to enter the password.
+    const stranger = await (await externalBrowser.newContext({ ignoreHTTPSErrors: true })).newPage();
+    await stranger.goto(other.publicUrl);
+    await stranger.getByRole("textbox", { name: "访问密码" }).waitFor();
+    assert.equal(await stranger.getByText("已连接", { exact: true }).count(), 0);
+
+    other.write("\u0003");
+    await waitFor(() => other.exitCode !== undefined, "pi process exits", 15_000);
+    assert.equal(other.exitCode, 0);
+    assert.ok(!alive(handed.childPid), "the RPC child has exited");
+    assert.equal(await listening(backend), false, "the backend port is closed");
+    return { tuiPid: handed.tuiPid, childPid: handed.childPid };
+  });
   assert.deepEqual(pageErrors, []);
   report.status = "passed";
 } catch (error) {
@@ -173,6 +257,9 @@ try {
   process.exitCode = 1;
 } finally {
   await browser?.close();
+  await externalBrowser?.close();
+  await proxy?.close();
+  if (certDir) await rm(certDir, { recursive: true, force: true });
   for (const item of [fixture, ...extra]) if (item) { await item.close(); await item.remove(); }
   report.finishedAt = new Date().toISOString();
   await writeFile(join(reportDir, "report.json"), `${JSON.stringify(report, null, 2)}\n`);
