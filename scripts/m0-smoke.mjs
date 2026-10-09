@@ -3,7 +3,7 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { createServer } from "node:net";
-import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { createInterface } from "node:readline";
@@ -16,6 +16,24 @@ const pause = (ms) => new Promise((resolvePromise) => setTimeout(resolvePromise,
 export const textOf = (message) => message?.content?.filter((part) => part.type === "text").map((part) => part.text).join("") ?? "";
 const stripAnsi = (value) => value.replace(/\u001b\][^\u0007]*(?:\u0007|\u001b\\)/g, "").replace(/\u001b\[[0-?]*[ -/]*[@-~]/g, "");
 const redact = (value) => value.replace(/#t=[A-Za-z0-9_-]+/g, "#t=[REDACTED]").replace(/pi-pane\.bearer\.[A-Za-z0-9_-]+/g, "pi-pane.bearer.[REDACTED]");
+
+/** Resolve the selected CLI's own package, including bundled CLI entrypoints. */
+export async function readPiHost(selectedCli = process.env.PI_M0_CLI || join(dirname(fileURLToPath(import.meta.resolve("@earendil-works/pi-coding-agent"))), "cli.js")) {
+  const cli = await realpath(resolve(selectedCli));
+  let directory = dirname(cli);
+  while (true) {
+    let manifest;
+    try { manifest = JSON.parse(await readFile(join(directory, "package.json"), "utf8")); }
+    catch (error) { if (error.code !== "ENOENT") throw error; }
+    if (manifest?.name === "@earendil-works/pi-coding-agent") {
+      if (typeof manifest.version !== "string" || !manifest.version) throw new Error(`Selected pi host has no package version: ${directory}`);
+      return { cli, packageRoot: directory, version: manifest.version };
+    }
+    const parent = dirname(directory);
+    if (parent === directory) throw new Error(`Selected CLI does not belong to @earendil-works/pi-coding-agent: ${cli}`);
+    directory = parent;
+  }
+}
 
 export async function waitFor(predicate, label, timeout = 15_000) {
   const end = Date.now() + timeout;
@@ -36,10 +54,11 @@ async function freePort() {
 }
 
 export async function startFixture({ autoWeb = true, extraExtensions = [], settings = {}, envOverrides = {}, disablePane = false,
-  provider = "pi-pane-m0", model = "deterministic", packaged = false, loadThemes = false, prepareAgentDir } = {}) {
+  provider = "pi-pane-m0", model = "deterministic", packaged = false, loadThemes = false, prepareAgentDir, cli: selectedCli } = {}) {
   if (process.platform === "win32") throw new Error("The M0 real-TUI harness requires a POSIX PTY (macOS or Linux).");
   for (const key of Object.keys(envOverrides)) if (!key.startsWith("PI_M0_") && key !== "PI_PANE_PASSWORD") throw new Error(`Fixture env override is not allowed: ${key}`);
-  const cli = process.env.PI_M0_CLI || join(dirname(fileURLToPath(import.meta.resolve("@earendil-works/pi-coding-agent"))), "cli.js");
+  const host = await readPiHost(selectedCli);
+  const { cli } = host;
   const extension = resolve(process.env.PI_M0_EXTENSION || join(project, "src/extension/index.ts"));
   const directory = await mkdtemp(join(tmpdir(), "pi-pane-m0-"));
   const agentDir = join(directory, "agent");
@@ -49,7 +68,7 @@ export async function startFixture({ autoWeb = true, extraExtensions = [], setti
   await writeFile(join(agentDir, "auth.json"), "{}", { mode: 0o600 });
   await writeFile(join(agentDir, "settings.json"), JSON.stringify({
     ...(provider && model ? { defaultProvider: provider, defaultModel: model } : {}), quietStartup: true,
-    lastChangelogVersion: "1.0.4", packages: [], compaction: { enabled: false },
+    lastChangelogVersion: host.version, packages: [], compaction: { enabled: false },
     ...settings,
   }), { mode: 0o600 });
   // `packaged`: pi-pane comes from a package installed into the agent directory, not from -e.
@@ -67,7 +86,7 @@ export async function startFixture({ autoWeb = true, extraExtensions = [], setti
     ...(provider && model ? ["--provider", provider, "--model", model] : []),
     ...(!disablePane ? [...(autoWeb ? ["--web"] : []), "--web-port", String(port), "--web-no-open"] : [])];
   const proc = spawn("python3", [join(project, "scripts/pty-host.py")], { stdio: ["pipe", "pipe", "pipe"] });
-  const fixture = { proc, directory, agentDir, cwd, eventPath, port, cli, extension, env, argv, terminal: "", processError: "", exitCode: undefined, url: undefined,
+  const fixture = { proc, directory, agentDir, cwd, eventPath, port, cli, piVersion: host.version, extension, env, argv, terminal: "", processError: "", exitCode: undefined, url: undefined,
     write(data) { proc.stdin.write(`${JSON.stringify({ type: "write", data })}\n`); },
     command(text) { fixture.write(`${text}\r`); },
     async events() { return (await readFile(eventPath, "utf8")).trim().split("\n").filter(Boolean).map((line) => JSON.parse(line)); },
@@ -267,7 +286,7 @@ export async function runSmoke() {
     fixture = await startFixture();
     report.piCli = fixture.cli;
     report.extension = fixture.extension;
-    report.piVersion = JSON.parse(await readFile(join(dirname(fixture.cli), "../package.json"), "utf8")).version;
+    report.piVersion = fixture.piVersion;
     await check("print/json/rpc reject --web without leaving sockets or timers", async () => {
       const results = [];
       for (const mode of ["print", "json", "rpc"]) results.push(await checkNonTui(fixture, mode));

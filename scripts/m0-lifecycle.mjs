@@ -8,20 +8,21 @@ import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { createInterface } from "node:readline";
 import { fileURLToPath, pathToFileURL } from "node:url";
-import { openClient, waitFor } from "./m0-smoke.mjs";
+import { openClient, readPiHost, waitFor } from "./m0-smoke.mjs";
 
 const project = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const output = resolve(process.env.PI_M0_LIFECYCLE_REPORT_DIR || join(project, "build-artifacts/m0/lifecycle"));
-const cli = process.env.PI_M0_CLI || join(dirname(fileURLToPath(import.meta.resolve("@earendil-works/pi-coding-agent"))), "cli.js");
+const host = await readPiHost();
+const { cli } = host;
 const sourceEntry = resolve(process.env.PI_M0_LIFECYCLE_EXTENSION || join(project, "src/extension/index.ts"));
-const packageModule = import.meta.resolve("@earendil-works/pi-coding-agent");
+const packageModule = pathToFileURL(join(host.packageRoot, "dist/index.js")).href;
 const pause = (ms) => new Promise((done) => setTimeout(done, ms));
 const stripAnsi = (value) => value.replace(/\u001b\][^\u0007]*(?:\u0007|\u001b\\)/g, "").replace(/\u001b\[[0-?]*[ -/]*[@-~]/g, "");
 const redact = (value) => String(value).replace(/#t=[A-Za-z0-9_-]+/g, "#t=[REDACTED]").replace(/pi-pane\.bearer\.[A-Za-z0-9_-]+/g, "pi-pane.bearer.[REDACTED]");
 const envBase = () => Object.fromEntries(["PATH", "TMPDIR", "LANG", "LC_ALL", "SYSTEMROOT"].filter((key) => process.env[key]).map((key) => [key, process.env[key]]));
-const report = { startedAt: new Date().toISOString(), piVersion: "1.0.4", node: process.version, platform: process.platform, arch: process.arch,
+const report = { startedAt: new Date().toISOString(), piVersion: host.version, piCli: cli, node: process.version, platform: process.platform, arch: process.arch,
   realTui: true, realModelCalls: 0, isolation: "Empty fixture cwd, isolated agent/auth {}, explicit environment allowlist, no inherited model credentials", checks: [],
-  decisions: [], notCovered: ["Host event compatibility outside pi 1.0.4", "Arbitrary piPane settings writes or crash-atomic persistence", "npm registry publication", "pnpm isolated dependency layout"] };
+  decisions: [], notCovered: [`Host event compatibility outside pi ${host.version}`, "Arbitrary piPane settings writes or crash-atomic persistence", "npm registry publication", "pnpm isolated dependency layout"] };
 await mkdir(output, { recursive: true });
 
 async function run(command, args, options = {}) {
@@ -51,6 +52,7 @@ async function check(name, action) {
 }
 
 async function startReal(options = {}) {
+  const selectedHost = options.cli ? await readPiHost(options.cli) : host;
   const directory = await mkdtemp(join(tmpdir(), "pi-pane-lifecycle-"));
   const agentDir = join(directory, "agent"), cwd = join(directory, "workspace");
   await mkdir(agentDir); await mkdir(cwd);
@@ -61,7 +63,7 @@ async function startReal(options = {}) {
   const settingsPath = join(agentDir, "settings.json");
   const port = options.defaultPort ? undefined : options.port ?? await freePort();
   const settings = { defaultProvider: "pi-pane-m0", defaultModel: "deterministic", defaultProjectTrust: "always", quietStartup: true,
-    lastChangelogVersion: "1.0.4", packages: [], compaction: { enabled: false },
+    lastChangelogVersion: selectedHost.version, packages: [], compaction: { enabled: false },
     extensions: options.packageRoot ? [] : [wrapper], ...options.settings };
   await writeFile(settingsPath, JSON.stringify(settings), { mode: 0o600 });
   if (options.projectSettings) {
@@ -92,7 +94,7 @@ export default async function(pi) {
   await writeFile(wrapper, wrapperSource());
   const env = { ...envBase(), TERM: "xterm-256color", COLORTERM: "truecolor", PI_OFFLINE: "1", NO_COLOR: "1",
     PI_CODING_AGENT_DIR: agentDir, PI_CODING_AGENT_SESSION_DIR: join(agentDir, "sessions"), PI_M0_EVENTS_PATH: eventsPath };
-  const argv = [process.execPath, options.cli ?? cli, "--no-skills", "--no-prompt-templates", "--no-themes", "--no-builtin-tools",
+  const argv = [process.execPath, selectedHost.cli, "--no-skills", "--no-prompt-templates", "--no-themes", "--no-builtin-tools",
     "-e", join(project, "tests/fixtures/deterministic-provider.ts"), ...(options.packageRoot ? ["-e", options.packageRoot] : []),
     "--provider", "pi-pane-m0", "--model", "deterministic", ...(options.autoWeb === false ? [] : ["--web"]),
     ...(port === undefined || options.omitPortFlag ? [] : ["--web-port", String(port)]), ...(options.omitNoOpenFlag ? [] : ["--web-no-open"])];
@@ -333,7 +335,7 @@ async function isolatedPackageInstall() {
       const packageInfo = JSON.parse(pack.stdout)[0];
       await writeFile(join(installDir, "package.json"), JSON.stringify({ name: "pi-pane-m0-isolated-install", private: true, type: "module" }));
       await run("npm", ["install", "--ignore-scripts", "--omit=dev", "--no-audit", "--no-fund", join(directory, packageInfo.filename),
-        "@earendil-works/pi-coding-agent@1.0.4", "@earendil-works/pi-ai@1.0.4"], { cwd: installDir, env: npmEnv });
+        `@earendil-works/pi-coding-agent@${host.version}`, `@earendil-works/pi-ai@${host.version}`], { cwd: installDir, env: npmEnv });
       const packageRoot = join(installDir, "node_modules/pi-pane");
       const ws = JSON.parse(await readFile(join(installDir, "node_modules/ws/package.json"), "utf8"));
       assert.equal(ws.version, "8.22.0");
@@ -341,9 +343,9 @@ async function isolatedPackageInstall() {
       assert.deepEqual(manifest.pi.extensions, ["./dist/extension/index.js"]);
       const installedHostRoot = join(installDir, "node_modules/@earendil-works/pi-coding-agent");
       const installedHostVersion = JSON.parse(await readFile(join(installedHostRoot, "package.json"), "utf8")).version;
-      assert.equal(installedHostVersion, "1.0.4");
+      assert.equal(installedHostVersion, host.version);
       const installedAiVersion = JSON.parse(await readFile(join(installDir, "node_modules/@earendil-works/pi-ai/package.json"), "utf8")).version;
-      assert.equal(installedAiVersion, "1.0.4");
+      assert.equal(installedAiVersion, host.version);
       const installedTuiVersion = JSON.parse(await readFile(join(installDir, "node_modules/@earendil-works/pi-tui/package.json"), "utf8")).version;
       fixture = await startReal({ packageRoot, cli: join(installedHostRoot, "dist/cli.js") });
       const client = await openClient(fixture.url);

@@ -1,7 +1,7 @@
 {
   "name": "pi-pane",
   "version": "0.1.0",
-  "private": true,
+  "license": "MIT",
   "type": "module",
   "description": "Open the running pi TUI session in a browser: live mirror, prompts with images, optional HTTPS access from other devices",
   "repository": {
@@ -40,7 +40,8 @@
     "prepack": "npm run build",
     "m2:images": "node scripts/m2-images.mjs",
     "m2:external": "node scripts/m2-external.mjs",
-    "m2:install": "node scripts/m2-install.mjs"
+    "m2:install": "node scripts/m2-install.mjs",
+    "m2:real-model": "node scripts/m2-real-model.mjs"
   },
   "peerDependencies": {
     "@earendil-works/pi-ai": "*",

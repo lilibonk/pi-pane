@@ -12,6 +12,8 @@ PI_M0_EXTENSION=./dist/extension/index.js PI_M0_REPORT_DIR=./build-artifacts/m0-
 
 Optional `PI_M0_CLI` selects an explicit `pi-coding-agent/dist/cli.js`. `PI_M0_EXTENSION` selects the source or built extension. `PI_M0_REPORT_DIR` selects the evidence directory. Defaults use project-local dependencies and `src/extension/index.ts`.
 
+The selected CLI's package supplies the actual host version. Fixture settings, lifecycle consumer installation and A11 package installation follow that selection, so `PI_M0_CLI` can verify pi 1.1.0 without changing the project's 1.0.4 development baseline. The install command and installed-package startup use the same CLI.
+
 The smoke report lists each executed check and explicit uncovered branches. A passing report means those checks passed; it does not mean all M0 questions or M1 acceptance criteria are complete. The test covers TUI text entry, preservation of an unsent draft, multiple browser clients, prompt/steer/followUp, partial text and tool snapshots, reconnect, abort, tree cancellation/navigation, runtime reload/new/fork/resume, stale commands, duplicate IDs, local handshake checks, stop/restart and token rotation. Fork/resume/tree targets are selected through fixture commands that call the real command-context APIs; their built-in selection dialogs are not automated.
 
 The focused integration scripts use the same isolation rules:
@@ -23,7 +25,7 @@ npm run m0:projection
 npm run m0:performance
 ```
 
-`m0:lifecycle` tests actual extension removal, syntax errors, a 12-second extension factory delay against the real 10-second rebind deadline, settings precedence, concurrent official settings writers, port conflicts, multiple pi instances and an independent npm consumer of the packed extension. The consumer fixes pi and pi-ai to 1.0.4; this does not verify pnpm's isolated dependency layout or npm publication. The extension reads settings only; preservation by the host's locked merge writer does not prove crash-atomic saving.
+`m0:lifecycle` tests actual extension removal, syntax errors, a 12-second extension factory delay against the real 10-second rebind deadline, settings precedence, concurrent official settings writers, port conflicts, multiple pi instances and an independent npm consumer of the packed extension. The consumer pins pi and pi-ai to the selected CLI's version; this does not verify pnpm's isolated dependency layout or npm publication. The extension reads settings only; preservation by the host's locked merge writer does not prove crash-atomic saving.
 
 `m0:boundaries` loads another real extension to consume/transform inputs, discover a template and a skill, replace a finalized message, open a terminal dialog and fail local summarization. It also checks thinking/tool-argument reconnects, positive TUI template/skill expansion controls, TUI queue consumption/dequeue, unread receipt recovery, and session replacement while input/model hooks or compaction are pending. The compact-success check compares the attached client's history with a fresh canonical snapshot, including the compaction marker. No-model and missing-authentication checks use isolated host preflight; the controlled provider error has no outbound network request.
 
@@ -78,3 +80,15 @@ Unit tests add image structure and limit validation (`images.test.ts`), external
 `m1:render` 新增词级范围、恶意 HTML diff 纯文本渲染与折叠思考耗时检查；`m0:boundaries` 验证真实 thinking 流在重连和落盘后保留耗时；`m0:performance` 的主题部分新增仅修改 export 背景及其派生颜色的热更新检查；`m2:install` 检查 tarball 中的主题与覆盖 CSS，并在干净安装后切换两个包内主题、直接修改 CSS 后刷新验证生效。安装夹具显式设置 `loadThemes: true`；其他夹具默认仍使用 `--no-themes`。
 
 这轮完整回归命令与结果见 [M1/M2 收尾验收记录](../docs/m2-followup-status.md)。`m2:install` 的 prepack 会重新构建，仍须最后单独运行。
+
+## 真实模型试用
+
+`m2:real-model` 与上述夹具分开，只有显式设置 `PI_PANE_REAL_MODEL` 才会运行。它使用现有 pi 登录和日常安装的 pi-pane，在临时工作目录和会话目录中发送三条合成输入；不加载项目上下文、skills、模板或 MCP。真实模型可使用内置 read/bash/write/edit，系统说明将操作限制在临时目录。
+
+```sh
+PI_M0_CLI=/path/to/pi-coding-agent/dist/cli.js \
+PI_PANE_REAL_PROVIDER=qwen-token-plan-cn PI_PANE_REAL_MODEL=qwen3.7-max \
+PI_M2_REPORT_DIR=./build-artifacts/m2/pi-1.1-trial/real-model npm run m2:real-model
+```
+
+脚本检查 TUI `/web`、终端与网页各一轮真实回复、真实 bash 的执行计数、工具运行时刷新和同租约重连，以及 fresh snapshot 与共享 reducer 的一致性。每轮最长 3 分钟，总上限 10 分钟；结束时清理临时目录和子进程，报告与终端日志脱敏。`submittedPrompts` 是提交数，不能当作 provider 请求数或账单调用数。一次通过不代表日常一周稳定性，发布后的正式 registry 安装仍须另外验证。

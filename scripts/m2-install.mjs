@@ -13,15 +13,16 @@ import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import { chromium } from "playwright";
-import { startFixture, waitFor } from "./m0-smoke.mjs";
+import { readPiHost, startFixture, waitFor } from "./m0-smoke.mjs";
 
 const run = promisify(execFile);
 const project = resolve(dirname(fileURLToPath(import.meta.url)), "..");
+const host = await readPiHost();
 const reportDir = resolve(process.env.PI_M2_REPORT_DIR ?? join(project, "build-artifacts/m2/install"));
 await mkdir(reportDir, { recursive: true });
 const pkg = JSON.parse(await readFile(join(project, "package.json"), "utf8"));
 const UPSTREAM = "https://registry.npmjs.org";
-const report = { scope: "A11 install: npm tarball contents and pi install from a registry into a clean agent directory", checks: [], status: "running",
+const report = { scope: "A11 install: npm tarball contents and pi install from a registry into a clean agent directory", piVersion: host.version, piCli: host.cli, checks: [], status: "running",
   notCovered: ["Publication to npmjs.com and listing in the pi.dev gallery (requires the maintainer to publish)"] };
 const check = async (name, action) => {
   const started = Date.now();
@@ -84,13 +85,12 @@ try {
 
   let installed, installedRoot;
   await check("pi install npm:pi-pane into a clean agent directory and npm cache installs without building", async () => {
-    fixture = await startFixture({ packaged: true, loadThemes: true, extraExtensions: [join(project, "tests/fixtures/performance-provider.ts")], async prepareAgentDir(agentDir, directory) {
-      const cli = join(dirname(fileURLToPath(import.meta.resolve("@earendil-works/pi-coding-agent"))), "cli.js");
+    fixture = await startFixture({ cli: host.cli, packaged: true, loadThemes: true, extraExtensions: [join(project, "tests/fixtures/performance-provider.ts")], async prepareAgentDir(agentDir, directory) {
       const env = { PATH: process.env.PATH, HOME: join(directory, "home"), PI_CODING_AGENT_DIR: agentDir,
         npm_config_registry: registryUrl, npm_config_cache: join(directory, "npm-cache"), npm_config_update_notifier: "false", npm_config_fund: "false", npm_config_audit: "false" };
       await mkdir(env.HOME);
       const started = Date.now();
-      const { stdout, stderr } = await run(process.execPath, [cli, "install", `npm:${pkg.name}@${pkg.version}`], { env, cwd: directory, maxBuffer: 16 * 1024 * 1024, timeout: 180_000 });
+      const { stdout, stderr } = await run(process.execPath, [host.cli, "install", `npm:${pkg.name}@${pkg.version}`], { env, cwd: directory, maxBuffer: 16 * 1024 * 1024, timeout: 180_000 });
       const settings = JSON.parse(await readFile(join(agentDir, "settings.json"), "utf8"));
       installed = { durationMs: Date.now() - started, packages: settings.packages, output: `${stdout}${stderr}`.trim().slice(-400) };
     } });

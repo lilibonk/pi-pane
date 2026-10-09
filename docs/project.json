@@ -1,7 +1,7 @@
 {
   "name": "pi pane",
   "stage": "M2",
-  "stageStatus": "local-acceptance-complete-publication-pending",
+  "stageStatus": "real-model-trial-passed-publication-authentication-pending",
   "m0CompletedDate": "2026-10-08",
   "m1LocalAcceptanceCompletedDate": "2026-10-08",
   "m2LocalAcceptanceCompletedDate": "2026-10-08",
@@ -18,6 +18,22 @@
   "evidencePage": "https://chatgpt.com/space/page_b3f2b1dc1800819189f2b90d540f931c",
   "localFollowUpAutomationId": "pi-pane-m0-space",
   "localFollowUpStatus": "PAUSED",
-  "evidenceDirectory": "build-artifacts/m2/followup",
-  "liveTaskStatusSource": "docs/m2-followup-status.md"
+  "evidenceDirectory": "build-artifacts/m2/pi-1.1-trial",
+  "liveTaskStatusSource": "docs/m2-trial-status.md",
+  "nextSteps": [
+    "Verify pi 1.1.0 compatibility and load pi-pane in the daily terminal",
+    "Exercise /web, terminal/browser conversation, tools and refresh/reconnect with a real model",
+    "Fix trial issues, publish to npm and verify installation from the public registry",
+    "Advance M3 after stable daily-use feedback"
+  ],
+  "pi110CompatibilityStatus": "key-regressions-passed",
+  "dailyPackageLoadStatus": "verified",
+  "realModelTrialStatus": "passed",
+  "realModelTrialCompletedDate": "2026-10-09",
+  "trialProvider": "qwen-token-plan-cn",
+  "trialModel": "qwen3.7-max",
+  "license": "MIT",
+  "npmAuthenticationStatus": "required",
+  "releaseCandidateStatus": "packed-and-dry-run-passed",
+  "m3Status": "not-started"
 }
