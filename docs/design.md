@@ -120,6 +120,12 @@ WebSocket subprotocol 为 `pi-pane.v1`、`pi-pane.bearer.<token>`，握手先鉴
 
 目录最多 200 条历史元数据，搜索包含后续消息；树最多 2,000 条，命令最多 512 条，模型最多 256 条。只传展示元数据，不传认证、完整 settings 或扩展内部 data。
 
+### 宿主状态与运行时替换（M3.1 进行中）
+
+当前项目 = 子进程启动目录 = 会话目录。切到另一项目的会话时，宿主不发原生 `switch_session`，而是停掉旧子进程、在目标目录启动新子进程：先校验目标并取得目标会话的锁，趁旧子进程还在完成最后一次归属校验，关闭其 stdin 并等它退出（最长 20 秒，之后才发信号），按有界规则接受关闭窗口内的非消息条目，再启动并核对新子进程。子进程自己切到另一项目的会话时不接受，服务停止。
+
+替换失败进入 `recovery_required`：Hub 保持运行，没有会话，对话写入被拒绝，只接受一次明确的重试、恢复上一个会话或停止服务，不自动重启。`host_state {revision,phase,cwd,recovery?}` 在握手后先于快照下发；`host_command` 与普通命令共用租约编号和回执，按 `hostRevision` 校验。前台循环监督的是宿主而不是某一个子进程：只有已就绪子进程的非计划退出才结束服务。
+
 ### 扩展 UI
 
 `ui_request {id,method,title?,message?,options?,placeholder?,prefill?,expiresAt?}` → `ui_response {id,value?,confirmed?,cancelled?}` → `ui_resolved {id,reason?}`。答案独立于命令队列，否则等待扩展对话框的 prompt 会阻塞回答。第一份有效答案胜出；超时、会话替换和停止关闭所有 viewer 的请求。重连新快照后重发宿主仍待处理的请求，不把本地乐观关闭当作宿主已确认。

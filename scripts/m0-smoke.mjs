@@ -61,7 +61,7 @@ async function freePort() {
 export async function startFixture({ autoWeb = true, extraExtensions = [], settings = {}, envOverrides = {}, disablePane = false,
   provider = "pi-pane-m0", model = "deterministic", packaged = false, loadThemes = false, loadSkills = false, loadPromptTemplates = false, prepareAgentDir, cli: selectedCli, controllingTty = true, webArgs = [], extraArgs = [], seedSession = true, webConfigFlags = true } = {}) {
   if (process.platform === "win32") throw new Error("The M0 real-TUI harness requires a POSIX PTY (macOS or Linux).");
-  for (const key of Object.keys(envOverrides)) if (!key.startsWith("PI_M0_") && key !== "PI_PANE_PASSWORD") throw new Error(`Fixture env override is not allowed: ${key}`);
+  for (const key of Object.keys(envOverrides)) if (!key.startsWith("PI_M0_") && !key.startsWith("PI_M31_") && key !== "PI_PANE_PASSWORD") throw new Error(`Fixture env override is not allowed: ${key}`);
   const host = await readPiHost(selectedCli);
   const { cli } = host;
   const extension = resolve(process.env.PI_M0_EXTENSION || join(project, "src/extension/index.ts"));
@@ -253,7 +253,8 @@ export async function openClient(url, clientId, options = {}) {
   });
   await new Promise((resolvePromise, reject) => { socket.once("open", resolvePromise); socket.once("error", reject); });
   client.send({ t: "hello", ...(clientId ? { clientId } : {}) });
-  await waitFor(() => client.snapshot && client.clientId, "authenticated snapshot");
+  // `sessionless`: the host may have no session to show (a failed runtime replacement).
+  await waitFor(() => (client.snapshot || options.sessionless) && client.clientId, "authenticated snapshot");
   setFixtureControl(url, client);
   return client;
 }

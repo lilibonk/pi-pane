@@ -8,7 +8,7 @@ import type { Duplex } from "node:stream";
 import { WebSocket, WebSocketServer, type RawData } from "ws";
 import {
   LIMITS, PROTOCOL, WS_PATH, ProtocolError, isRecord, parseClientMessage, toWireError,
-  commandArgs, type Ack, type ClientMessage, type CommandEnvelope, type CommandResult, type ProjectionEvent, type ServerMessage,
+  commandArgs, type Ack, type ClientMessage, type CommandEnvelope, type CommandResult, type HostCommandEnvelope, type HostCommandName, type HostState, type ProjectionEvent, type ServerMessage,
   type ExtensionUiState, type WorkbenchAction, type WorkbenchValues,
 } from "../protocol/index.js";
 import type { Bridge } from "./bridge.js";
@@ -32,6 +32,9 @@ export interface HostHandler {
   answer(id: string, response: Record<string, unknown>): void;
   pendingDialogs(): unknown[];
   uiState(): ExtensionUiState;
+  /** Host state and its commands do not depend on a live session. */
+  hostState?(): HostState;
+  hostCommand?(name: HostCommandName): Promise<unknown>;
 }
 export interface HubOptions {
   host?: string;
@@ -401,6 +404,9 @@ export class Hub {
       lease.expiresAt = this.leaseUntil(peer);
       clearTimeout(peer.helloTimer);
       this.send(peer, { t: "welcome", clientId: lease.id, leaseExpiresAt: lease.expiresAt, nextCommandNo: lease.nextCommandNo });
+      // Before the snapshot: a page that (re)connects during a failed switch must see the recovery state.
+      const hostState = this.hostHandler?.hostState?.();
+      if (hostState) this.send(peer, hostState);
       this.sendSnapshot(peer);
       this.notifyCount();
       return;
@@ -426,10 +432,10 @@ export class Hub {
       if (receipt.result) this.send(peer, receipt.result);
       return;
     }
-    try { this.command(peer, lease, message); }
+    try { if (message.t === "host_command") this.hostCommand(peer, lease, message); else this.command(peer, lease, message); }
     catch (error) {
       // A valid command envelope always receives an ID-correlated rejection.
-      this.send(peer, { t: "ack", id: message.id, epoch: message.epoch,
+      this.send(peer, { t: "ack", id: message.id, epoch: message.t === "host_command" ? this._epoch : message.epoch,
         nextCommandNo: lease.nextCommandNo, status: "rejected", error: toWireError(error) });
     }
   }
@@ -440,7 +446,32 @@ export class Hub {
     lease.expiresAt = this.leaseUntil(peer);
     return lease;
   }
+  /** A command about the host: valid without a session, but only against the host state the viewer has seen. */
+  private hostCommand(peer: Peer, lease: Lease, command: HostCommandEnvelope): void {
+    this.dispatch(peer, lease, command, this._epoch, () => {
+      const handler = this.hostHandler;
+      if (!handler?.hostState || !handler.hostCommand) throw new ProtocolError("host_unavailable", "The RPC session host is not ready.");
+      if (command.hostRevision !== handler.hostState().revision) throw new ProtocolError("stale_host", "The host state changed; check the page before trying again.");
+      return handler.hostCommand(command.command);
+    });
+  }
   private command(peer: Peer, lease: Lease, command: CommandEnvelope): void {
+    this.dispatch(peer, lease, command, command.epoch, () => {
+      const bridge = this.boundBridge;
+      if (!bridge || this._switching || !bridge.isCurrent() || command.epoch !== this._epoch || command.sessionId !== bridge.sessionId || command.branchRevision !== bridge.branchRevision)
+        throw new ProtocolError("stale_session", "Refresh the session snapshot before submitting.");
+      const args = commandArgs(command.command, command.args);
+      if (!this.hostHandler) throw new ProtocolError("host_unavailable", "The RPC session host is not ready.");
+      // Every RPC response belongs to its originating receipt. Epoch replacement changes
+      // reads and new submissions, never the identity of an already accepted operation.
+      return command.command === "access_rotate" ? Promise.resolve(this.prepareRotation())
+        : this.hostHandler.command(command.command, args, {
+          sessionId: bridge.sessionId, branchRevision: bridge.branchRevision, generation: bridge.generation,
+        });
+    });
+  }
+  /** One numbered command per lease: deduplicated by number and content, acknowledged, then resolved once. */
+  private dispatch(peer: Peer, lease: Lease, command: { commandNo: number; id: string }, epoch: string, start: () => Promise<unknown>): void {
     const digest = createHash("sha256").update(canonical(command)).digest("hex");
     const previous = lease.receipts.get(command.commandNo);
     if (previous) {
@@ -453,27 +484,17 @@ export class Hub {
     if (command.commandNo !== lease.nextCommandNo) throw new ProtocolError("out_of_order", "Use the next expected command number.");
     if (lease.nextCommandNo >= Number.MAX_SAFE_INTEGER) throw new ProtocolError("client_expired", "Command sequence exhausted; create a new client lease.");
     lease.nextCommandNo++;
-    const receipt: Receipt = { digest, ack: { t: "ack", id: command.id, epoch: command.epoch, nextCommandNo: lease.nextCommandNo, status: "rejected" } };
+    const receipt: Receipt = { digest, ack: { t: "ack", id: command.id, epoch, nextCommandNo: lease.nextCommandNo, status: "rejected" } };
     lease.receipts.set(command.commandNo, receipt);
     while (lease.receipts.size > (this.options.receiptLimit ?? 128)) lease.receipts.delete(lease.receipts.keys().next().value!);
     let ackSent = false;
-    const bridge = this.boundBridge;
     try {
-      if (!bridge || this._switching || !bridge.isCurrent() || command.epoch !== this._epoch || command.sessionId !== bridge.sessionId || command.branchRevision !== bridge.branchRevision)
-        throw new ProtocolError("stale_session", "Refresh the session snapshot before submitting.");
-      const args = commandArgs(command.command, command.args);
-      if (!this.hostHandler) throw new ProtocolError("host_unavailable", "The RPC session host is not ready.");
-      // Every RPC response belongs to its originating receipt. Epoch replacement changes
-      // reads and new submissions, never the identity of an already accepted operation.
-      const pending = command.command === "access_rotate" ? Promise.resolve(this.prepareRotation())
-        : this.hostHandler.command(command.command, args, {
-          sessionId: bridge.sessionId, branchRevision: bridge.branchRevision, generation: bridge.generation,
-        });
+      const pending = start();
       void pending.then(
         (value) => ({ status: "completed" as const, value }),
         (error: unknown) => ({ status: "failed" as const, error: toWireError(error) }),
       ).then((result) => {
-        receipt.result = { t: "command_result", id: command.id, epoch: command.epoch, ...result };
+        receipt.result = { t: "command_result", id: command.id, epoch, ...result };
         if (ackSent) this.send(peer, receipt.result);
       });
       receipt.ack.status = "dispatched";
@@ -564,6 +585,8 @@ export class Hub {
   private hostHandler?: HostHandler;
   setHostHandler(handler: HostHandler | undefined): void { this.hostHandler = handler; }
   get hosted(): boolean { return !!this.hostHandler; }
+  /** The host's own state changed: every viewer learns it, with or without a session. */
+  publishHostState(): void { const state = this.hostHandler?.hostState?.(); if (state) this.broadcast(state); }
   /** Unsequenced notices from the session host (dialogs), delivered to every authenticated viewer. */
   notifyAll(message: ServerMessage): void { this.broadcast(message); }
   private sendSnapshot(peer: Peer): void {
@@ -587,6 +610,13 @@ export class Hub {
       },
     });
     this.reset(reason);
+  }
+  /** The runtime behind the bridge is being replaced: no session exists until the next bindBridge. */
+  suspendBridge(reason: string): void {
+    this.boundBridge?.setObserver(undefined);
+    this.boundBridge = undefined;
+    this._switching = true;
+    this.broadcast({ t: "switching", reason });
   }
   private reset(reason: string): void {
     if (!this.boundBridge) return;

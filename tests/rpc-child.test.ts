@@ -43,3 +43,16 @@ test("spawn failure resolves the exit promise and pending calls reject without h
   const child = new RpcChild([], join(root, "missing"), entry, { HOME: root }); child.start();
   await assert.rejects(child.request("ready", {}, 1000)); assert.equal(await child.exited, null); await child.stop();
 }));
+test("stop reports whether the child ended on its own or had to be signalled; a later urgent stop shortens the wait", async () => fixture(async (root, entry) => {
+  const env = { HOME: root, MARKER: join(root, "started.json") };
+  const orderly = new RpcChild([], root, entry, env); orderly.start(); orderly.activate(); await orderly.request("ready");
+  assert.deepEqual(await orderly.stop({ graceMs: 5000 }), { code: 0, forced: false });
+  assert.deepEqual(await orderly.stop(), { code: 0, forced: false });
+  // A child that ignores stdin closing, like a shutdown handler that never returns.
+  const stubborn = join(root, "stubborn.mjs");
+  await writeFile(stubborn, `import {createInterface} from 'node:readline'; const lines=createInterface({input:process.stdin}); lines.on('line',line=>{const message=JSON.parse(line); process.stdout.write(JSON.stringify({type:'response',id:message.id,success:true,data:{}})+'\\n');}); setInterval(()=>{},1000);`);
+  const slow = new RpcChild([], root, stubborn, env); slow.start(); slow.activate(); await slow.request("ready");
+  const started = Date.now(); const planned = slow.stop({ graceMs: 60_000 });
+  const urgent = await slow.stop({ graceMs: 50 });
+  assert.equal(urgent.forced, true); assert.equal((await planned).forced, true); assert(Date.now() - started < 5000); assert.equal(slow.running, false);
+}));

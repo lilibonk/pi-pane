@@ -1,5 +1,5 @@
 import { createStore } from "zustand/vanilla";
-import type { CommandName, ExtensionUiState, ImageType, MessageView, PromptImage, Snapshot } from "../protocol/index.js";
+import type { CommandName, ExtensionUiState, HostCommandName, HostState, ImageType, MessageView, PromptImage, Snapshot } from "../protocol/index.js";
 import { IMAGE_TYPES, LIMITS, applyProjectionEvent, boundedTools, decodeBase64, encodedSize, inspectImage, isTextContent, mergeOlderPage } from "../protocol/index.js";
 import type { WorkbenchAction, WorkbenchValues } from "../protocol/workbench.js";
 import { ForkDraftRecovery } from "./draft-recovery.js";
@@ -52,6 +52,10 @@ export interface WebState {
   /** Extension requests pending in the foreground RPC host. */
   dialogs: Dialog[];
   ui: ExtensionUiState | null;
+  /** The host's own state. Present with or without a session; drives the recovery page. */
+  host: HostState | null;
+  /** The recovery command this page sent and has no result for yet. */
+  hostAction: { id: string; command: HostCommandName } | null;
 }
 
 export const webStore = createStore<WebState>(() => ({
@@ -75,6 +79,8 @@ export const webStore = createStore<WebState>(() => ({
   images: {},
   dialogs: [],
   ui: null,
+  host: null,
+  hostAction: null,
 }));
 
 const TOKEN_KEY = "pi-pane.token";
@@ -304,7 +310,7 @@ function handleFrame(raw: unknown) {
     case "welcome":
       if (typeof frame.clientId !== "string" || !Number.isSafeInteger(frame.nextCommandNo)) throw new Error("welcome shape");
       saveSession(CLIENT_KEY, frame.clientId);
-      webStore.setState({ clientId: frame.clientId, nextCommandNo: frame.nextCommandNo });
+      webStore.setState({ clientId: frame.clientId, nextCommandNo: frame.nextCommandNo, hostAction: null });
       break;
     case "snapshot": {
       if (typeof frame.epoch !== "string" || !Number.isSafeInteger(frame.seq) ||
@@ -390,11 +396,21 @@ function handleFrame(raw: unknown) {
       break;
     case "switching":
       cancelWorkbenchReads();
-      webStore.setState({ connection: "switching", notice: "宿主正在切换会话，写操作暂时暂停…" });
+      webStore.setState({ connection: "switching", notice: current.host?.phase === "recovery_required" ? "" : "宿主正在切换会话，写操作暂时暂停…" });
+      break;
+    case "host_state":
+      if (!Number.isSafeInteger(frame.revision) || typeof frame.phase !== "string") throw new Error("host_state shape");
+      webStore.setState({ host: frame as unknown as HostState,
+        // A failed switch has no session to show: drop the old snapshot so nothing looks writable.
+        ...(frame.phase === "recovery_required" ? { snapshot: null, lastAppliedSeq: 0, connection: "switching" as const, notice: "" } : {}) });
       break;
     case "ack": {
       if (typeof frame.id !== "string") throw new Error("ack id");
       if (Number.isSafeInteger(frame.nextCommandNo)) webStore.setState({ nextCommandNo: Math.max(current.nextCommandNo, frame.nextCommandNo) });
+      if (current.hostAction?.id === frame.id) {
+        if (frame.status !== "dispatched") webStore.setState({ hostAction: null, notice: frame.error?.code === "stale_host" ? "宿主状态已变化，请按页面当前内容重新选择。" : frame.error?.message ?? "操作未被接受。" });
+        break;
+      }
       updateSubmission(frame.id, {
         status: frame.status === "dispatched" ? "dispatched" : "rejected",
         explanation: frame.error?.message,
@@ -403,6 +419,11 @@ function handleFrame(raw: unknown) {
       break;
     }
     case "command_result": {
+      if (current.hostAction?.id === frame.id) {
+        // On failure the host has already published the updated recovery state with its reason.
+        webStore.setState({ hostAction: null, ...(frame.status === "completed" ? {} : { notice: frame.error?.code === "recovery_required" ? "" : frame.error?.message ?? "操作失败。" }) });
+        break;
+      }
       const submission = current.submissions.find(item => item.id === frame.id);
       const restored = submission?.command === "session_fork" && frame.status === "completed" && typeof frame.value?.draftText === "string" ? frame.value.draftText as string : undefined;
       updateSubmission(frame.id, { status: frame.status === "completed" ? frame.value?.cancelled === true ? "cancelled" : ["started", "queued", "handled"].includes(frame.value?.disposition ?? frame.value?.status) ? (frame.value.disposition ?? frame.value.status) : "completed" : "failed", explanation: frame.error?.message });
@@ -645,6 +666,15 @@ export function answerDialog(id: string, response: { value?: string; confirmed?:
     webStore.setState({ notice: "对话框输入超过 64 KiB，请缩短后再提交。" }); return;
   }
   if (webStore.getState().connection === "online" && send({ t: "ui_response", id, ...response })) webStore.setState(state => ({ dialogs: state.dialogs.filter(dialog => dialog.id !== id) }));
+}
+/** Retry, restore or stop after a failed runtime replacement. Needs no session, only the host state this page shows. */
+export function issueHostCommand(command: HostCommandName) {
+  const state = webStore.getState();
+  if (!state.clientId || !state.host || state.hostAction || state.connection === "disconnected" || state.connection === "fatal" || state.connection === "login") return;
+  const commandNo = state.nextCommandNo;
+  const id = `${state.clientId}:${commandNo}`;
+  if (!send({ t: "host_command", clientId: state.clientId, commandNo, id, hostRevision: state.host.revision, command, args: {} })) return;
+  webStore.setState({ notice: "", nextCommandNo: commandNo + 1, hostAction: { id, command } });
 }
 export function issueCommand(command: CommandName, args: Record<string, unknown> = {}, text?: string, mode?: "followUp" | "steer") {
   const state = webStore.getState();

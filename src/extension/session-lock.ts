@@ -218,6 +218,46 @@ export class SessionFileLock {
       this.baseline = { fingerprint: current, offset: end, prefix: hash.update(appended).digest("hex"), lastId: lastId ?? this.baseline.lastId };
     } finally { await file.close(); }
   }
+  /**
+   * After the owned writer has exited: accepts what it appended while shutting down, and returns
+   * the number of entries. Nothing can attribute these lines any more (the writer is gone), so the
+   * rule is structural and bounded: the file only grew in place, accepted history is unchanged,
+   * every appended line is a complete transcript entry, none is a conversation message (a turn was
+   * still running), and the file is no longer changing.
+   */
+  async acceptShutdownAppends(): Promise<number> {
+    await this.assertOwned();
+    const current = await fingerprint(this.sessionFile);
+    if (sameFingerprint(current, this.baseline.fingerprint)) return 0;
+    const conflict = (detail: string) => new ProtocolError("session_conflict", `The session file changed while its writer was shutting down (${detail}). Inspect the session in a terminal before resuming.`);
+    if (!current) throw conflict("the file disappeared");
+    if (this.baseline.fingerprint && (current.dev !== this.baseline.fingerprint.dev || current.ino !== this.baseline.fingerprint.ino)) throw conflict("the file was replaced");
+    const start = this.baseline.offset;
+    const file = await open(this.sessionFile, constants.O_RDONLY | constants.O_NOFOLLOW);
+    try {
+      if (current.size < start) throw conflict("it was truncated");
+      const hash = await prefixHash(file, start);
+      if (hash.copy().digest("hex") !== this.baseline.prefix) throw conflict("earlier content was rewritten");
+      if (await lastLineEnd(file, current.size) !== current.size) throw conflict("the last entry is incomplete");
+      const appended = await readRange(file, start, current.size);
+      if (appended.length !== current.size - start) throw conflict("it was truncated while checking appended entries");
+      const lines = appended.length ? appended.toString("utf8").slice(0, -1).split("\n") : [];
+      let lastId = this.baseline.lastId; let count = 0;
+      for (const [index, line] of lines.entries()) {
+        let value: unknown;
+        try { value = JSON.parse(line); } catch { throw conflict("a line is not a transcript entry"); }
+        if (typeof value !== "object" || value === null || typeof (value as { type?: unknown }).type !== "string") throw conflict("a line is not a transcript entry");
+        const entry = value as { type: string; id?: unknown };
+        if (start === 0 && index === 0 && entry.type === "session") continue; // the header
+        if (typeof entry.id !== "string") throw conflict("a line is not a transcript entry");
+        if (entry.type === "message") throw conflict("a conversation message was written, so a turn was still running");
+        lastId = entry.id; count++;
+      }
+      if (!sameFingerprint(await fingerprint(this.sessionFile), current)) throw conflict("it is still being written after the writer exited");
+      this.baseline = { fingerprint: current, offset: current.size, prefix: hash.update(appended).digest("hex"), lastId };
+      return count;
+    } finally { await file.close(); }
+  }
   private async assertOwned(): Promise<void> {
     if (this.released) throw new ProtocolError("session_lock_lost", "Session ownership has already been released.");
     const file = await open(this.lockPath, constants.O_RDONLY | constants.O_NOFOLLOW).catch(() => undefined);

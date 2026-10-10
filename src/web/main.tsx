@@ -3,7 +3,7 @@ import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "preact/ho
 import type { JSX } from "preact";
 import { IMAGE_TYPES } from "../protocol/index.js";
 import {
-  addImages, answerDialog, forgetSubmission, issueCommand, loadOlder, login, logout, queryReceipt, reconnect, removeAttachment, setDraft,
+  addImages, answerDialog, forgetSubmission, issueCommand, issueHostCommand, loadOlder, login, logout, queryReceipt, reconnect, removeAttachment, setDraft,
   startConnection, submitPrompt, webStore, type Attachment, type Dialog, type MessageView, type Submission, type ToolView, type WebState,
 } from "./store.js";
 import { Message, ToolCard, type ToolContext } from "./messages.js";
@@ -128,6 +128,28 @@ const WINDOW_STEP = 100;
 /** Touch keyboards have no reliable Shift+Enter; Enter inserts a newline and the buttons submit. */
 const coarsePointer = typeof matchMedia === "function" && matchMedia("(pointer: coarse)").matches;
 
+const RECOVERY_REASONS: Record<string, string> = {
+  stop_incomplete: "上一个会话没有正常结束，所以新的项目没有启动。",
+  shutdown_conflict: "上一个会话的记录在结束时出现了无法确认来源的写入，所以新的项目没有启动。",
+  start_failed: "目标项目的会话没有启动成功。",
+};
+/** A failed project switch: no session is running. Nothing retries on its own; the user picks one way out. */
+function Recovery({ state }: { state: WebState }) {
+  const recovery = state.host!.recovery!;
+  const busy = !!state.hostAction || state.connection === "disconnected" || state.connection === "fatal";
+  return <section class="recovery" role="alert" aria-labelledby="recovery-title">
+    <h2 id="recovery-title">项目切换没有完成</h2>
+    <p>{RECOVERY_REASONS[recovery.reason] ?? "会话运行时没有就绪。"}现在没有会话在运行，消息不会被发送。</p>
+    <p class="recovery-detail">{recovery.message}</p>
+    <div class="recovery-actions">
+      <button type="button" disabled={busy} onClick={() => issueHostCommand("recover_retry")}>{state.hostAction?.command === "recover_retry" ? "正在重试…" : "重试打开"}<span title={recovery.targetCwd}>{recovery.targetCwd}</span></button>
+      <button type="button" disabled={busy || !recovery.canRestore} onClick={() => issueHostCommand("recover_restore")}>{state.hostAction?.command === "recover_restore" ? "正在恢复…" : "回到上一个项目"}<span title={recovery.previousCwd}>{recovery.previousCwd}</span></button>
+      <button type="button" class="quiet" disabled={busy} onClick={() => issueHostCommand("host_stop")}>停止服务</button>
+    </div>
+    {!recovery.canRestore && <p class="recovery-hint">上一个会话需要先在终端检查，不能在这里直接恢复。</p>}
+    <p class="recovery-hint">不会自动重试。停止服务后，终端会显示继续上一个会话的命令；也可以在终端按 Ctrl+C。</p>
+  </section>;
+}
 function Login({ state }: { state: WebState }) {
   const [password, setPassword] = useState("");
   return (
@@ -192,6 +214,7 @@ function App() {
   const themeKeys = useRef<string[]>([]);
   const online = connection === "online" && !!snapshot && !!state.clientId;
   const host = snapshot?.state;
+  const recovery = state.host?.phase === "recovery_required" && !!state.host.recovery;
   const controlPending = state.submissions.some(item => item.epoch === snapshot?.epoch &&
     (item.command.startsWith("session_") || item.command === "set_model" || item.command === "compact") &&
     (item.status === "sent" || item.status === "dispatched"));
@@ -355,14 +378,14 @@ function App() {
         <div class="timeline-inner" ref={feedInner}>
           {start > 0 && <div class="history-limit"><button type="button" onClick={showEarlier}>显示更早的 {Math.min(start, WINDOW_STEP)} 条（已在浏览器中）</button></div>}
           {!start && snapshot?.session.olderCursor && <div class="history-limit"><button type="button" disabled={state.historyLoading || !online} onClick={olderPage}>{state.historyLoading ? "正在加载更早的消息…" : "加载更早的消息"}</button>{state.historyError && <span>{state.historyError}</span>}</div>}
-          {!snapshot ? <div class="empty-state"><span class="empty-pi">π</span><h2>{connection === "switching" ? "等待新会话" : "连接当前会话"}</h2><p>在终端输入 /web 后，当前分支和正在生成的内容会显示在这里。</p></div> : !snapshot.session.messages.length && !host?.tools.length ? <div class="empty-state"><span class="empty-pi">π</span><h2>可以开始了</h2><p>会话已交给浏览器。发送消息后，pi 的实际输出会出现在这里。</p></div> : null}
+          {recovery ? <Recovery state={state} /> : !snapshot ? <div class="empty-state"><span class="empty-pi">π</span><h2>{connection === "switching" ? "等待新会话" : "连接当前会话"}</h2><p>在终端输入 /web 后，当前分支和正在生成的内容会显示在这里。</p></div> : !snapshot.session.messages.length && !host?.tools.length ? <div class="empty-state"><span class="empty-pi">π</span><h2>可以开始了</h2><p>会话已交给浏览器。发送消息后，pi 的实际输出会出现在这里。</p></div> : null}
           {shown.map(message => <Message key={message.id} message={message} tools={view.tools} expansions={state.expansions} />)}
           {!!view.orphans.length && <div class="tools"><div class="section-label">工具执行</div>{view.orphans.map(tool => <ToolCard key={tool.id} live={tool} expansions={state.expansions} />)}</div>}
           {host?.running && <div class="running-line"><span class="running-indicator" />pi 正在运行</div>}
         </div>
       </div>
-      {showLatest && <button type="button" class="go-latest" onClick={goLatest}>↓ 回到最新</button>}
-      <footer class="composer-region">
+      {showLatest && !recovery && <button type="button" class="go-latest" onClick={goLatest}>↓ 回到最新</button>}
+      <footer class="composer-region" hidden={recovery}>
         <div class="composer-inner">
           <ExtensionWidgets state={state} placement="aboveEditor" />
           <div class="host-controls">

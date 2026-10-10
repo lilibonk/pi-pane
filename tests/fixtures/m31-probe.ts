@@ -23,7 +23,9 @@ export default function m31Probe(pi: ExtensionAPI) {
     if (process.env.PI_M31_VETO_SWITCH === "1") return { cancel: true };
   });
   pi.on("session_shutdown", async (event, ctx) => {
-    evidence("m31_shutdown_begin", { reason: event.reason });
+    evidence("m31_shutdown_begin", { reason: event.reason, mode: ctx.mode });
+    // Shutdown probes describe the RPC child; a TUI running the same fixture just exits.
+    if (ctx.mode !== "rpc") { evidence("m31_shutdown_end", { reason: event.reason, mode: ctx.mode }); return; }
     if (process.env.PI_M31_SHUTDOWN_APPEND === "1") { pi.appendEntry("m31-shutdown", { at: "shutdown" }); evidence("m31_shutdown_append"); }
     const delay = Number(process.env.PI_M31_SHUTDOWN_DELAY ?? 0);
     if (delay > 0) await new Promise((resolve) => setTimeout(resolve, delay));

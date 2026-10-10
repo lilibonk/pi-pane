@@ -52,6 +52,9 @@ export type ImageType = (typeof IMAGE_TYPES)[number];
 
 export const COMMANDS = ["prompt", "abort", "set_model", "set_thinking", "compact", "session_new", "session_switch", "session_fork", "session_clone", "session_rename", "run_command", "access_rotate"] as const;
 export type CommandName = (typeof COMMANDS)[number];
+/** Commands about the host itself. They need no live session: a failed runtime replacement is recovered through them. */
+export const HOST_COMMANDS = ["recover_retry", "recover_restore", "host_stop"] as const;
+export type HostCommandName = (typeof HOST_COMMANDS)[number];
 
 /** `total` is present when `text` is a prefix of a longer block readable through content_page. */
 export type ContentView =
@@ -177,6 +180,28 @@ export interface CommandEnvelope {
   command: string;
   args: unknown;
 }
+/** Same lease, numbering and receipts as `command`; checked against the host revision instead of a session epoch. */
+export interface HostCommandEnvelope {
+  t: "host_command";
+  clientId: string;
+  commandNo: number;
+  id: string;
+  hostRevision: number;
+  command: HostCommandName;
+  args: Record<string, unknown>;
+}
+/**
+ * The host's own state, independent of any session. `replacing`: the session runtime is being
+ * swapped. `recovery_required`: a swap failed; conversation writes are refused until the user
+ * retries, restores the previous session or stops the service.
+ */
+export interface HostState {
+  t: "host_state";
+  revision: number;
+  phase: "ready" | "replacing" | "recovery_required";
+  cwd: string;
+  recovery?: { reason: string; message: string; targetCwd: string; previousCwd: string; canRestore: boolean };
+}
 export interface Ack {
   t: "ack";
   id: string;
@@ -254,13 +279,15 @@ export type ClientMessage =
   | ContentPageRequest
   | ImagePageRequest
   | WorkbenchQuery
-  | CommandEnvelope;
+  | CommandEnvelope
+  | HostCommandEnvelope;
 export type ServerMessage =
   | { t: "welcome"; clientId: string; leaseExpiresAt: number; nextCommandNo: number }
   | Snapshot
   | { t: "event"; epoch: string; seq: number; ev: ProjectionEvent }
   | { t: "session_reset"; epoch: string; sessionId: string; branchRevision: number; reason: string }
   | { t: "switching"; reason: string }
+  | HostState
   | { t: "notice"; message: string }
   | UiRequest
   | ({ t: "ui_state" } & ExtensionUiState)
@@ -328,6 +355,13 @@ export function parseClientMessage(value: unknown): ClientMessage {
       shortString(value.command, 64) && Number.isSafeInteger(value.commandNo) && (value.commandNo as number) >= 1 &&
       nonNegativeInt(value.branchRevision) && "args" in value &&
       value.id === `${value.clientId}:${value.commandNo}`) return value as unknown as CommandEnvelope;
+  if (value.t === "host_command" && exactKeys(value, ["t", "clientId", "commandNo", "id", "hostRevision", "command", "args"]) &&
+      shortString(value.clientId) && shortString(value.id) && Number.isSafeInteger(value.commandNo) && (value.commandNo as number) >= 1 &&
+      nonNegativeInt(value.hostRevision) && value.id === `${value.clientId}:${value.commandNo}`) {
+    if (!HOST_COMMANDS.includes(value.command as HostCommandName)) throw new ProtocolError("unknown_command", "Unknown host command.");
+    if (!isRecord(value.args) || Object.keys(value.args).length) throw new ProtocolError("invalid_args", "This host command takes no arguments.");
+    return value as unknown as HostCommandEnvelope;
+  }
   throw new ProtocolError("invalid_envelope", "Invalid message envelope or command ID.");
 }
 export function workbenchArgs(action: WorkbenchQuery["action"], value: unknown): Record<string, unknown> {

@@ -8,6 +8,7 @@ import { HandoffHost } from "../src/extension/handoff.js";
 import { SessionFileLock } from "../src/extension/session-lock.js";
 import type { Hub } from "../src/extension/hub.js";
 import type { Bridge } from "../src/extension/bridge.js";
+import type { HostState } from "../src/protocol/index.js";
 import { RpcReadTimeoutError, type RpcConnection, type RpcRecord } from "../src/extension/rpc-child.js";
 
 class FakeChild implements RpcConnection {
@@ -30,7 +31,17 @@ class FakeChild implements RpcConnection {
   emit(record: RpcRecord) { for (const listener of this.listeners) listener(record); }
   onRecord(listener: (record: RpcRecord) => void) { this.listeners.add(listener); return () => this.listeners.delete(listener); }
   respondUi(id: string, response: Record<string, unknown>) { this.responses.push({ id, response }); this.onUiResponse?.(id, response); }
-  async stop() { this.running = false; this.exit(0); }
+  /** Runs after stdin is closed and before the exit, like a session_shutdown handler. */
+  beforeExit?: () => Promise<void> | void;
+  stopOutcome = { code: 0 as number | null, forced: false };
+  stops = 0;
+  private stopping?: Promise<void>;
+  async stop() {
+    this.stops++; if (!this.running) return this.stopOutcome;
+    await (this.stopping ??= (async () => { await this.beforeExit?.(); this.running = false; this.exit(this.stopOutcome.code); })());
+    return this.stopOutcome;
+  }
+  crash(code: number) { this.running = false; this.exit(code); }
   async request<T>(type: string, payload: Record<string, unknown> = {}): Promise<T> {
     this.calls.push({ type, payload }); const custom = await this.intercept?.(type, payload); if (custom?.intercepted) return custom.value as T;
     let value: unknown;
@@ -65,7 +76,15 @@ class FakeChild implements RpcConnection {
     return value as T;
   }
 }
-async function withHost(run: (host: HandoffHost, child: FakeChild, fixture: { root: string; foreign: SessionManager; bridges: Bridge[]; notices: unknown[] }) => Promise<void>, beforeStart?: (child: FakeChild) => void) {
+interface Fixture {
+  root: string; foreign: SessionManager; bridges: Bridge[]; notices: unknown[];
+  /** Every child the host started, with its arguments and directory. The first is the handoff child. */
+  launches: { args: string[]; cwd: string; child: FakeChild }[];
+  suspended: string[]; logs: string[]; hostStates: HostState[];
+  /** Adjusts a replacement child before the host starts it. */
+  prepare?: (child: FakeChild, cwd: string) => void;
+}
+async function withHost(run: (host: HandoffHost, child: FakeChild, fixture: Fixture) => Promise<void>, beforeStart?: (child: FakeChild) => void, argv: string[] = []) {
   const root = await mkdtemp(join(tmpdir(), "pi-pane-host-")); const cwd = join(root, "project"); const other = join(root, "other"); const custom = join(root, "custom");
   await Promise.all([mkdir(cwd), mkdir(other), mkdir(custom)]); await writeFile(join(cwd, "local.txt"), "local"); await writeFile(join(other, "foreign.txt"), "foreign");
   const manager = SessionManager.create(cwd, custom); manager.appendMessage({ role: "user", content: "first user", timestamp: 1 });
@@ -75,11 +94,22 @@ async function withHost(run: (host: HandoffHost, child: FakeChild, fixture: { ro
   foreign.appendMessage({ role: "assistant", content: [{ type: "text", text: "foreign answer" }], api: "fixture", provider: "local", model: "fixture", timestamp: 5, stopReason: "stop", usage: { input: 0, output: 0, totalTokens: 0, cacheRead: 0, cacheWrite: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } } } as never);
   const child = new FakeChild(manager, root); const bridges: Bridge[] = []; const notices: unknown[] = [];
   beforeStart?.(child);
-  const hub = { setHostHandler() {}, bindBridge(bridge: Bridge) { bridges.push(bridge); }, notifyAll(record: unknown) { notices.push(record); } } as unknown as Hub;
+  const fixture: Fixture = { root, foreign, bridges, notices, launches: [], suspended: [], logs: [], hostStates: [] };
+  const hub = { setHostHandler() {}, bindBridge(bridge: Bridge) { bridges.push(bridge); }, notifyAll(record: unknown) { notices.push(record); }, suspendBridge(reason: string) { fixture.suspended.push(reason); }, publishHostState() { fixture.hostStates.push(host.hostState()); } } as unknown as Hub;
   const theme = { appearance: "dark", colors: {} } as unknown as ExtensionContext["ui"]["theme"];
-  const host = new HandoffHost(hub, { sessionFile: manager.getSessionFile()!, sessionDir: custom, cwd, argv: [], theme, themes: [] }, () => {}, { createChild: () => child,
+  // Like pi: `--session` opens that transcript; without it the child creates a session in its directory.
+  const createChild = (args: string[], directory: string): FakeChild => {
+    let next = child;
+    if (fixture.launches.length) {
+      const session = args.includes("--session") ? args[args.indexOf("--session") + 1] : undefined;
+      next = new FakeChild(session ? SessionManager.open(session) : SessionManager.create(directory, custom), root);
+      fixture.prepare?.(next, directory);
+    }
+    fixture.launches.push({ args, cwd: directory, child: next }); return next;
+  };
+  const host = new HandoffHost(hub, { sessionFile: manager.getSessionFile()!, sessionDir: custom, cwd, argv, theme, themes: [] }, line => { fixture.logs.push(line); }, { createChild, plannedStopMs: 50,
     listAll: ((directory?: string) => child.catalogOverride ? Promise.resolve(child.catalogOverride) : directory ? SessionManager.listAll(directory) : Promise.resolve([])) as typeof SessionManager.listAll });
-  try { await host.start(); await run(host, child, { root, foreign, bridges, notices }); }
+  try { await host.start(); await run(host, child, fixture); }
   finally { await host.stop(); await rm(root, { recursive: true, force: true }); }
 }
 test("host catalog searches all message text/custom roots and follows current cwd across RPC session switches", async () => withHost(async (host, child, { foreign }) => {
@@ -89,7 +119,6 @@ test("host catalog searches all message text/custom roots and follows current cw
   await host.command("session_switch", { sessionId: foreign.getSessionId() }); assert.equal(host.cwd, foreign.getCwd());
   assert.deepEqual((await host.read("files")).files.map(file => file.path), ["foreign.txt"]);
   const current = (await host.read("sessions", { scope: "all" })).sessions.find(session => session.current); assert.equal(current?.id, foreign.getSessionId());
-  assert.equal(child.calls.filter(call => call.type === "switch_session").at(-1)?.payload.sessionPath, foreign.getSessionFile());
 }));
 test("RPC catalog preserves precedence, reserves builtins and reports upstream gaps", async () => withHost(async host => {
   const commands = (await host.read("commands")).commands; const shared = commands.filter(command => command.name === "shared");
@@ -213,15 +242,31 @@ test("long select labels remain distinct and map to exact original RPC option st
   const labels = host.pendingDialogs()[0]!.options!; assert.notEqual(labels[0], labels[1]); assert(Buffer.byteLength(labels[0]!) <= 500);
   host.answer("long-select", { value: labels[1] }); assert.deepEqual(child.responses.at(-1), { id: "long-select", response: { value: options[1] } });
 }));
-test("registered extension session replacement rebuilds scope/cwd; queued old-scope write is rejected", async () => withHost(async (host, child, { foreign, bridges }) => {
+test("registered extension session replacement in the same project rebuilds scope; queued old-scope write is rejected", async () => withHost(async (host, child, { root, bridges }) => {
+  const sibling = SessionManager.create(child.manager.getCwd(), join(root, "custom")); sibling.appendMessage({ role: "user", content: "sibling", timestamp: 6 });
+  await writeFile(sibling.getSessionFile()!, [sibling.getHeader(), ...sibling.getEntries()].map(line => JSON.stringify(line)).join("\n") + "\n");
+  child.disposition = "handled"; child.intercept = async type => {
+    if (type === "prompt") { child.manager = sibling; child.entries = sibling.getEntries() as unknown as Record<string, unknown>[]; }
+    return { intercepted: false };
+  };
+  const bridge = bridges[0]!; const expected = { sessionId: bridge.sessionId, generation: bridge.generation, branchRevision: bridge.branchRevision };
+  const cwd = host.cwd;
+  const extension = host.command("prompt", { text: "/mark" }, expected); const stale = host.command("prompt", { text: "old scope" }, expected);
+  await extension; await assert.rejects(stale, { code: "stale_session" }); assert.equal(host.cwd, cwd); assert.equal(bridges.at(-1)?.sessionId, sibling.getSessionId());
+  assert.equal(child.running, true); assert.deepEqual((await host.read("files")).files.map(file => file.path), ["local.txt"]);
+}));
+test("a child that moves itself to another project's session is not accepted: the service fails closed", async () => withHost(async (host, child, { foreign, bridges, launches, logs }) => {
   child.disposition = "handled"; child.intercept = async type => {
     if (type === "prompt") { child.manager = foreign; child.entries = foreign.getEntries() as unknown as Record<string, unknown>[]; }
     return { intercepted: false };
   };
-  const bridge = bridges[0]!; const expected = { sessionId: bridge.sessionId, generation: bridge.generation, branchRevision: bridge.branchRevision };
-  const extension = host.command("prompt", { text: "/mark" }, expected); const stale = host.command("prompt", { text: "old scope" }, expected);
-  await extension; await assert.rejects(stale, { code: "stale_session" }); assert.equal(host.cwd, foreign.getCwd()); assert.equal(bridges.at(-1)?.sessionId, foreign.getSessionId());
-  assert.deepEqual((await host.read("files")).files.map(file => file.path), ["foreign.txt"]);
+  await assert.rejects(host.command("prompt", { text: "/mark" }), { code: "project_mismatch" });
+  assert.equal(child.running, false); assert.equal(launches.length, 1); assert.equal(bridges.length, 1);
+  assert.deepEqual(await host.finished, { exit: 0, planned: false });
+  // The resume command must name the session the child actually ended on, in its own directory.
+  assert.equal(host.sessionFile, foreign.getSessionFile()); assert.equal(host.cwd, foreign.getCwd());
+  assert(logs.some(line => line.includes("another project")));
+  assert.equal(await SessionFileLock.inspect(foreign.getSessionFile()!), undefined);
 }));
 test("idle external transcript modification stops the sole child without restarting", async () => withHost(async (host, child) => {
   await appendFile(host.sessionFile, "unexpected external write\n");
@@ -302,4 +347,99 @@ test("native clone rejection on an empty fork retains the same session through l
   await assert.rejects(host.command("session_clone", {}), /Cannot clone session/);
   assert.equal(child.running, true); assert.equal(bridges.length, bridgeCount); assert.equal((await host.read("sessions", { scope: "all" })).sessions.find(session => session.current)?.id, activeId);
   await host.command("prompt", { text: "continue this empty session" }); assert.equal(child.running, true); assert.equal(bridges.length, bridgeCount);
+}));
+const settled = (promise: Promise<unknown>) => Promise.race([promise.then(() => true), new Promise<boolean>(resolve => setTimeout(() => resolve(false), 20))]);
+test("a session of another project gets a new child started there; the old one is stopped first", async () => withHost(async (host, child, { foreign, launches, suspended, bridges }) => {
+  const original = host.sessionFile; await host.read("sessions", { scope: "all" });
+  const result = await host.command("session_switch", { sessionId: foreign.getSessionId() }) as { sessionId: string };
+  assert.equal(result.sessionId, foreign.getSessionId()); assert.equal(launches.length, 2);
+  assert.equal(child.running, false); assert(!child.calls.some(call => call.type === "switch_session"));
+  assert.equal(launches[1]!.cwd, foreign.getCwd()); assert.deepEqual(launches[1]!.args.slice(-2), ["--session", foreign.getSessionFile()]);
+  assert.deepEqual(suspended, ["replacing"]); assert.equal(bridges.at(-1)?.sessionId, foreign.getSessionId());
+  assert.equal(host.status().phase, "ready"); assert.equal(await settled(host.finished), false);
+  // Ownership moved with the runtime: the old transcript is free, the new one is held.
+  assert.equal(await SessionFileLock.inspect(original), undefined); assert.equal((await SessionFileLock.inspect(foreign.getSessionFile()!))?.pid, process.pid);
+  await host.command("prompt", { text: "in the other project" }); assert(launches[1]!.child.calls.some(call => call.type === "prompt"));
+}));
+test("a saved session restores its own model; trust overrides do not travel to another project", async () => withHost(async (host, _child, { foreign, launches }) => {
+  // The start model is not replayed over a transcript that records its own; --approve stays with the start project.
+  assert.deepEqual(launches[0]!.args, ["--approve", "--no-skills", "--session", host.sessionFile]);
+  await host.read("sessions", { scope: "all" }); await host.command("session_switch", { sessionId: foreign.getSessionId() });
+  assert.deepEqual(launches[1]!.args, ["--no-skills", "--session", foreign.getSessionFile()]);
+}, undefined, ["--model", "start/model", "--approve", "--no-skills"]));
+test("a busy or unverifiable old runtime is left running when a project switch is requested", async () => withHost(async (host, child, { foreign, launches }) => {
+  await host.read("sessions", { scope: "all" });
+  const lock = await SessionFileLock.acquire(foreign.getSessionFile()!);
+  try { await assert.rejects(host.command("session_switch", { sessionId: foreign.getSessionId() }), { code: "session_locked" }); } finally { await lock.release(); }
+  assert.equal(child.running, true); assert.equal(launches.length, 1); assert.equal(host.status().phase, "ready");
+  await rm(foreign.getCwd(), { recursive: true });
+  await assert.rejects(host.command("session_switch", { sessionId: foreign.getSessionId() }), { code: "project_unavailable" });
+  assert.equal(child.running, true); assert.equal(await SessionFileLock.inspect(foreign.getSessionFile()!), undefined);
+  await host.command("prompt", { text: "still here" });
+}));
+test("a dialog during planned shutdown makes the stop incomplete: recovery, then restore the previous session", async () => withHost(async (host, child, { foreign, launches, bridges, hostStates }) => {
+  const original = host.sessionFile; const originalId = bridges[0]!.sessionId; await host.read("sessions", { scope: "all" });
+  child.beforeExit = () => child.emit({ type: "extension_ui_request", id: "late", method: "confirm", title: "Save?" });
+  await assert.rejects(host.command("session_switch", { sessionId: foreign.getSessionId() }), { code: "recovery_required" });
+  const status = host.status(); assert.equal(status.phase, "recovery_required"); assert.equal(status.recovery?.reason, "stop_incomplete"); assert.equal(status.recovery?.canRestore, true);
+  assert.equal(launches.length, 1); assert.equal(await settled(host.finished), false);
+  // The target was never activated and is free; the previous transcript stays owned while the user decides.
+  assert.equal(await SessionFileLock.inspect(foreign.getSessionFile()!), undefined); assert.equal((await SessionFileLock.inspect(original))?.pid, process.pid);
+  await assert.rejects(host.command("prompt", { text: "write" }), { code: "recovery_required" });
+  await assert.rejects(host.read("files"), { code: "recovery_required" });
+  const wire = host.hostState(); assert.equal(wire.phase, "recovery_required"); assert.deepEqual(hostStates.map(state => state.phase).slice(-2), ["replacing", "recovery_required"]);
+  assert.deepEqual({ ...wire.recovery, message: "" }, { reason: "stop_incomplete", message: "", targetCwd: foreign.getCwd(), previousCwd: launches[0]!.cwd, canRestore: true });
+  assert(!JSON.stringify(wire).includes(".jsonl")); // viewers choose by project, not by transcript path
+  assert.deepEqual(await host.hostCommand("recover_restore"), { phase: "ready" }); const restored = host.status(); assert.equal(restored.recovery, undefined);
+  assert.equal(hostStates.at(-1)?.phase, "ready"); assert(hostStates.every((state, index) => index === 0 || state.revision > hostStates[index - 1]!.revision));
+  assert.equal(launches.length, 2); assert.deepEqual(launches[1]!.args, ["--session", original]); assert.equal(bridges.at(-1)?.sessionId, originalId);
+  await host.command("prompt", { text: "back" }); await assert.rejects(host.recover("retry"), { code: "no_recovery" });
+}));
+test("entries written during planned shutdown are accepted only when they are not conversation messages", async () => {
+  await withHost(async (host, child, { foreign, launches, logs }) => {
+    await host.read("sessions", { scope: "all" });
+    child.beforeExit = () => { child.manager.appendCustomEntry("shutdown-note", { saved: true }); };
+    await host.command("session_switch", { sessionId: foreign.getSessionId() });
+    assert.equal(launches.length, 2); assert.equal(host.status().phase, "ready"); assert(logs.some(line => line.includes("Accepted 1 transcript entries")));
+  });
+  await withHost(async (host, child, { foreign, launches }) => {
+    await host.read("sessions", { scope: "all" });
+    child.beforeExit = () => { child.manager.appendMessage({ role: "user", content: "a turn that started after the idle check", timestamp: 9 }); };
+    await assert.rejects(host.command("session_switch", { sessionId: foreign.getSessionId() }), { code: "recovery_required" });
+    const status = host.status(); assert.equal(status.recovery?.reason, "shutdown_conflict"); assert.equal(status.recovery?.canRestore, false);
+    assert.equal(launches.length, 1); await assert.rejects(host.recover("restore"), { code: "restore_unavailable" });
+    await host.recover("stop"); assert.deepEqual(await host.finished, { exit: 0, planned: true });
+  });
+});
+test("a target that fails to start leaves recovery; one explicit retry starts it", async () => withHost(async (host, child, fixture) => {
+  const { foreign, launches } = fixture; await host.read("sessions", { scope: "all" });
+  fixture.prepare = next => { next.intercept = async type => { if (type === "get_state") throw new Error("extension crashed on startup"); return { intercepted: false }; }; };
+  await assert.rejects(host.command("session_switch", { sessionId: foreign.getSessionId() }), { code: "recovery_required" });
+  assert.equal(host.status().recovery?.reason, "start_failed"); assert.match(host.status().recovery!.message, /extension crashed on startup/);
+  assert.equal(launches.length, 2); assert.equal(launches[1]!.child.running, false); assert.equal(child.running, false);
+  assert.equal(await SessionFileLock.inspect(foreign.getSessionFile()!), undefined); assert.equal(await settled(host.finished), false);
+  // A failing retry is one bounded attempt and stays in recovery.
+  await assert.rejects(host.recover("retry"), { code: "recovery_required" }); assert.equal(launches.length, 3); assert.equal(host.status().phase, "recovery_required");
+  fixture.prepare = undefined;
+  assert.equal((await host.recover("retry")).phase, "ready"); assert.equal(launches.length, 4); assert.equal(host.cwd, foreign.getCwd());
+  assert.equal(await SessionFileLock.inspect(launches[0]!.child.manager.getSessionFile()!), undefined);
+}));
+test("only the ready child's own exit ends the service; a replaced child's exit does not", async () => {
+  await withHost(async (host, child, { foreign }) => {
+    await host.read("sessions", { scope: "all" }); await host.command("session_switch", { sessionId: foreign.getSessionId() });
+    child.crash(1); assert.equal(await settled(host.finished), false);
+  });
+  await withHost(async (host, child, { foreign, launches }) => {
+    await host.read("sessions", { scope: "all" }); await host.command("session_switch", { sessionId: foreign.getSessionId() });
+    launches[1]!.child.crash(7); assert.deepEqual(await host.finished, { exit: 7, planned: false });
+  });
+});
+test("stopping the host during a slow planned shutdown releases every lock and starts nothing", async () => withHost(async (host, child, { foreign, launches }) => {
+  const original = host.sessionFile; await host.read("sessions", { scope: "all" });
+  let release!: () => void; child.beforeExit = () => new Promise<void>(resolve => { release = resolve; });
+  const switching = host.command("session_switch", { sessionId: foreign.getSessionId() });
+  while (!child.stops) await new Promise(resolve => setTimeout(resolve, 1));
+  const stopping = host.stop(); release(); await stopping;
+  await assert.rejects(switching); assert.equal(launches.length, 1);
+  assert.equal(await SessionFileLock.inspect(original), undefined); assert.equal(await SessionFileLock.inspect(foreign.getSessionFile()!), undefined);
 }));

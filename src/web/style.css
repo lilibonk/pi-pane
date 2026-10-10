@@ -54,6 +54,14 @@ h1 { font-size: 15px; font-weight: 600; margin: 0 0 5px; }
 .terminal-notice { flex-wrap: wrap; }
 .timeline { flex: 1; min-height: 100px; overflow-y: auto; overscroll-behavior: contain; scrollbar-width: thin; scrollbar-color: var(--border) transparent; }
 .timeline-inner { max-width: 940px; padding: 26px 28px 38px; margin: 0 auto; }
+.recovery { max-width: 560px; margin: 8vh auto; padding: 0 16px; }
+.recovery h2 { font-size: 18px; font-weight: 500; margin: 0 0 12px; }
+.recovery p { color: var(--fg-muted); font-size: 13px; line-height: 1.8; margin: 0 0 10px; }
+.recovery .recovery-detail { color: var(--fg); font-family: var(--mono, ui-monospace, monospace); font-size: 12px; overflow-wrap: anywhere; padding: 10px 12px; border: 1px solid var(--border); border-radius: 6px; }
+.recovery-actions { display: flex; flex-direction: column; gap: 8px; margin: 18px 0 14px; }
+.recovery-actions button { display: flex; flex-direction: column; align-items: flex-start; gap: 2px; text-align: left; padding: 10px 12px; }
+.recovery-actions button span { color: var(--fg-muted); font-size: 12px; max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.recovery .recovery-hint { font-size: 12px; }
 .empty-state { text-align: center; padding: 8vh 16px; max-width: 440px; margin: auto; }
 .empty-pi { color: var(--accent); font: 42px Georgia, serif; }
 .empty-state h2 { font-size: 18px; margin: 16px 0 12px; font-weight: 500; }

@@ -7,7 +7,7 @@ import test from "node:test";
 import WebSocket from "ws";
 import { Hub, type HubOptions, type HostHandler } from "../src/extension/hub.ts";
 import type { Bridge, BridgeObserver } from "../src/extension/bridge.ts";
-import { COMMANDS, type CommandEnvelope, type ServerMessage } from "../src/protocol/index.ts";
+import { COMMANDS, ProtocolError, type CommandEnvelope, type ServerMessage } from "../src/protocol/index.ts";
 
 const delay = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 async function until<T>(predicate: () => T | undefined | false, label: string, timeout = 2_000): Promise<T> {
@@ -301,5 +301,43 @@ test("RPC failures produce retained correlated errors and preserve submission se
     const from = c.frames.length; c.send(envelope(welcome.clientId, f.hub, 2));
     const success = await c.wait("command_result", from); assert.ok(success.t === "command_result"); assert.equal(success.status, "completed");
     assert.deepEqual(scopes[0], { sessionId: "fixture-session", branchRevision: 0, generation: 1 });
+  } finally { await f.close(); }
+});
+test("host state and host commands work without a session and share the lease's numbering and receipts", async () => {
+  const f = await fixture();
+  try {
+    const state = { t: "host_state" as const, revision: 3, phase: "recovery_required" as const, cwd: "/fixture",
+      recovery: { reason: "start_failed", message: "did not start", targetCwd: "/other", previousCwd: "/fixture", canRestore: true } };
+    const hostCalls: string[] = [];
+    f.hub.setHostHandler({ command: async () => ({ disposition: "started" }), read: async () => ({ commands: [] }), answer: () => {}, pendingDialogs: () => [],
+      uiState: () => ({ revision: 0, statuses: {}, widgets: {} }), hostState: () => ({ ...state }),
+      hostCommand: async (name: string) => { hostCalls.push(name); if (name === "recover_retry") throw new ProtocolError("recovery_required", "still failing"); return { phase: "ready" }; },
+    } as unknown as HostHandler);
+    f.hub.suspendBridge("replacing");
+    const c = await client(f.hub);
+    const welcome = await c.wait("welcome"); assert.ok(welcome.t === "welcome");
+    // A page that connects during a failed switch sees why before it is told there is no session.
+    assert.deepEqual(c.frames.map(frame => frame.t).slice(0, 3), ["welcome", "host_state", "switching"]);
+    const host = (no: number, command: string, hostRevision = 3) => ({ t: "host_command", clientId: welcome.clientId, commandNo: no, id: `${welcome.clientId}:${no}`, hostRevision, command, args: {} });
+    // Session commands are refused while no session is bound; they still consume their number.
+    c.send(envelope(welcome.clientId, f.hub, 1)); const refused = await c.wait("ack"); assert.ok(refused.t === "ack"); assert.equal(refused.error?.code, "stale_session"); assert.equal(f.calls(), 0);
+    let from = c.frames.length;
+    c.send(host(2, "recover_restore", 2)); const stale = await c.wait("ack", from); assert.ok(stale.t === "ack"); assert.equal(stale.status, "rejected"); assert.equal(stale.error?.code, "stale_host"); assert.deepEqual(hostCalls, []);
+    from = c.frames.length;
+    c.send(host(3, "recover_retry")); const failed = await c.wait("command_result", from); assert.ok(failed.t === "command_result"); assert.equal(failed.status, "failed"); assert.equal(failed.error?.code, "recovery_required");
+    from = c.frames.length;
+    c.send(host(4, "recover_restore")); const done = await c.wait("command_result", from); assert.ok(done.t === "command_result"); assert.deepEqual(done.value, { phase: "ready" });
+    // A resend is answered from the receipt; the host is not asked again.
+    from = c.frames.length;
+    c.send(host(4, "recover_restore")); assert.deepEqual(await c.wait("command_result", from), done); assert.deepEqual(hostCalls, ["recover_retry", "recover_restore"]);
+    from = c.frames.length;
+    c.send({ ...host(4, "host_stop") }); const conflict = await c.wait("ack", from); assert.ok(conflict.t === "ack"); assert.equal(conflict.error?.code, "command_conflict");
+    for (const bad of [{ ...host(5, "recover_restore"), args: { path: "/x" } }, host(5, "shell"), { ...host(5, "host_stop"), sessionFile: "/x" }]) {
+      from = c.frames.length; c.send(bad); const error = await c.wait("error", from); assert.ok(error.t === "error"); assert.match(error.error.code, /invalid_args|unknown_command|invalid_envelope/);
+    }
+    assert.deepEqual(hostCalls, ["recover_retry", "recover_restore"]);
+    from = c.frames.length; state.revision = 4; state.phase = "ready" as never; f.hub.publishHostState();
+    const published = await c.wait("host_state", from); assert.ok(published.t === "host_state"); assert.equal(published.revision, 4);
+    await c.close();
   } finally { await f.close(); }
 });

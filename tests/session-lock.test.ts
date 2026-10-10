@@ -130,3 +130,40 @@ test("lock replacement or disappearance is detected and release never deletes an
   await assert.rejects(lock.assertUnchanged(), { code: "session_lock_lost" }); await lock.release();
   assert.equal(JSON.parse(await readFile(lock.lockPath, "utf8")).token, "other-owner");
 }));
+const jsonLine = (value: unknown) => `${JSON.stringify(value)}\n`;
+test("shutdown-window appends are accepted only as complete non-message entries on an unchanged file", async () => {
+  const header = jsonLine({ type: "session", id: "s", cwd: "/p" }); const first = jsonLine({ type: "message", id: "m1", message: { role: "user", content: "hi" } });
+  const withLock = async (run: (path: string, lock: SessionFileLock) => Promise<void>) => fixture(async path => {
+    await writeFile(path, header + first); const lock = await SessionFileLock.acquire(path);
+    try { await run(path, lock); } finally { await lock.release(); }
+  });
+  await withLock(async (path, lock) => {
+    assert.equal(await lock.acceptShutdownAppends(), 0);
+    await appendFile(path, jsonLine({ type: "custom", id: "c1", customType: "note" }) + jsonLine({ type: "session_info", id: "c2", name: "n" }));
+    assert.equal(await lock.acceptShutdownAppends(), 2);
+    await lock.assertUnchanged(); // the accepted ending is the new baseline for a restore
+  });
+  for (const [appended, reason] of [
+    [jsonLine({ type: "message", id: "m2", message: { role: "assistant", content: [] } }), /turn was still running/],
+    [jsonLine({ type: "custom", id: "c1" }).slice(0, -1), /incomplete/],
+    ["not json\n", /not a transcript entry/],
+    [jsonLine({ type: "custom" }), /not a transcript entry/],
+    [jsonLine(["array"]), /not a transcript entry/],
+  ] as const) await withLock(async (path, lock) => {
+    await appendFile(path, appended);
+    await assert.rejects(lock.acceptShutdownAppends(), error => (error as { code?: string }).code === "session_conflict" && reason.test((error as Error).message));
+    await assert.rejects(lock.assertUnchanged(), { code: "session_conflict" }); // a refused ending is never adopted
+  });
+  await withLock(async (path, lock) => { await writeFile(path, header + jsonLine({ type: "message", id: "mX", message: { role: "user", content: "hi" } })); await assert.rejects(lock.acceptShutdownAppends(), /rewritten/); });
+  await withLock(async (path, lock) => { await truncate(path, header.length); await assert.rejects(lock.acceptShutdownAppends(), /truncated/); });
+  await withLock(async (path, lock) => { const copy = `${path}.new`; await writeFile(copy, header + first + jsonLine({ type: "custom", id: "c1" })); await rename(copy, path); await assert.rejects(lock.acceptShutdownAppends(), /replaced/); });
+  await withLock(async (path, lock) => { await rm(path); await assert.rejects(lock.acceptShutdownAppends(), /disappeared/); });
+});
+test("a session first written during shutdown is accepted only without conversation messages", async () => fixture(async (_path, root) => {
+  const path = join(root, "new.jsonl"); const lock = await SessionFileLock.acquire(path);
+  try {
+    assert.equal(await lock.acceptShutdownAppends(), 0);
+    await writeFile(path, jsonLine({ type: "session", id: "s", cwd: "/p" }) + jsonLine({ type: "model_change", id: "e1", provider: "p", modelId: "m" }));
+    assert.equal(await lock.acceptShutdownAppends(), 1);
+  } finally { await lock.release(); }
+}));

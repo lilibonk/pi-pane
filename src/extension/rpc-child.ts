@@ -56,8 +56,12 @@ export interface RpcConnection {
   request<T = unknown>(type: string, payload?: Record<string, unknown>, timeoutMs?: number): Promise<T>;
   onRecord(listener: (record: RpcRecord) => void): () => void;
   respondUi(id: string, response: Record<string, unknown>): void;
-  stop(): Promise<void>;
+  stop(options?: StopOptions): Promise<StopOutcome | void>;
 }
+/** How long a stop waits after closing stdin before it signals the child. */
+export interface StopOptions { graceMs?: number; killAfterMs?: number }
+/** `forced` when any signal was needed: the child's shutdown handlers may not have completed. */
+export interface StopOutcome { code: number | null; forced: boolean }
 
 /**
  * pi in RPC mode as a child process: the session's only writer after a handoff.
@@ -71,6 +75,8 @@ export class RpcChild implements RpcConnection {
   private listeners = new Set<(record: RpcRecord) => void>();
   private stderr = "";
   private finished = false;
+  private exitCode: number | null = null;
+  private signalled = false;
   readonly exited: Promise<number | null>;
   private resolveExit!: (code: number | null) => void;
 
@@ -94,6 +100,7 @@ export class RpcChild implements RpcConnection {
     const finish = (code: number | null, error?: Error) => {
       if (this.finished) return;
       this.finished = true;
+      this.exitCode = code;
       for (const { reject } of this.pending.values()) reject(error ?? new Error(`pi RPC child exited (${code}); the web host must stop.`));
       this.pending.clear();
       this.resolveExit(code);
@@ -156,19 +163,26 @@ export class RpcChild implements RpcConnection {
   respondUi(id: string, response: Record<string, unknown>): void {
     this.write({ type: "extension_ui_response", id, ...response });
   }
-  /** Graceful stop: close stdin, then SIGTERM, then SIGKILL. */
-  async stop(): Promise<void> {
+  /**
+   * Graceful stop: close stdin, then SIGTERM after `graceMs`, then SIGKILL `killAfterMs` later.
+   * pi RPC has no shutdown command; closing stdin is the only orderly request. A later call with a
+   * shorter grace (Ctrl+C during a planned stop) shortens the wait.
+   */
+  async stop(options: StopOptions = {}): Promise<StopOutcome> {
     const child = this.process;
-    if (!child || this.finished || child.exitCode !== null) return;
+    if (!child || this.finished || child.exitCode !== null) return { code: this.exitCode, forced: this.signalled };
     child.stdin?.end();
     const signal = (value: NodeJS.Signals) => {
+      this.signalled = true;
       try { if (process.platform !== "win32" && child.pid) process.kill(-child.pid, value); else child.kill(value); }
       catch { /* already exited */ }
     };
-    const terminate = setTimeout(() => signal("SIGTERM"), 2000);
-    const kill = setTimeout(() => signal("SIGKILL"), 5000);
-    await this.exited;
+    const grace = options.graceMs ?? 2000;
+    const terminate = setTimeout(() => signal("SIGTERM"), grace);
+    const kill = setTimeout(() => signal("SIGKILL"), grace + (options.killAfterMs ?? 3000));
+    const code = await this.exited;
     clearTimeout(terminate);
     clearTimeout(kill);
+    return { code, forced: this.signalled };
   }
 }

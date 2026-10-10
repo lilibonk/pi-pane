@@ -1,15 +1,17 @@
 import { SessionManager, type ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { open } from "node:fs/promises";
-import { dirname } from "node:path";
-import { ProtocolError, isRecord, isCommandInvocationName, workbenchArgs, type WorkbenchAction, type WorkbenchValues, type WorkbenchCommand, type SessionCatalogItem } from "../protocol/index.js";
+import { existsSync } from "node:fs";
+import { open, realpath, stat } from "node:fs/promises";
+import { dirname, resolve } from "node:path";
+import { ProtocolError, isRecord, isCommandInvocationName, workbenchArgs, type HostCommandName, type HostState, type WorkbenchAction, type WorkbenchValues, type WorkbenchCommand, type SessionCatalogItem } from "../protocol/index.js";
 import { Bridge } from "./bridge.js";
 import type { Hub, HostHandler } from "./hub.js";
-import { childArgs } from "./child-args.js";
+import { LaunchProfile, type LaunchTarget } from "./launch-profile.js";
 import { RpcChild, RpcReadTimeoutError, type RpcConnection, type RpcRecord } from "./rpc-child.js";
 import { RpcSessionMirror } from "./rpc-session.js";
 import { SessionFileLock, type KnownEntry } from "./session-lock.js";
 import { WorkspaceService } from "./workspace.js";
 export { childArgs } from "./child-args.js";
+export { LaunchProfile } from "./launch-profile.js";
 export { SessionFileLock } from "./session-lock.js";
 
 export interface HandoffTarget {
@@ -17,7 +19,27 @@ export interface HandoffTarget {
   theme: ExtensionContext["ui"]["theme"]; themes: ReturnType<ExtensionContext["ui"]["getAllThemes"]>;
   /** Transferred in-process only after the foreground TUI has shut down. */
   lock?: SessionFileLock;
+  /** Built while the TUI's start directory is still the process cwd; derived from `argv` and `cwd` when absent. */
+  profile?: LaunchProfile;
+  /** The model the TUI was using. A saved session restores its own; a difference is reported, never hidden. */
+  model?: ModelRef;
 }
+interface ModelRef { provider: string; id: string }
+/** Where an RPC child runs: a project directory and, unless a new session is wanted, a saved transcript. */
+export interface RuntimeTarget { cwd: string; sessionFile?: string; withholdTrust?: boolean }
+/**
+ * - `replacing`: the old child is stopping or its replacement is starting; no session is bound.
+ * - `recovery_required`: a replacement failed. The Hub stays up, conversation writes are refused,
+ *   and only an explicit retry, restore or stop leaves this state.
+ */
+export type HostPhase = "starting" | "ready" | "replacing" | "recovery_required" | "stopped";
+export type RecoveryReason = "stop_incomplete" | "shutdown_conflict" | "start_failed";
+export interface HostStatus {
+  revision: number; phase: HostPhase; cwd: string; sessionFile?: string;
+  recovery?: { reason: RecoveryReason; message: string; target: RuntimeTarget; previous: RuntimeTarget; canRestore: boolean };
+}
+/** Why the host is over. `planned` is the user's own stop from the recovery page. */
+export interface HostEnd { exit: number | null; planned: boolean }
 export interface HostUiState {
   revision: number; statuses: Record<string, string>; widgets: Record<string, { content: string[]; placement?: string }>;
   title?: string; editorText?: string; editorRevision?: number;
@@ -28,6 +50,15 @@ interface HandoffDependencies {
   createChild?: (args: string[], cwd: string) => RpcConnection;
   listAll?: typeof SessionManager.listAll;
   list?: typeof SessionManager.list;
+  /** How long a planned stop waits for the old child's shutdown handlers before signalling it. */
+  plannedStopMs?: number;
+}
+/** A planned replacement waits for slow shutdown handlers; an emergency stop (Ctrl+C) does not. */
+const PLANNED_STOP_MS = 20_000;
+const DIALOG_METHODS = ["select", "confirm", "input", "editor"];
+async function samePath(a: string, b: string): Promise<boolean> {
+  const canonical = (path: string) => realpath(path).catch(() => resolve(path));
+  return await canonical(a) === await canonical(b);
 }
 const BUILTINS: WorkbenchCommand[] = [
   ["new", "新建会话", "new"], ["resume", "查找并恢复会话", "sessions"], ["fork", "从用户消息之前分叉", "tree"],
@@ -76,46 +107,142 @@ export class HandoffHost implements HostHandler {
   private sessionChangePending = false;
   private stopping = false;
   private stopPromise?: Promise<void>;
+  /** Lock of the active runtime, or of the last one while a replacement is pending or failed. */
   private lock?: SessionFileLock;
+  /** Every lock this host holds, so a stop at any point of a replacement releases all of them. */
+  private locks = new Set<SessionFileLock>();
   private verifying: Promise<void> = Promise.resolve();
   private unsubscribe?: () => void;
   private activeCwd: string;
+  /** The directory the active child was started in. Its sessions must all belong to it. */
+  private runtimeCwd: string;
+  private withholdTrust = false;
   private lastSessionFile: string;
+  private readonly profile: LaunchProfile;
+  private phase: HostPhase = "starting";
+  private hostRevision = 0;
+  /** The child that passed readiness. Only its unplanned exit ends the service. */
+  private readyChild?: RpcConnection;
+  private retiring?: RpcConnection;
+  private shutdownDialog = false;
+  private recovery?: NonNullable<HostStatus["recovery"]>;
+  /** The model of the runtime that was stopped, to compare when its session is restored. */
+  private previousModel?: ModelRef;
+  private end!: (value: HostEnd) => void;
+  /** Settles once: the ready child exited on its own, the host failed closed, or the user stopped a failed replacement. */
+  readonly finished = new Promise<HostEnd>(resolve => { this.end = resolve; });
   constructor(private readonly hub: Hub, private readonly target: HandoffTarget, private readonly log: (line: string) => void,
     private readonly dependencies: HandoffDependencies = {}) {
-    this.activeCwd = target.cwd; this.lastSessionFile = target.sessionFile;
+    this.activeCwd = this.runtimeCwd = target.cwd; this.lastSessionFile = target.sessionFile;
+    this.profile = target.profile ?? new LaunchProfile(target.argv, target.cwd);
     this.rememberDirectory(target.sessionDir ?? dirname(target.sessionFile));
   }
   get sessionFile(): string { return this.lastSessionFile; }
   get cwd(): string { return this.activeCwd; }
-  get childExited(): Promise<number | null> | undefined { return this.child?.exited; }
   get childPid(): number | undefined { return this.child?.pid; }
   get diagnostics(): string { return this.child?.diagnostics ?? ""; }
+  status(): HostStatus {
+    return structuredClone({ revision: this.hostRevision, phase: this.phase, cwd: this.activeCwd, sessionFile: this.lastSessionFile, ...(this.recovery ? { recovery: this.recovery } : {}) });
+  }
+  /** The wire view: no session paths, which a viewer never needs to choose a recovery. */
+  hostState(): HostState {
+    const recovery = this.recovery;
+    return { t: "host_state", revision: this.hostRevision, phase: this.phase === "recovery_required" ? "recovery_required" : this.phase === "ready" ? "ready" : "replacing", cwd: this.activeCwd,
+      ...(recovery ? { recovery: { reason: recovery.reason, message: clip(recovery.message, 2000), targetCwd: recovery.target.cwd, previousCwd: recovery.previous.cwd, canRestore: recovery.canRestore } } : {}) };
+  }
+  hostCommand(name: HostCommandName): Promise<unknown> {
+    return this.recover(name === "recover_retry" ? "retry" : name === "recover_restore" ? "restore" : "stop").then(() => ({ phase: this.hostState().phase }));
+  }
+  private setPhase(phase: HostPhase): void { this.phase = phase; this.hostRevision++; this.hub.publishHostState(); }
+  private async hold(path: string): Promise<SessionFileLock> { const lock = await SessionFileLock.acquire(path); this.locks.add(lock); return lock; }
+  private async drop(lock: SessionFileLock | undefined): Promise<void> { if (lock) { this.locks.delete(lock); await lock.release(); } }
   async start(): Promise<void> {
     if (this.stopping) throw new Error("The handoff host is stopping.");
-    const args = childArgs(this.target.argv, this.target.sessionFile);
-    this.lock = this.target.lock ?? await SessionFileLock.acquire(this.target.sessionFile);
+    const file = this.target.sessionFile;
+    const lock = this.target.lock ?? await SessionFileLock.acquire(file);
+    this.locks.add(lock); this.lock = lock;
     try {
-      if (this.stopping) { await this.lock.release(); throw new Error("The handoff host stopped before child startup."); }
-      await this.lock.assertUnchanged();
-      if (this.stopping) throw new Error("The handoff host stopped before child startup.");
-      this.child = this.dependencies.createChild?.(args, this.target.cwd) ?? new RpcChild(args, this.target.cwd);
-      this.unsubscribe = this.child.onRecord(record => {
-        if (record.type === "extension_ui_request") this.dialog(record);
-        // pi RPC does not emit a separate dialog-cancel event for AbortSignal. Once the
-        // agent has settled, orphaned model/tool dialogs cannot still be awaiting a result.
-        if (record.type === "agent_settled") for (const id of this.dialogs.keys()) if (!this.dialogOwners.has(id)) this.resolveDialog(id, "cancelled", true);
-      });
-      this.child.start();
-      if (this.child.pid) await this.lock.setWriterPid(this.child.pid);
-      if (this.stopping) throw new Error("The handoff host stopped before activating its child.");
-      this.child.activate?.();
-      this.hub.setHostHandler(this);
-      let timer: ReturnType<typeof setTimeout> | undefined;
-      try { await Promise.race([this.rebind("handoff"), new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new Error("RPC handoff startup timed out.")), 10_000); timer.unref?.(); })]); }
-      finally { if (timer) clearTimeout(timer); }
+      // A TUI session that has not been written yet keeps its path and the start model, as before.
+      await this.launch({ cwd: this.target.cwd, session: { file, saved: existsSync(file) } }, "handoff", lock);
+      await this.reportModelChange(this.target.model, "before the handoff", "交接前");
+      this.setPhase("ready");
     }
     catch (error) { await this.stop(); throw error; }
+  }
+  /**
+   * Starts a child at `target` and makes it the active runtime once its state, snapshot and lock
+   * are valid. Until then it is only a candidate: a failure stops it and leaves `this.lock` as it was.
+   * Without `lock` the child creates a new session; its path is locked as soon as it is known,
+   * before any message can be written.
+   */
+  private async launch(target: LaunchTarget, reason: string, lock: SessionFileLock | undefined): Promise<void> {
+    const stopped = (): void => { if (this.stopping) throw new Error("The handoff host stopped before child startup."); };
+    const args = this.profile.args(target);
+    stopped(); await lock?.assertUnchanged(); stopped();
+    const child = this.dependencies.createChild?.(args, target.cwd) ?? new RpcChild(args, target.cwd);
+    const unsubscribe = child.onRecord(record => this.record(child, record));
+    const previous = { lock: this.lock, cwd: this.runtimeCwd, active: this.activeCwd, withhold: this.withholdTrust };
+    let created: SessionFileLock | undefined;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      child.start();
+      this.child = child; this.unsubscribe = unsubscribe;
+      void child.exited.then(code => this.childExit(child, code));
+      // The writer PID is durable before the gate opens; nothing may have touched the file meanwhile.
+      if (lock && child.pid) { await lock.setWriterPid(child.pid); await lock.assertUnchanged(); }
+      stopped();
+      child.activate?.();
+      this.hub.setHostHandler(this);
+      await Promise.race([(async () => {
+        if (lock) { if (reason !== "handoff") {
+          const state = await child.request<{ sessionFile?: string }>("get_state", {}, 10_000);
+          if (!state.sessionFile || !(await lock.matchesPath(state.sessionFile))) throw new Error("The RPC child did not open the requested session.");
+        } } else {
+          const state = await child.request<{ sessionFile?: string }>("get_state", {}, 10_000);
+          if (!state.sessionFile) throw new Error("The new RPC session has no session path.");
+          created = await this.hold(state.sessionFile);
+          if (child.pid) await created.setWriterPid(child.pid);
+        }
+        this.lock = lock ?? created; this.runtimeCwd = this.activeCwd = target.cwd; this.withholdTrust = !!target.withholdTrust;
+        await this.rebind(reason);
+      })(), new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new Error("RPC handoff startup timed out.")), 10_000); timer.unref?.(); })]);
+      stopped();
+      this.readyChild = child;
+      if (!child.running) this.childExit(child, null);
+    } catch (error) {
+      unsubscribe(); this.mirror?.dispose(); this.bridge?.dispose(); this.mirror = undefined; this.bridge = undefined; this.workspace = undefined;
+      if (this.child === child) { this.child = undefined; this.unsubscribe = undefined; }
+      this.lock = previous.lock; this.runtimeCwd = previous.cwd; this.withholdTrust = previous.withhold;
+      if (reason !== "handoff") this.activeCwd = previous.active;
+      await child.stop(); await this.drop(created);
+      throw error;
+    } finally { if (timer) clearTimeout(timer); }
+  }
+  private async currentModel(): Promise<ModelRef | undefined> {
+    const state = await this.child?.request<{ model?: ModelRef }>("get_state").catch(() => undefined);
+    return state?.model ? { provider: state.model.provider, id: state.model.id } : undefined;
+  }
+  /** A restarted runtime takes the model its transcript records. Say so when that differs from what was in use. */
+  private async reportModelChange(expected: ModelRef | undefined, when: string, label: string): Promise<void> {
+    const actual = expected && await this.currentModel();
+    if (!expected || !actual || (actual.provider === expected.provider && actual.id === expected.id)) return;
+    this.log(`Model is now ${actual.provider}/${actual.id}; ${when} it was ${expected.provider}/${expected.id}. The session's recorded model takes precedence.`);
+    this.hub.notifyAll({ t: "notice", message: `当前模型是 ${actual.provider}/${actual.id}，${label}是 ${expected.provider}/${expected.id}。已按会话记录恢复，需要时请重新选择。` });
+  }
+  private record(child: RpcConnection, record: RpcRecord): void {
+    if (child === this.retiring) {
+      // stdin is closed: the child can never receive an answer, and pi then exits 0 without finishing its handlers.
+      if (record.type === "extension_ui_request" && DIALOG_METHODS.includes(String(record.method))) this.shutdownDialog = true;
+      return;
+    }
+    if (child !== this.child) return;
+    if (record.type === "extension_ui_request") this.dialog(record);
+    // pi RPC does not emit a separate dialog-cancel event for AbortSignal. Once the
+    // agent has settled, orphaned model/tool dialogs cannot still be awaiting a result.
+    if (record.type === "agent_settled") for (const id of this.dialogs.keys()) if (!this.dialogOwners.has(id)) this.resolveDialog(id, "cancelled", true);
+  }
+  private childExit(child: RpcConnection, code: number | null): void {
+    if (child === this.readyChild && child !== this.retiring) this.end({ exit: code, planned: false });
   }
   private rememberDirectory(path: string): void { this.directories = [...this.directories.filter(value => value !== path), path].slice(-32); }
   /**
@@ -155,7 +282,12 @@ export class HandoffHost implements HostHandler {
     const generation = ++this.generation;
     const state = await this.child!.request<{ sessionFile?: string }>("get_state", {}, 10_000);
     this.lastSessionFile = state.sessionFile ?? this.lastSessionFile;
-    this.activeCwd = await sessionCwd(state.sessionFile, this.activeCwd);
+    // RPC get_state has no cwd. A saved session states its own; an unsaved one is where its child was started.
+    const cwd = await sessionCwd(state.sessionFile, this.runtimeCwd);
+    if (reason === "handoff") this.runtimeCwd = cwd; // the TUI's session defines the start project
+    this.activeCwd = cwd;
+    if (!(await samePath(cwd, this.runtimeCwd))) throw new ProtocolError("project_mismatch",
+      `The RPC child moved to a session of another project (${cwd}) while running in ${this.runtimeCwd}. Its tools, trust and project resources still belong to the old project.`);
     if (state.sessionFile) this.rememberDirectory(dirname(state.sessionFile));
     const mirror = new RpcSessionMirror(this.child!, this.activeCwd, this.target.theme, () => this.target.themes, () => {}, () => this.verifyOwnedChanges());
     try { await mirror.load(); } catch (error) { mirror.dispose(); throw error; }
@@ -164,11 +296,14 @@ export class HandoffHost implements HostHandler {
     mirror.attach(bridge); this.mirror = mirror; this.bridge = bridge; this.workspace = new WorkspaceService(this.activeCwd);
     // The launched runtime legitimately persists initial model/system/session updates.
     // Establish its acknowledged startup baseline before exposing the first snapshot.
-    if (reason === "handoff") await this.lock!.acceptChanges();
+    // The same holds for every newly started child. Between the gate check and this point only it could write.
+    if (this.child !== this.readyChild) await this.lock!.acceptChanges();
     this.hub.bindBridge(bridge, reason);
     if (reason !== "handoff") this.log(`Current workspace: ${this.activeCwd}\nSession: ${this.lastSessionFile}`);
   }
   private assertLive(expected?: Expected): void {
+    if (this.phase === "recovery_required") throw new ProtocolError("recovery_required", "The last project switch failed. Retry it, restore the previous session, or stop the service.");
+    if (this.phase === "replacing") throw new ProtocolError("busy", "The session runtime is being replaced; wait for the new session.");
     if (this.stopping || !this.child?.running || !this.mirror || !this.bridge) throw new ProtocolError("host_stopped", "The RPC child has stopped. Resume the last session from the terminal.");
     if (expected && (expected.generation !== this.generation || expected.sessionId !== this.mirror.sessionId || expected.branchRevision !== this.bridge.branchRevision))
       throw new ProtocolError("stale_session", "The session changed while this command was waiting; refresh before submitting again.");
@@ -275,7 +410,14 @@ export class HandoffHost implements HostHandler {
         const path = typeof args.sessionId === "string" ? this.paths.get(args.sessionId) : undefined;
         if (!path) throw new ProtocolError("unknown_session", "Refresh the catalog and choose an exposed session ID.");
         if (args.sessionId === this.mirror!.sessionId) return { cancelled: false, unchanged: true, sessionId: this.mirror!.sessionId };
-        nextLock = await SessionFileLock.acquire(path);
+        // A session of another project needs a child started there: a native switch would keep this
+        // child's process cwd, trust decision and project resources.
+        const cwd = await sessionCwd(path, this.runtimeCwd);
+        if (!(await samePath(cwd, this.runtimeCwd))) {
+          await this.replaceRuntime({ cwd, sessionFile: path }, "resume");
+          return { cancelled: false, sessionId: this.mirror!.sessionId, branchRevision: this.bridge!.branchRevision };
+        }
+        nextLock = await this.hold(path);
         if (child.pid) await nextLock.setWriterPid(child.pid);
       }
       if (name === "session_fork") {
@@ -292,10 +434,10 @@ export class HandoffHost implements HostHandler {
           await this.mirror!.synchronize(); await this.lock!.acceptChanges(); return { cancelled: true, sessionId: this.mirror!.sessionId }; }
         const state = await child.request<{ sessionFile?: string }>("get_state");
         if (!state.sessionFile) throw new Error("The new RPC session has no persisted session path.");
-        nextLock ??= await SessionFileLock.acquire(state.sessionFile);
+        nextLock ??= await this.hold(state.sessionFile);
         if (child.pid) await nextLock.setWriterPid(child.pid);
         const previousLock = this.lock; this.lock = nextLock; nextLock = undefined;
-        await this.lock.acceptChanges(); await previousLock?.release(); await this.rebind(name === "session_new" ? "new" : "resume");
+        await this.lock.acceptChanges(); await this.drop(previousLock); await this.rebind(name === "session_new" ? "new" : "resume");
         return { cancelled: false, sessionId: this.mirror!.sessionId, branchRevision: this.bridge!.branchRevision, ...(typeof result.text === "string" ? { draftText: clip(result.text, 64 * 1024) } : {}) };
       } catch (error) {
         const state = await child.request<{ sessionFile?: string; sessionId?: string }>("get_state").catch(() => undefined);
@@ -309,7 +451,7 @@ export class HandoffHost implements HostHandler {
           this.ui = { ...previousUi, revision: this.ui.revision + 1 }; this.publishUi();
         }
         throw error;
-      } finally { this.sessionChangePending = false; await nextLock?.release(); }
+      } finally { this.sessionChangePending = false; await this.drop(nextLock); }
     }
     if (name === "prompt" || name === "run_command") {
       const message = name === "prompt" ? String(args.text ?? "") : `/${String(args.name)}${typeof args.args === "string" && args.args ? ` ${args.args}` : ""}`;
@@ -340,17 +482,20 @@ export class HandoffHost implements HostHandler {
       && await this.lock?.matchesPath(state.sessionFile).catch(() => false);
     if (state.sessionFile && !sameSession) {
       this.lastSessionFile = state.sessionFile;
-      this.activeCwd = await sessionCwd(state.sessionFile, this.activeCwd);
       let nextLock: SessionFileLock | undefined;
       try {
-        nextLock = await SessionFileLock.acquire(state.sessionFile);
+        nextLock = await this.hold(state.sessionFile);
         if (this.child!.pid) await nextLock.setWriterPid(this.child!.pid!);
         const previousLock = this.lock; this.lock = nextLock; nextLock = undefined;
-        await this.lock.acceptChanges(); await previousLock?.release();
+        await this.lock.acceptChanges(); await this.drop(previousLock);
         this.clearDialogs("session_changed", true);
+        // rebind refuses a session of another project: the child switched itself, so fail closed.
         await this.rebind("resume");
-      } catch (error) { await this.stop(); throw error; }
-      finally { await nextLock?.release(); }
+      } catch (error) {
+        if ((error as { code?: string }).code === "project_mismatch") this.log(`${(error as Error).message}\nStopping the service; continue that session from its own directory.`);
+        await this.stop(); throw error;
+      }
+      finally { await this.drop(nextLock); }
     } else { if (state.sessionFile) this.lastSessionFile = state.sessionFile; await this.mirror!.synchronize(); }
     await this.verifyOwnedChanges();
   }
@@ -421,10 +566,112 @@ export class HandoffHost implements HostHandler {
     else return;
     this.ui.revision++; this.publishUi();
   }
+  /**
+   * Planned replacement of the RPC child (docs/m3.1-plan.md §8). Runs inside the write queue.
+   * Nothing is disturbed until the target is validated and lockable; after the old child has been
+   * asked to stop, every failure ends in `recovery_required` or, where no safe state exists, a stop.
+   */
+  private async replaceRuntime(next: RuntimeTarget, reason: string): Promise<void> {
+    const directory = await stat(next.cwd).catch(() => undefined);
+    if (!directory?.isDirectory()) throw new ProtocolError("project_unavailable", `The project directory ${next.cwd} is missing or not a directory.`);
+    const oldLock = this.lock!;
+    const previous: RuntimeTarget = { cwd: this.runtimeCwd, ...(existsSync(this.lastSessionFile) ? { sessionFile: this.lastSessionFile } : {}), ...(this.withholdTrust ? { withholdTrust: true } : {}) };
+    if (next.sessionFile && !existsSync(next.sessionFile)) throw new ProtocolError("unknown_session", "That session has no saved transcript; open the project and start a new session instead.");
+    const sameFile = !!next.sessionFile && await oldLock.matchesPath(next.sessionFile);
+    let targetLock = sameFile ? oldLock : next.sessionFile ? await this.hold(next.sessionFile) : undefined;
+    try {
+      // The last moment the old child can vouch for its own writes and for being idle.
+      await this.mirror!.synchronize();
+      if (!this.mirror!.idle) throw new ProtocolError("busy", "Wait until replies and queued messages have settled.");
+      await this.verifyOwnedChanges();
+      this.previousModel = await this.currentModel();
+    } catch (error) { if (!sameFile) await this.drop(targetLock); throw error; }
+    this.setPhase("replacing"); this.sessionChangePending = true;
+    try {
+      this.hub.suspendBridge("replacing");
+      this.ui = { revision: this.ui.revision + 1, statuses: {}, widgets: {} }; this.publishUi();
+      const stop = await this.retire();
+      let conflict: Error | undefined;
+      try { const accepted = await oldLock.acceptShutdownAppends(); if (accepted) this.log(`Accepted ${accepted} transcript entries written while the previous session runtime shut down (ownership cannot be verified).`); }
+      catch (error) { conflict = error as Error; }
+      if (this.stopping) throw new Error("The handoff host stopped during a runtime replacement.");
+      if (stop || conflict) {
+        const message = conflict?.message ?? stop!;
+        if (!sameFile) await this.drop(targetLock);
+        targetLock = undefined;
+        // The same transcript would be reopened on top of an unverified ending: there is no safe state.
+        if (sameFile) { this.log(`${message}\nStopping the service.`); void this.stop(); this.end({ exit: null, planned: false }); throw new ProtocolError("host_stopped", message); }
+        this.fail(conflict ? "shutdown_conflict" : "stop_incomplete", message, next, previous, !conflict);
+      }
+      try { await this.launch({ cwd: next.cwd, ...(next.sessionFile ? { session: { file: next.sessionFile, saved: true } } : {}), ...(next.withholdTrust ? { withholdTrust: true } : {}) }, reason, targetLock); }
+      catch (error) {
+        if (this.stopping) throw error;
+        if (!sameFile) await this.drop(targetLock);
+        this.fail("start_failed", `The session runtime did not start in ${next.cwd}: ${error instanceof Error ? error.message : String(error)}`, next, previous, true);
+      }
+      if (this.lock !== oldLock) await this.drop(oldLock);
+      if (sameFile) await this.reportModelChange(this.previousModel, "before the restart", "重启前");
+      this.setPhase("ready");
+    } finally { this.sessionChangePending = false; }
+  }
+  /**
+   * Asks the active child to stop and waits for its exit. Returns why the stop cannot be trusted, if so.
+   * pi RPC has no shutdown command: only closing stdin, after which the child cannot be answered.
+   */
+  private async retire(): Promise<string | undefined> {
+    const child = this.child!;
+    this.clearDialogs("session_changed", true); this.mirror?.dispose(); this.bridge?.dispose();
+    this.mirror = undefined; this.bridge = undefined; this.workspace = undefined;
+    this.retiring = child; this.shutdownDialog = false;
+    const outcome = await child.stop({ graceMs: this.dependencies.plannedStopMs ?? PLANNED_STOP_MS }) ?? { code: 0, forced: false };
+    this.unsubscribe?.(); this.unsubscribe = undefined; this.child = undefined; this.readyChild = undefined; this.retiring = undefined;
+    if (this.shutdownDialog) return "An extension opened a dialog while the session runtime was shutting down. It cannot be answered there, so its shutdown work was cut short. Switch projects from the terminal while that extension is installed.";
+    if (outcome.forced) return "The previous session runtime did not finish shutting down in time and had to be terminated.";
+    if (outcome.code !== 0) return `The previous session runtime exited with code ${String(outcome.code)} while shutting down.`;
+    return undefined;
+  }
+  private fail(reason: RecoveryReason, message: string, target: RuntimeTarget, previous: RuntimeTarget, canRestore: boolean): never {
+    this.recovery = { reason, message, target, previous, canRestore };
+    this.setPhase("recovery_required");
+    this.log(`${message}\nThe browser offers: retry, restore the previous session, or stop. Nothing restarts on its own.`);
+    throw new ProtocolError("recovery_required", message);
+  }
+  /**
+   * The user's one explicit way out of `recovery_required`; each call is a single bounded attempt.
+   * Restoring reuses the retained lock and its baseline: the old transcript must be exactly as verified.
+   */
+  recover(action: "retry" | "restore" | "stop"): Promise<HostStatus> {
+    const result = this.writes.then(async () => {
+      const recovery = this.recovery;
+      if (this.stopping || this.phase !== "recovery_required" || !recovery) throw new ProtocolError("no_recovery", "There is no failed switch to recover from.");
+      if (action === "stop") { this.end({ exit: 0, planned: true }); return this.status(); }
+      if (action === "restore" && !recovery.canRestore) throw new ProtocolError("restore_unavailable", "The previous session cannot be restored safely here; stop the service and inspect it in a terminal.");
+      const chosen = action === "retry" ? recovery.target : recovery.previous;
+      const oldLock = this.lock;
+      const keep = !!chosen.sessionFile && !!oldLock && await oldLock.matchesPath(chosen.sessionFile);
+      const lock = keep ? oldLock : chosen.sessionFile ? await this.hold(chosen.sessionFile) : undefined;
+      this.setPhase("replacing");
+      try { await this.launch({ cwd: chosen.cwd, ...(chosen.sessionFile ? { session: { file: chosen.sessionFile, saved: true } } : {}), ...(chosen.withholdTrust ? { withholdTrust: true } : {}) }, action === "retry" ? "resume" : "restore", lock); }
+      catch (error) {
+        if (!keep) await this.drop(lock);
+        if (this.stopping) throw error;
+        recovery.message = `${action === "retry" ? "Retry" : "Restore"} failed: ${error instanceof Error ? error.message : String(error)}`;
+        this.setPhase("recovery_required"); throw new ProtocolError("recovery_required", recovery.message);
+      }
+      if (oldLock && this.lock !== oldLock) await this.drop(oldLock);
+      if (action === "restore" && chosen.sessionFile) await this.reportModelChange(this.previousModel, "before the switch", "切换前");
+      this.recovery = undefined; this.setPhase("ready");
+      return this.status();
+    });
+    this.writes = result.catch(() => undefined); return result;
+  }
   stop(): Promise<void> {
     if (this.stopPromise) return this.stopPromise;
     this.stopping = true; this.clearDialogs("stopped", true); this.mirror?.dispose(); this.bridge?.dispose(); this.unsubscribe?.();
-    this.stopPromise = (async () => { try { await this.child?.stop(); } finally { await this.lock?.release(); this.hub.setHostHandler(undefined); } })();
+    this.stopPromise = (async () => {
+      try { await this.child?.stop(); }
+      finally { for (const lock of [...this.locks]) await this.drop(lock); this.hub.setHostHandler(undefined); this.phase = "stopped"; this.hostRevision++; }
+    })();
     return this.stopPromise;
   }
 }

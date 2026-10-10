@@ -8,7 +8,7 @@ import { ProtocolError } from "../protocol/index.js";
 import { Hub, type ExternalAccess } from "./hub.js";
 import { readPaneSettings } from "./config.js";
 import { qrLines, qrWidth } from "./qr.js";
-import { HandoffHost, childArgs, type HandoffTarget } from "./handoff.js";
+import { HandoffHost, LaunchProfile, type HandoffTarget } from "./handoff.js";
 import { runningPiRpcEntry } from "./rpc-child.js";
 import { SessionFileLock } from "./session-lock.js";
 
@@ -139,7 +139,9 @@ export default function piPane(pi: ExtensionAPI): void {
         };
         if (!runningPiRpcEntry()) throw new ProtocolError("unsupported_host", "The running pi installation must provide the pi 1.1.0 RPC entry.");
         const argv = process.argv.slice(2);
-        childArgs(argv, sessionFile); // Fail ambiguous CLI reconstruction while the TUI still exists.
+        // Fail ambiguous CLI reconstruction while the TUI still exists, and pin relative launch
+        // paths to the directory pi was started in before any other project is opened.
+        const profile = new LaunchProfile(argv, process.cwd());
         const explicit = parseWebArgs(text);
         const config = defaults();
         const args = { ...config, ...explicit, noOpen: explicit.noOpen || config.noOpen };
@@ -154,7 +156,8 @@ export default function piPane(pi: ExtensionAPI): void {
           assertReady();
         } catch (error) { await lock.release(); throw error; }
         state.lock = lock;
-        state.handoff = { sessionFile, sessionDir: ctx.sessionManager.getSessionDir(), cwd: ctx.cwd, argv,
+        state.handoff = { sessionFile, sessionDir: ctx.sessionManager.getSessionDir(), cwd: ctx.cwd, argv, profile,
+          ...(ctx.model ? { model: { provider: ctx.model.provider, id: ctx.model.id } } : {}),
           theme: ctx.ui.theme, themes: ctx.ui.getAllThemes(), lock, args, external, webRoot };
         installExitTakeover(() => runHandoff(state));
         notify(ctx, "pi-pane: handing this session to the browser…");
@@ -227,8 +230,10 @@ async function runHandoff(state: ProcessState): Promise<number> {
       const executable = process.platform === "darwin" ? "open" : "xdg-open";
       try { spawn(executable, [hub.url], { detached: true, stdio: "ignore", shell: false }).on("error", () => write("pi-pane: browser did not open; use the link above.\n")).unref(); } catch { /* URL available */ }
     }
-    exitCode = await Promise.race([stopped, host.childExited!.then((code) => {
-      write(`\npi-pane: the RPC session host exited (${code}); stopping service. No automatic restart.\n`);
+    // Supervise the host, not one child: a planned replacement swaps children without ending the service.
+    exitCode = await Promise.race([stopped, host.finished.then(({ exit, planned }) => {
+      if (planned) return 0;
+      write(`\npi-pane: the RPC session host exited (${exit}); stopping service. No automatic restart.\n`);
       return 1;
     })]);
   } catch (error) { write(`\npi-pane: handoff failed: ${error instanceof Error ? error.message : String(error)}\n`); }
