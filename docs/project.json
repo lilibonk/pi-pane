@@ -1,7 +1,7 @@
 {
   "name": "pi pane",
   "stage": "M3",
-  "stageStatus": "published-public-installation-and-daily-npm-update-complete",
+  "stageStatus": "completed",
   "m0CompletedDate": "2026-10-08",
   "m1LocalAcceptanceCompletedDate": "2026-10-08",
   "m2LocalAcceptanceCompletedDate": "2026-10-08",
@@ -22,7 +22,6 @@
   "liveTaskStatusSource": "docs/m3-status.md",
   "nextSteps": [
     "Restart already-open pi processes to load npm:@lilibonk/pi-pane@0.2.0; collect daily stability feedback",
-    "Keep 38152e1 CUA 19-check evidence historical unless explicitly rerun",
     "Track upstream RPC tool/tree gaps and design custom TUI and Plan/Goal/Agent semantics"
   ],
   "pi110CompatibilityStatus": "key-regressions-passed",
@@ -38,7 +37,7 @@
   "npmPublishAttemptStatus": "published",
   "releaseCandidateStatus": "published-exact-validated-archive-public-installation-passed",
   "publicationEvidenceDirectory": "build-artifacts/releases/0.2.0",
-  "m3Status": "released-public-installation-and-daily-package-update-complete",
+  "m3Status": "completed",
   "npmPackageName": "@lilibonk/pi-pane",
   "npmPackageVersion": "0.2.0",
   "npmPackageUrl": "https://www.npmjs.com/package/@lilibonk/pi-pane",
@@ -50,7 +49,7 @@
   "publishedRealModelTrialCompletedDate": "2026-10-10",
   "galleryLastCheckedDate": "2026-10-09",
   "m3ImplementationStatus": "foreground-handoff-with-review-and-release-fixes",
-  "uiParityStatus": "handoff-workbench-historical-cua-pass-with-documented-upstream-gaps",
+  "uiParityStatus": "agreed-M3-handoff-workbench-scope-complete-with-documented-upstream-gaps",
   "uiAuditEvidenceDirectory": "build-artifacts/kimi-alignment/current",
   "m3Reference": {
     "package": "@moonshot-ai/kimi-code",
@@ -69,8 +68,8 @@
   "m3StartedDate": "2026-10-09",
   "m3ImplementationBranch": "main",
   "m3EvidenceDirectory": "build-artifacts/releases/0.2.0",
-  "m3SourcePublicationStatus": "npm-0.2.0-published-git-not-pushed",
-  "m3AStatus": "workbench-desktop-mobile-cua-passed-on-38152e1-not-rerun-after-review",
+  "m3SourcePublicationStatus": "published-with-main-closeout",
+  "m3AStatus": "published-0.2.0-desktop-mobile-cua-19-of-19-passed",
   "m3BStatus": "candidate-rpc-workbench-verified-16-checks",
   "m3CStatus": "candidate-standard-rpc-ui-verified-resource-config-incomplete",
   "m3DStatus": "candidate-foreground-handoff-long-mode-verified-15-checks",
@@ -221,29 +220,26 @@
     "browser": {
       "passed": 19,
       "total": 19,
-      "status": "passed-on-38152e1-not-rerun-after-review-fixes",
+      "status": "passed-published-0.2.0",
       "method": "CUA",
       "widths": [
         1280,
         390
       ],
       "consoleErrors": 0,
-      "report": "build-artifacts/m3/handoff/browser-report.json",
+      "sourceCommit": "439c545b4293143473cb2a0d42f5dbc073147fa5",
+      "candidateSha256": "5bba224d3b106139ee56614e5ec83079ba97f324a56bfc11c29a0656177f2eb0",
+      "completedDate": "2026-10-10",
+      "realModelCalls": 0,
+      "dailyCredentialsRead": false,
+      "productChangesRequired": false,
+      "report": "build-artifacts/releases/0.2.0/cua/browser-report.json",
+      "publicSummary": "docs/m3-final-acceptance.md",
+      "cleanupReport": "build-artifacts/releases/0.2.0/cua/cleanup.json",
       "screenshots": [
-        "build-artifacts/m3/handoff/browser-desktop.png",
-        "build-artifacts/m3/handoff/browser-mobile.png",
-        "build-artifacts/m3/handoff/browser-mobile-dialog.png"
-      ],
-      "firstFailure": {
-        "name": "fork-before-first-user then clone",
-        "status": "fixed-with-regression-and-CUA-rerun",
-        "evidence": [
-          "build-artifacts/m3/handoff/browser-clone-first.png",
-          "build-artifacts/m3/handoff/browser-clone-first.txt",
-          "build-artifacts/m3/handoff/cua-empty-fork-clone-failure/"
-        ]
-      },
-      "sourceCommit": "38152e1b0a585c549f3ef71d11715c29589b61ad"
+        "docs/images/m3-0.2.0-desktop.jpg",
+        "docs/images/m3-0.2.0-mobile.jpg"
+      ]
     },
     "deterministicRealModelCalls": 0,
     "realProviderTrial": {
@@ -449,7 +445,7 @@
     "installedLocalPath": "/Users/zile.zhou/.pi/agent/local/pi-pane/0.2.0-5bba224d3b10",
     "publicationStatus": "published-and-downloaded-integrity-verified",
     "publicRegistryInstallationStatus": "passed-5-of-5",
-    "gitPushStatus": "not-performed",
+    "gitPushStatus": "included-in-main-closeout",
     "readinessReport": "build-artifacts/releases/0.2.0/release-readiness.json",
     "integrityVerification": {
       "status": "passed",
@@ -467,5 +463,34 @@
     "dailyInstalledPath": "/Users/zile.zhou/.pi/agent/npm/node_modules/@lilibonk/pi-pane",
     "dailyInstallationReport": "build-artifacts/releases/0.2.0/daily-public-install.json"
   },
-  "formalInstallationCompletedDate": "2026-10-10"
+  "formalInstallationCompletedDate": "2026-10-10",
+  "m3CompletedDate": "2026-10-10",
+  "m3CloseoutStatus": "final-published-package-cua-19-of-19-passed",
+  "historicalM3HandoffBrowser": {
+    "passed": 19,
+    "total": 19,
+    "status": "passed-on-38152e1-not-rerun-after-review-fixes",
+    "method": "CUA",
+    "widths": [
+      1280,
+      390
+    ],
+    "consoleErrors": 0,
+    "report": "build-artifacts/m3/handoff/browser-report.json",
+    "screenshots": [
+      "build-artifacts/m3/handoff/browser-desktop.png",
+      "build-artifacts/m3/handoff/browser-mobile.png",
+      "build-artifacts/m3/handoff/browser-mobile-dialog.png"
+    ],
+    "firstFailure": {
+      "name": "fork-before-first-user then clone",
+      "status": "fixed-with-regression-and-CUA-rerun",
+      "evidence": [
+        "build-artifacts/m3/handoff/browser-clone-first.png",
+        "build-artifacts/m3/handoff/browser-clone-first.txt",
+        "build-artifacts/m3/handoff/cua-empty-fork-clone-failure/"
+      ]
+    },
+    "sourceCommit": "38152e1b0a585c549f3ef71d11715c29589b61ad"
+  }
 }

@@ -2,7 +2,9 @@
 
 在 pi 终端里输入 `/web`，把当前会话交给浏览器：TUI 正常退出，同一进程继续在前台提供网页服务，`pi --mode rpc` 子进程负责会话写入。浏览器提供会话导航、流式对话、工具输出、图片、文件与 Git 差异面板。终端按 **Ctrl+C** 停止服务，再按恢复提示回到终端会话；关闭终端也会结束服务。
 
-**本文对应 0.2.0 交接工作台。** 与终端、网页并行的 0.1.0 镜像版相比，这是不兼容变化。开发与验证基线为 pi 1.1.0、Node ≥ 22.19、macOS/Linux；Windows 暂不支持交接。发布由维护者执行，实际发布与验收状态见 [M3 状态](https://github.com/lilibonk/pi-pane/blob/main/docs/m3-status.md)，设计见 [设计方案](docs/design.md)。
+**M3 已完成；本文对应已发布的 0.2.0 交接工作台。** 与终端、网页并行的 0.1.0 镜像版相比，这是不兼容变化。开发与验证基线为 pi 1.1.0、Node ≥ 22.19、macOS/Linux；Windows 暂不支持交接。发布由维护者执行，实际发布与验收状态见 [M3 状态](https://github.com/lilibonk/pi-pane/blob/main/docs/m3-status.md)，设计见 [设计方案](docs/design.md)。
+
+最终公开包的桌面与移动端交互验收 **19/19** 通过，结果和截图见 [M3 最终验收](docs/m3-final-acceptance.md)。
 
 ## 从 0.1.0 迁移
 
@@ -15,7 +17,7 @@
 
 ## 安装与源码试用
 
-0.2.0 发布到 npm 后，安装或升级到指定版本：
+安装或升级到已发布的 0.2.0：
 
 ```sh
 pi install npm:@lilibonk/pi-pane@0.2.0

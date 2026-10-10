@@ -1,6 +1,6 @@
 # pi `/web`：交接工作台设计
 
-状态：M3 交接修订 v0.8，2026-10-10。`@lilibonk/pi-pane@0.2.0` 已发布到 npm（MIT），开发分支为 `main`。当前能力与测试基线为 pi / pi-ai 1.1.0，Node ≥22.19，macOS/Linux。正式安装与验收结果见 [M3 状态](m3-status.md)。
+状态：M3 已完成，交接修订 v0.8，2026-10-10。`@lilibonk/pi-pane@0.2.0` 已发布到 npm（MIT），开发分支为 `main`。当前能力与测试基线为 pi / pi-ai 1.1.0，Node ≥22.19，macOS/Linux。正式安装与验收结果见 [M3 状态](m3-status.md)。
 
 维护者的 [调整说明](m3-codex-adjustment.md) 取代 v0.6 的镜像、命令网关及后台 attach 方向。`spike/m3-handoff` 仅证明交接可行，依据与 8 项原型证据见 [交接 spike](m3-handoff-spike.md)；不能直接作为可发布实现。原工作台在 commit `6196c7b` 保存，旧证据与已发布 0.1.0 的 M0–M2 验收均为历史记录，不作为本修订的通过结论。
 
@@ -183,4 +183,6 @@ M3-D 验收门槛：正常 TUI shutdown 在子进程打开文件前完成；交�
 
 旧镜像的 TUI/网页同时输入、扩展运行时 rebind、/web stop/status/qr/rotate、--web 自启动、终端主题热变和 tree 导航按新定义退役；它们的底层安全、状态一致性、失败清理与重复执行防护在上述宿主矩阵补足。具体命令、结果和未覆盖范围见 [tests/README.md](../tests/README.md) 与 [M3 状态](m3-status.md)。旧慢流重连超时保留原证据，在交接模式重新跟踪，不能将后续通过自动当作旧问题根因已定位。
 
-打包仍是 pi package（keywords pi-package，coding-agent peer ≥1.1.0 <2，pi-ai peer *），dist 扩展与 web-dist/主题预构建后随包发布。版本 `0.2.0` 为未发布的次版本升级，README 必须写明 --web 去掉及 TUI 不再并行；npm 发布只由维护者执行。干净安装验收与真实 provider 验收各自记录；不因本地 pack、原型或部分回归通过声称已发布或整体 Kimi 对齐完成。
+打包仍是 pi package（keywords pi-package，coding-agent peer ≥1.1.0 <2，pi-ai peer *），dist 扩展与 web-dist/主题预构建后随包发布。版本 `0.2.0` 已作为不兼容次版本升级发布，README 已写明 --web 去掉及 TUI 不再并行；后续 npm 发布仍由维护者执行。干净安装验收与真实 provider 验收各自记录；不因本地 pack、原型或部分回归通过声称已发布或整体 Kimi 对齐完成。
+
+M3 收尾已完成：最终公开包在真实 pi 1.1.0 上补跑桌面/移动端 CUA **19/19**，双页面控制台错误为 0。逐项结果与截图见 [最终交互验收](m3-final-acceptance.md)；上游 RPC 缺口和长期稳定性观察继续按已确认边界跟进。
