@@ -1,7 +1,7 @@
 # M3.1 认证能力调研（只读，未实现）
 
 返回：[主计划](../m3.1-plan.md) · [调研索引](../m3.1-research.md)。本文保留事实、候选方案与限制；实施范围以主计划的明确取舍为准。
-调研日期：2026-10-10。基线：本仓库安装的 `@earendil-works/pi-coding-agent@1.1.0` 和配套 `pi-ai@1.1.0` 发布包；上游 `v1.1.0` 对应不可变提交 `abe508e1b89912adde45528136c3221eb69acdd7`。本文以固定提交链接为依据，不以滚动 main 声称当前能力。未读取日常 auth.json、未登录、未调用模型、未修改产品代码。2026-10-10 已按主计划第 14 节的审阅修订同步；其中“进程内应用”一项是对发布 JS 的静态阅读，未运行。
+调研日期：2026-10-10。基线：本仓库安装的 `@earendil-works/pi-coding-agent@1.1.0` 和配套 `pi-ai@1.1.0` 发布包；上游 `v1.1.0` 对应不可变提交 `abe508e1b89912adde45528136c3221eb69acdd7`。本文以固定提交链接为依据，不以滚动 main 声称当前能力。未读取日常 auth.json、未登录、未调用模型、未修改产品代码。2026-10-10 已按主计划第 14 节的审阅修订同步；其中“进程内应用”一项当时是对发布 JS 的静态阅读；其后 G3 原型已运行并选定进程内应用，同时证实以 `!` 开头的密钥会被执行、必须先转义为字面值，G5 证实自定义供应商的密钥可存入官方凭据文件，见[门槛验证记录](../m3.1-gates.md)。下文与该记录不一致之处以该记录和主计划为准。
 
 证据提取：从发布包 sourcemap 的 `sourcesContent` 提取源码；其中 model-runtime、auth-storage、auth/types、kimi-coding OAuth、openai-codex OAuth、openai-chatgpt OAuth 六文件与固定上游提交原文 SHA-256 比较完全一致，见 `source-verification.json`。余下文件直接取自相同发布包 sourcemap。下文“事实”来自静态源码核对；所有 pi-pane 新设计均是建议，需要未来 spike 和测试，不能当作已经验证可用。
 
@@ -35,7 +35,7 @@
 | 分组 | 固定版本能力依据 | M3.1 建议承诺 |
 |---|---|---|
 | 普通 API key：OpenAI、Anthropic、Google Gemini、Qwen Token Plan Individual | provider 声明 apiKey，通常使用 envApiKeyAuth；Anthropic 有专门 resolve | P1 第一批：网页录入、替换、删除存储凭据及状态；至少一个经授权的真实 API key provider 完成模型试用。不要因输入被保存就显示“验证成功”。[OpenAI](https://github.com/earendil-works/pi/blob/abe508e1b89912adde45528136c3221eb69acdd7/packages/ai/src/providers/openai.ts)、[Anthropic](https://github.com/earendil-works/pi/blob/abe508e1b89912adde45528136c3221eb69acdd7/packages/ai/src/providers/anthropic.ts)、[Google](https://github.com/earendil-works/pi/blob/abe508e1b89912adde45528136c3221eb69acdd7/packages/ai/src/providers/google.ts)、[Qwen](https://github.com/earendil-works/pi/blob/abe508e1b89912adde45528136c3221eb69acdd7/packages/ai/src/providers/qwen-token-plan-individual.ts) |
-| Kimi Code OAuth | device_code + polling；refresh 可取消；返回 OAuth credential | P1 第一批 OAuth 代表：同机与远程手机都走 device flow；需要真实授权试用才打已验证标记。[实现](https://github.com/earendil-works/pi/blob/abe508e1b89912adde45528136c3221eb69acdd7/packages/ai/src/auth/oauth/kimi-coding.ts#L266-L295) |
+| 设备码 OAuth（以 pi 内置 provider `kimi-coding` 的实现为核对样本；它是 pi 自带的模型 provider，与 Kimi Code 网页参照无关） | device_code + polling；refresh 可取消；返回 OAuth credential | P1 第一批 OAuth 类型：同机与远程手机都走 device flow，适配按类型通用；真实试用选维护者授权的任一内置设备码 provider，试过哪家才给哪家打已验证标记。[实现](https://github.com/earendil-works/pi/blob/abe508e1b89912adde45528136c3221eb69acdd7/packages/ai/src/auth/oauth/kimi-coding.ts#L266-L295) |
 | OpenAI Codex OAuth | 用户选择 browser callback 或 device code；device flow可能服务端未启用；callback 为 localhost:1455并支持手动回填 | P1 条件纳入：先完成合成 callback/manual/device 三类 adapter 测试，再对可用账户实际试用；不能保证服务端启用所有路径。[选择](https://github.com/earendil-works/pi/blob/abe508e1b89912adde45528136c3221eb69acdd7/packages/ai/src/auth/oauth/openai-codex.ts#L413-L430)、[callback](https://github.com/earendil-works/pi/blob/abe508e1b89912adde45528136c3221eb69acdd7/packages/ai/src/auth/oauth/openai-codex.ts#L359-L399) |
 | Anthropic OAuth | browser callback/manual 或 copy-code headless 两种选择 | 条件纳入，远程使用 copy-code/manual；保留 provider 报错，不承诺所有账户可用。[选择](https://github.com/earendil-works/pi/blob/abe508e1b89912adde45528136c3221eb69acdd7/packages/ai/src/auth/oauth/anthropic.ts#L280-L299) |
 | OpenAI provider 的 ChatGPT OAuth | 与 openai-codex 是不同实现；需要稳定安装 device ID；固定回调端口被占会直接失败；有手动回填 | 单独能力条目，不能混为 Codex OAuth 或已覆盖；完成端口占用／取消／重复尝试验证后再开放。[实现](https://github.com/earendil-works/pi/blob/abe508e1b89912adde45528136c3221eb69acdd7/packages/ai/src/auth/oauth/openai-chatgpt.ts#L233-L296) |
@@ -121,7 +121,7 @@
 | M31-AUTH-16 | 对所有错误路径注入哨兵key/token/code/state | 只允许官方auth文件与发起owner的必要定向认证交互承载秘密；普通WS结果/快照/广播、其他页面、日志、浏览器持久storage、会话和测试证据均无哨兵；尤其CredentialSynchronizationError.credential/cause不被透传 |
 | M31-AUTH-17 | 突然关闭终端／Ctrl+C发生在OAuth pending | host/child/认证轮询/callback listener停止；无后台认证服务，会话锁按既有策略释放 |
 | M31-AUTH-18 | 外部HTTPS认证已到期、错误Origin、无token的账号API请求 | 未授权请求均拒绝；有效M2登录正常；测试中不依赖只有前端禁用按钮 |
-| M31-AUTH-19 | 支持矩阵中选定的真实API key和Kimi OAuth路径 | 经过明确授权后分别完成登录→新模型出现→短提示成功→注销/清理；失败不得把该provider标“已验证” |
+| M31-AUTH-19 | 支持矩阵中选定的真实 API key 和一个内置设备码 OAuth 路径 | 经过明确授权后分别完成登录→新模型出现→短提示成功→注销/清理；失败不得把该provider标“已验证” |
 
 ## 8. 尚须在主计划明确的产品决定
 

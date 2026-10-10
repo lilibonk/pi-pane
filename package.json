@@ -43,7 +43,8 @@
     "m2:install": "node scripts/m2-install.mjs",
     "m2:real-model": "node scripts/m2-real-model.mjs",
     "m3:workbench": "node scripts/m3-workbench.mjs",
-    "m3:handoff": "node scripts/m3-handoff.mjs"
+    "m3:handoff": "node scripts/m3-handoff.mjs",
+    "m31:gates": "node --import tsx scripts/m31-g1.mjs && node --import tsx scripts/m31-g2.mjs && node --import tsx scripts/m31-g3.mjs && node --import tsx scripts/m31-g4g5.mjs"
   },
   "peerDependencies": {
     "@earendil-works/pi-ai": "*",

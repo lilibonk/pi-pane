@@ -1,7 +1,7 @@
 # M3.1 调研：主题与 pi 原生设置
 
 返回：[主计划](../m3.1-plan.md) · [调研索引](../m3.1-research.md)。本文保留事实、候选方案与限制；实施范围以主计划的明确取舍为准。
-日期：2026-10-10。仅调研与计划建议；未修改产品代码、未读取日常 settings.json/auth.json、未执行模型调用。2026-10-10 已按主计划第 14 节的审阅修订同步。当前 pi-pane 固定为 `c2c39e6f7a84c7e8490bbca587528cb195524e22`（0.2.0 收尾）。pi 固定为本机已发布 `@earendil-works/pi-coding-agent@1.1.0`，官方 `v1.1.0` tag 经 `git ls-remote` 解析到 `abe508e1b89912adde45528136c3221eb69acdd7`。
+日期：2026-10-10。仅调研与计划建议；未修改产品代码、未读取日常 settings.json/auth.json、未执行模型调用。2026-10-10 已按主计划第 14 节的审阅修订同步；G4 原型其后已运行，磁盘落盘语义、RPC 开关同时写全局默认、`images.blockImages` 对 RPC 生效等结果见[门槛验证记录](../m3.1-gates.md)。当前 pi-pane 固定为 `c2c39e6f7a84c7e8490bbca587528cb195524e22`（0.2.0 收尾）。pi 固定为本机已发布 `@earendil-works/pi-coding-agent@1.1.0`，官方 `v1.1.0` tag 经 `git ls-remote` 解析到 `abe508e1b89912adde45528136c3221eb69acdd7`。
 
 ## 1. 结论与证据分级
 
