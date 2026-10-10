@@ -5,6 +5,7 @@ import { Diff } from "./messages.js";
 import { highlight, languageForPath } from "./highlight.js";
 import { issueCommand, queryWorkbench, setDraft, webStore, type WebState } from "./store.js";
 import { LIMITS } from "../protocol/index.js";
+import { ProjectSection } from "./projects.js";
 
 export interface QueryState<T> { value?: T; loading: boolean; error: string; reload: () => void }
 /** Cancelling the component read also removes its transport timeout and reply handler. */
@@ -152,7 +153,8 @@ export function Workbench({ state, canConfigure, commands, controller, onFocusCo
   const online = state.connection === "online" && !!state.snapshot?.caps.workbench;
   const settledSessionSearch = useDebounced(sessionSearch);
   const settledFileSearch = useDebounced(fileSearch);
-  const sessions = useWorkbenchQuery(state, "sessions", { scope: "all", query: settledSessionSearch });
+  // The sidebar lists the current project's sessions; a search looks through every project.
+  const sessions = useWorkbenchQuery(state, "sessions", { scope: settledSessionSearch ? "all" : "workspace", query: settledSessionSearch });
   const tree = useWorkbenchQuery(state, "tree", {}, leftMode === "tree");
   const status = useWorkbenchQuery(state, "git_status", {}, rightOpen && tab === "changes");
   const files = useWorkbenchQuery(state, "files", { query: settledFileSearch }, rightOpen && tab === "files");
@@ -276,10 +278,18 @@ export function Workbench({ state, canConfigure, commands, controller, onFocusCo
   }
   function choosePath(path: string, mode: "file" | "diff") { setSelectedPath(path); setPreviewMode(mode); }
   const currentCwd = state.snapshot?.session.cwd || "";
+  // After a project was chosen on a phone, the conversation is what the user came for.
+  const shownProject = useRef(currentCwd);
+  useEffect(() => {
+    if (!currentCwd || currentCwd === shownProject.current) return;
+    const first = !shownProject.current; shownProject.current = currentCwd;
+    if (!first && matchMedia("(max-width: 760px)").matches) { setLeftOpen(false); focusComposer(); }
+  }, [currentCwd]);
   return <div class={`workbench ${leftOpen ? "left-open" : ""} ${rightOpen ? "right-open" : ""}`} ref={workbenchRef}>
     {modal && <button type="button" tabindex={-1} class={`drawer-backdrop ${modal === "left" ? "for-left" : "for-right"}`} aria-label="关闭侧栏" onClick={() => { setLeftOpen(false); setRightOpen(false); focusComposer(); }} />}
     <aside class="workspace-sidebar" aria-label="工作区与会话" ref={leftRef} role={modal === "left" ? "dialog" : undefined} aria-modal={modal === "left" ? true : undefined} inert={modal === "right" || (narrow && !leftOpen)} aria-hidden={modal === "right" || (narrow && !leftOpen) ? true : undefined}>
-      <div class="sidebar-heading"><span>工作区</span><button type="button" class="icon-button mobile-close" aria-label="关闭会话侧栏" onClick={() => { setLeftOpen(false); requestAnimationFrame(() => toggleLeft.current?.focus()); }}><Icon name="close" /></button><button type="button" class="icon-button" aria-label="刷新会话列表" disabled={!online || sessionsRead.loading} onClick={sessions.reload}><Icon name="refresh" /></button></div>
+      <ProjectSection state={state} canSwitch={canNavigate} onSwitched={() => { setLeftOpen(false); focusComposer(); }} />
+      <div class="sidebar-heading"><span>会话</span><button type="button" class="icon-button mobile-close" aria-label="关闭会话侧栏" onClick={() => { setLeftOpen(false); requestAnimationFrame(() => toggleLeft.current?.focus()); }}><Icon name="close" /></button><button type="button" class="icon-button" aria-label="刷新会话列表" disabled={!online || sessionsRead.loading} onClick={sessions.reload}><Icon name="refresh" /></button></div>
       <button type="button" class="new-session-button" disabled={!canNavigate} onClick={() => issueCommand("session_new")}><Icon name="plus" />新建会话</button>
       <div class="session-management"><button type="button" disabled={!canNavigate} onClick={() => { setSessionName(state.snapshot?.session.name || ""); setRenaming(value => !value); }}>重命名</button><button type="button" disabled={!canNavigate} onClick={() => issueCommand("session_clone")}>克隆会话</button></div>
       {renaming && <form class="rename-session" onSubmit={event => { event.preventDefault(); if (canNavigate && sessionName.trim()) { issueCommand("session_rename", { name: sessionName.trim() }); setRenaming(false); } }}><input aria-label="会话名称" maxLength={256} value={sessionName} onInput={event => setSessionName(event.currentTarget.value)} placeholder="会话名称" /><button type="submit" disabled={!canNavigate || !sessionName.trim()}>保存</button><button type="button" class="quiet" onClick={() => setRenaming(false)}>取消</button></form>}
@@ -287,7 +297,7 @@ export function Workbench({ state, canConfigure, commands, controller, onFocusCo
       <div class="sidebar-tabs" role="group" aria-label="会话导航"><button type="button" aria-pressed={leftMode === "sessions"} onClick={() => setLeftMode("sessions")}>会话</button><button type="button" aria-pressed={leftMode === "tree"} onClick={() => setLeftMode("tree")}><Icon name="branch" />分支树</button></div>
       <div class="sidebar-scroll">
         {leftMode === "sessions" ? <ReadState read={sessionsRead}>
-          {!catalog.length && <p class="panel-message">{sessionSearch ? "没有匹配的会话。" : "暂无历史会话。"}</p>}
+          {!catalog.length && <p class="panel-message">{sessionSearch ? "没有匹配的会话。" : "这个项目尚无会话。发送第一条消息后会出现在这里。"}</p>}
           {catalog.map(([cwd, items]) => <section class="workspace-group" key={cwd}><h2 title={cwd}><span class="folder-mark">▱</span>{workspaceName(cwd)}<span>{items.length}</span></h2>{items.map(item => <button type="button" class={`session-item ${item.current ? "is-current" : ""}`} aria-current={item.current ? "page" : undefined} key={item.id} title={item.name || item.firstMessage || "未命名会话"} disabled={!item.current && !canNavigate} onClick={() => { if (!item.current) issueCommand("session_switch", { sessionId: item.id }); setLeftOpen(false); focusComposer(); }}><span class="session-item-title">{item.name || item.firstMessage || "未命名会话"}</span><span class="session-item-meta">{item.current ? "当前会话" : `${item.messageCount} 条消息`}<time>{timeLabel(item.modified)}</time></span></button>)}</section>)}
           {sessions.value?.truncated && <p class="panel-message">仅显示最近的部分会话。</p>}
         </ReadState> : <ReadState read={tree}>

@@ -1,8 +1,8 @@
-import { SessionManager, type ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { SessionManager, getAgentDir, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { existsSync } from "node:fs";
 import { open, realpath, stat } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
-import { ProtocolError, isRecord, isCommandInvocationName, workbenchArgs, type HostCommandName, type HostState, type WorkbenchAction, type WorkbenchValues, type WorkbenchCommand, type SessionCatalogItem } from "../protocol/index.js";
+import { ProtocolError, isRecord, isCommandInvocationName, workbenchArgs, type HostCommandName, type HostQueryAction, type HostQueryValues, type HostState, type ProjectItem, type ProjectInspectView, type ProjectsView, type ProjectTrustView, type WorkbenchAction, type WorkbenchValues, type WorkbenchCommand, type SessionCatalogItem } from "../protocol/index.js";
 import { Bridge } from "./bridge.js";
 import type { Hub, HostHandler } from "./hub.js";
 import { LaunchProfile, type LaunchTarget } from "./launch-profile.js";
@@ -10,6 +10,8 @@ import { RpcChild, RpcReadTimeoutError, type RpcConnection, type RpcRecord } fro
 import { RpcSessionMirror } from "./rpc-session.js";
 import { SessionFileLock, type KnownEntry } from "./session-lock.js";
 import { WorkspaceService } from "./workspace.js";
+import { ProjectRegistry, ProjectRegistryError, type ProjectView } from "./project-registry.js";
+import { ProjectService } from "./projects.js";
 export { childArgs } from "./child-args.js";
 export { LaunchProfile } from "./launch-profile.js";
 export { SessionFileLock } from "./session-lock.js";
@@ -52,14 +54,14 @@ interface HandoffDependencies {
   list?: typeof SessionManager.list;
   /** How long a planned stop waits for the old child's shutdown handlers before signalling it. */
   plannedStopMs?: number;
+  /** pi's agent directory: the project list, the trust store and global settings live under it. */
+  agentDir?: string;
 }
 /** A planned replacement waits for slow shutdown handlers; an emergency stop (Ctrl+C) does not. */
 const PLANNED_STOP_MS = 20_000;
 const DIALOG_METHODS = ["select", "confirm", "input", "editor"];
-async function samePath(a: string, b: string): Promise<boolean> {
-  const canonical = (path: string) => realpath(path).catch(() => resolve(path));
-  return await canonical(a) === await canonical(b);
-}
+const canonical = (path: string): Promise<string> => realpath(path).catch(() => resolve(path));
+async function samePath(a: string, b: string): Promise<boolean> { return await canonical(a) === await canonical(b); }
 const BUILTINS: WorkbenchCommand[] = [
   ["new", "新建会话", "new"], ["resume", "查找并恢复会话", "sessions"], ["fork", "从用户消息之前分叉", "tree"],
   ["model", "选择模型", "model"], ["thinking", "调整思考强度", "thinking"], ["compact", "压缩会话", "compact"],
@@ -131,10 +133,15 @@ export class HandoffHost implements HostHandler {
   private end!: (value: HostEnd) => void;
   /** Settles once: the ready child exited on its own, the host failed closed, or the user stopped a failed replacement. */
   readonly finished = new Promise<HostEnd>(resolve => { this.end = resolve; });
+  private readonly registry: ProjectRegistry;
+  private readonly projects: ProjectService;
   constructor(private readonly hub: Hub, private readonly target: HandoffTarget, private readonly log: (line: string) => void,
     private readonly dependencies: HandoffDependencies = {}) {
     this.activeCwd = this.runtimeCwd = target.cwd; this.lastSessionFile = target.sessionFile;
     this.profile = target.profile ?? new LaunchProfile(target.argv, target.cwd);
+    const agentDir = dependencies.agentDir ?? getAgentDir();
+    this.registry = new ProjectRegistry(agentDir);
+    this.projects = new ProjectService({ agentDir, protectedDirectories: () => [agentDir, ...this.directories] });
     this.rememberDirectory(target.sessionDir ?? dirname(target.sessionFile));
   }
   get sessionFile(): string { return this.lastSessionFile; }
@@ -150,9 +157,156 @@ export class HandoffHost implements HostHandler {
     return { t: "host_state", revision: this.hostRevision, phase: this.phase === "recovery_required" ? "recovery_required" : this.phase === "ready" ? "ready" : "replacing", cwd: this.activeCwd,
       ...(recovery ? { recovery: { reason: recovery.reason, message: clip(recovery.message, 2000), targetCwd: recovery.target.cwd, previousCwd: recovery.previous.cwd, canRestore: recovery.canRestore } } : {}) };
   }
-  hostCommand(name: HostCommandName): Promise<unknown> {
-    return this.recover(name === "recover_retry" ? "retry" : name === "recover_restore" ? "restore" : "stop").then(() => ({ phase: this.hostState().phase }));
+  hostCommand(name: HostCommandName, args: Record<string, unknown> = {}, revision = this.hostRevision): Promise<unknown> {
+    if (name === "recover_retry" || name === "recover_restore" || name === "host_stop")
+      return this.recover(name === "recover_retry" ? "retry" : name === "recover_restore" ? "restore" : "stop").then(() => ({ phase: this.hostState().phase }));
+    return this.projectCommand(name, args, revision);
   }
+  async hostQuery<A extends HostQueryAction>(action: A, args: Record<string, unknown> = {}): Promise<HostQueryValues[A]> {
+    if (this.stopping) throw new ProtocolError("host_stopped", "The service is stopping.");
+    let value: HostQueryValues[HostQueryAction];
+    if (action === "directories") value = await this.projects.directories(typeof args.path === "string" ? args.path : this.runtimeCwd);
+    else if (action === "project_inspect") value = await this.inspectProject(await this.projects.root(String(args.path)));
+    else value = await this.projectsView();
+    return value as HostQueryValues[A];
+  }
+  /** Saved sessions of the default session directory and of every directory this host has used. */
+  private async catalog(signal: AbortSignal) {
+    const listAll = this.dependencies.listAll ?? SessionManager.listAll;
+    const catalogs = await Promise.all([listAll(undefined, signal), ...this.directories.map(directory => listAll(directory, undefined, signal))]);
+    const unique = new Map<string, (typeof catalogs)[number][number]>();
+    for (const session of catalogs.flat()) { const old = unique.get(session.id); if (!old || old.modified.getTime() < session.modified.getTime()) unique.set(session.id, session); }
+    return [...unique.values()];
+  }
+  /** Saved sessions per project, keyed by real path where the directory still exists. */
+  private async sessionCounts(): Promise<Map<string, number> | undefined> {
+    const sessions = await this.catalog(AbortSignal.timeout(8000)).catch(() => undefined);
+    if (!sessions) return undefined;
+    const real = new Map<string, string>(), counts = new Map<string, number>();
+    for (const session of sessions) {
+      if (!real.has(session.cwd)) real.set(session.cwd, await canonical(session.cwd));
+      const path = real.get(session.cwd)!; counts.set(path, (counts.get(path) ?? 0) + 1);
+    }
+    return counts;
+  }
+  /**
+   * The user's choice and what was actually loaded are separate facts: RPC reports no trust result, and
+   * a global extension can veto a recorded choice. `loaded` counts project-scoped commands when it can.
+   */
+  private async trustView(root: string, current: boolean): Promise<ProjectTrustView> {
+    const view = this.projects.trust(root);
+    const override = this.profile.startTrust && await samePath(root, this.profile.startCwd) ? this.profile.startTrust : undefined;
+    let loaded: number | undefined;
+    if (current && this.phase === "ready" && this.child?.running) loaded = await this.child.request<{ commands: Array<{ sourceInfo?: { scope?: string } }> }>("get_commands")
+      .then(result => result.commands.filter(command => command.sourceInfo?.scope === "project").length, () => undefined);
+    return { ...view, ask: view.ask && !override, ...(override ? { override } : {}), ...(current && this.withholdTrust ? { withheld: true } : {}), ...(loaded !== undefined ? { loaded } : {}) };
+  }
+  private async inspectProject(root: string): Promise<ProjectInspectView> {
+    const current = await samePath(root, this.runtimeCwd);
+    const [counts, registered] = await Promise.all([this.sessionCounts(), this.registry.list().then(list => list.some(project => project.path === root), () => false)]);
+    return { path: root, name: this.projects.name(root), current, registered, sessions: counts?.get(root) ?? 0, trust: await this.trustView(root, current) };
+  }
+  private async projectsView(): Promise<ProjectsView> {
+    const counts = await this.sessionCounts();
+    const history = [...(counts?.keys() ?? [])];
+    let views: ProjectView[], registryError: string | undefined;
+    try { views = await this.registry.view(history); }
+    catch (error) {
+      // An unreadable list is never replaced. Projects known from saved sessions are still shown.
+      if (!(error instanceof ProjectRegistryError)) throw error;
+      registryError = error.message;
+      views = await Promise.all(history.map(async path => ({ path, name: this.projects.name(path), source: "history" as const, available: await stat(path).then(info => info.isDirectory(), () => false) })));
+    }
+    const current = await canonical(this.runtimeCwd);
+    const items: ProjectItem[] = views.map(view => ({ path: view.path, name: view.name, source: view.source, available: view.available, current: view.path === current,
+      sessions: counts?.get(view.path) ?? 0, ...(view.lastOpenedAt ? { lastOpenedAt: view.lastOpenedAt } : {}) }));
+    // The running project is always listed, even when it was removed from the list or has no saved session.
+    if (!items.some(item => item.current)) items.unshift({ path: current, name: this.projects.name(current), source: "current", available: true, current: true, sessions: counts?.get(current) ?? 0 });
+    const retained = [...items.filter(item => item.current), ...items.filter(item => !item.current)].slice(0, 200);
+    return { projects: retained.map(item => ({ ...item, name: clip(item.name, 256) })), truncated: retained.length < items.length,
+      current: { path: current, name: this.projects.name(current), trust: await this.trustView(current, true) },
+      ...(registryError ? { registryError: clip(registryError, 1000) } : {}), ...(counts ? {} : { historyIncomplete: true }) };
+  }
+  /** The project list is a convenience: a failure to update it is reported in the terminal and never blocks a session. */
+  private async note(change: () => Promise<unknown>): Promise<void> {
+    try { await change(); } catch (error) { this.log(`The project list was not updated: ${error instanceof Error ? error.message : String(error)}`); }
+  }
+  /** Remembers the saved session a project is being left on, so opening the project again returns to it. */
+  private async rememberSession(register: boolean): Promise<void> {
+    const file = this.lastSessionFile, id = this.mirror?.sessionId;
+    if (!id || !existsSync(file)) return;
+    await this.note(async () => {
+      const path = await canonical(this.runtimeCwd);
+      const entry = register ? await this.registry.open(path) : (await this.registry.list()).find(project => project.path === path);
+      if (entry) await this.registry.setLastSession(entry.id, { id, file });
+    });
+  }
+  /**
+   * Opens `root` (a validated real path) as the current project. A different project always gets its
+   * own child. Trust is never widened here: the only flag this host generates is --no-approve.
+   */
+  private async openProject(root: string, options: { trust?: "remember" | "withhold"; sessionFile?: string; asked?: boolean } = {}): Promise<{ path: string; unchanged?: true }> {
+    const current = await samePath(root, this.runtimeCwd);
+    // A session picked from the catalog was not a trust decision: unanswered, the child simply does not load project resources.
+    if (options.asked !== false && !options.trust && (await this.trustView(root, false)).ask)
+      throw new ProtocolError("trust_required", "Choose whether to trust this project before opening it.");
+    if (options.trust === "remember") this.projects.remember(root);
+    const withholdTrust = options.trust === "withhold";
+    if (current) {
+      await this.note(() => this.registry.open(root));
+      if (!options.trust && !this.withholdTrust) return { path: root, unchanged: true };
+      // The same project with a new trust answer: only a restart applies it.
+      await this.replaceRuntime({ cwd: this.runtimeCwd, ...(existsSync(this.lastSessionFile) ? { sessionFile: this.lastSessionFile } : {}), ...(withholdTrust ? { withholdTrust } : {}) }, "resume");
+      return { path: root };
+    }
+    let sessionFile = options.sessionFile;
+    if (!sessionFile) {
+      const last = (await this.registry.list().catch(() => [])).find(project => project.path === root)?.lastSession?.file;
+      if (last && existsSync(last) && await samePath(await sessionCwd(last, ""), root)) sessionFile = last;
+    }
+    // Listed before the switch: an opened project stays in the list even when its runtime then fails to start.
+    if (options.asked !== false) await this.note(() => this.registry.open(root));
+    await this.rememberSession(options.asked !== false);
+    await this.replaceRuntime({ cwd: root, ...(sessionFile ? { sessionFile } : {}), ...(withholdTrust ? { withholdTrust } : {}) }, sessionFile ? "resume" : "new");
+    return { path: root };
+  }
+  private projectCommand(name: HostCommandName, args: Record<string, unknown>, revision: number): Promise<unknown> {
+    const switches = name === "project_open" || name === "project_create";
+    if (switches && this.dialogs.size) return Promise.reject(new ProtocolError("busy", "Answer or cancel the current extension dialog before switching projects."));
+    if (switches && this.mirror && !this.mirror.idle) return Promise.reject(new ProtocolError("busy", "Wait until replies, compaction and queued messages have settled before switching projects."));
+    if (this.queuedWrites >= 32) return Promise.reject(new ProtocolError("busy", "Too many host commands are waiting; let them settle before retrying."));
+    this.queuedWrites++;
+    const result = this.writes.then(async () => {
+      if (this.control) await this.control;
+      // Two viewers acting on the same page state: the first one changes it, the second is told to look again.
+      if (revision !== this.hostRevision) throw new ProtocolError("stale_host", "The host state changed; check the page before trying again.");
+      if (this.stopping) throw new ProtocolError("host_stopped", "The service is stopping.");
+      if (name === "project_remove") {
+        const path = await canonical(String(args.path));
+        if (await samePath(path, this.runtimeCwd)) throw new ProtocolError("project_current", "Switch to another project before removing this one from the list.");
+        await this.registry.remove(path); this.touch(); return { path };
+      }
+      if (name === "project_relocate") {
+        const entry = await this.registry.relocate(String(args.from), await this.projects.root(String(args.to)));
+        this.touch(); return { path: entry.path };
+      }
+      this.assertLive(); await this.mirror!.synchronize();
+      if (!this.mirror!.idle) throw new ProtocolError("busy", "Wait until replies and queued messages have settled.");
+      try {
+        if (name === "project_create") {
+          const root = await this.projects.create(String(args.parent), String(args.name));
+          await this.note(() => this.registry.open(root, "created"));
+          // From here the folder and its list entry stay, whatever happens to the runtime.
+          await this.rememberSession(true); await this.replaceRuntime({ cwd: root }, "new");
+          return { path: root };
+        }
+        return await this.openProject(await this.projects.root(String(args.path)), { ...(args.trust === "remember" || args.trust === "withhold" ? { trust: args.trust } : {}) });
+      } finally { this.touch(); }
+    }).finally(() => { this.queuedWrites--; });
+    this.writes = result.catch(() => undefined); return result;
+  }
+  /** The project list changed without a phase change: viewers re-read it on the next host revision. */
+  private touch(): void { if (!this.stopping) { this.hostRevision++; this.hub.publishHostState(); } }
   private setPhase(phase: HostPhase): void { this.phase = phase; this.hostRevision++; this.hub.publishHostState(); }
   private async hold(path: string): Promise<SessionFileLock> { const lock = await SessionFileLock.acquire(path); this.locks.add(lock); return lock; }
   private async drop(lock: SessionFileLock | undefined): Promise<void> { if (lock) { this.locks.delete(lock); await lock.release(); } }
@@ -315,14 +469,10 @@ export class HandoffHost implements HostHandler {
     const args = workbenchArgs(action, input); let value: WorkbenchValues[WorkbenchAction];
     if (action === "sessions") {
       const signal = AbortSignal.timeout(8000);
-      const listAll = this.dependencies.listAll ?? SessionManager.listAll;
       const list = this.dependencies.list ?? SessionManager.list;
-      const catalogs = args.scope === "all" ? await Promise.all([listAll(undefined, signal), ...this.directories.map(directory => listAll(directory, undefined, signal))])
-        : [await list(this.cwd, dirname(this.sessionFile), undefined, signal)];
-      const unique = new Map<string, (typeof catalogs)[number][number]>();
-      for (const session of catalogs.flat()) { const old = unique.get(session.id); if (!old || old.modified.getTime() < session.modified.getTime()) unique.set(session.id, session); }
+      const found = args.scope === "all" ? await this.catalog(signal) : await list(this.cwd, dirname(this.sessionFile), undefined, signal);
       const query = typeof args.query === "string" ? args.query.trim().toLocaleLowerCase() : "";
-      const filtered = [...unique.values()].filter(session => !query || [session.name, session.cwd, session.firstMessage, session.allMessagesText].some(text => text?.toLocaleLowerCase().includes(query)))
+      const filtered = found.filter(session => !query || [session.name, session.cwd, session.firstMessage, session.allMessagesText].some(text => text?.toLocaleLowerCase().includes(query)))
         .sort((a, b) => b.modified.getTime() - a.modified.getTime());
       const retained = filtered.slice(0, 200); for (const session of retained) this.paths.set(session.id, session.path);
       while (this.paths.size > 1000) this.paths.delete(this.paths.keys().next().value!);
@@ -414,7 +564,7 @@ export class HandoffHost implements HostHandler {
         // child's process cwd, trust decision and project resources.
         const cwd = await sessionCwd(path, this.runtimeCwd);
         if (!(await samePath(cwd, this.runtimeCwd))) {
-          await this.replaceRuntime({ cwd, sessionFile: path }, "resume");
+          await this.openProject(await this.projects.root(cwd), { sessionFile: path, asked: false });
           return { cancelled: false, sessionId: this.mirror!.sessionId, branchRevision: this.bridge!.branchRevision };
         }
         nextLock = await this.hold(path);
@@ -667,9 +817,10 @@ export class HandoffHost implements HostHandler {
   }
   stop(): Promise<void> {
     if (this.stopPromise) return this.stopPromise;
+    const remembered = this.phase === "ready" ? this.rememberSession(false) : Promise.resolve();
     this.stopping = true; this.clearDialogs("stopped", true); this.mirror?.dispose(); this.bridge?.dispose(); this.unsubscribe?.();
     this.stopPromise = (async () => {
-      try { await this.child?.stop(); }
+      try { await remembered; await this.child?.stop(); }
       finally { for (const lock of [...this.locks]) await this.drop(lock); this.hub.setHostHandler(undefined); this.phase = "stopped"; this.hostRevision++; }
     })();
     return this.stopPromise;

@@ -8,7 +8,7 @@ import type { Duplex } from "node:stream";
 import { WebSocket, WebSocketServer, type RawData } from "ws";
 import {
   LIMITS, PROTOCOL, WS_PATH, ProtocolError, isRecord, parseClientMessage, toWireError,
-  commandArgs, type Ack, type ClientMessage, type CommandEnvelope, type CommandResult, type HostCommandEnvelope, type HostCommandName, type HostState, type ProjectionEvent, type ServerMessage,
+  commandArgs, hostCommandArgs, hostQueryArgs, type HostQuery, type HostQueryAction, type HostQueryValues, type Ack, type ClientMessage, type CommandEnvelope, type CommandResult, type HostCommandEnvelope, type HostCommandName, type HostState, type ProjectionEvent, type ServerMessage,
   type ExtensionUiState, type WorkbenchAction, type WorkbenchValues,
 } from "../protocol/index.js";
 import type { Bridge } from "./bridge.js";
@@ -34,7 +34,8 @@ export interface HostHandler {
   uiState(): ExtensionUiState;
   /** Host state and its commands do not depend on a live session. */
   hostState?(): HostState;
-  hostCommand?(name: HostCommandName): Promise<unknown>;
+  hostCommand?(name: HostCommandName, args: Record<string, unknown>, revision: number): Promise<unknown>;
+  hostQuery?(action: HostQueryAction, args: Record<string, unknown>): Promise<HostQueryValues[HostQueryAction]>;
 }
 export interface HubOptions {
   host?: string;
@@ -421,6 +422,7 @@ export class Hub {
     }
     if (message.t === "history_page" || message.t === "content_page" || message.t === "image_page") { this.page(peer, message); return; }
     if (message.t === "workbench_query") { void this.workbench(peer, message); return; }
+    if (message.t === "host_query") { void this.hostQuery(peer, message); return; }
     if (message.clientId !== lease.id) throw new ProtocolError("client_mismatch", "Command does not belong to this connection.");
     if (message.t === "receipt_query") {
       const prefix = `${lease.id}:`;
@@ -452,7 +454,7 @@ export class Hub {
       const handler = this.hostHandler;
       if (!handler?.hostState || !handler.hostCommand) throw new ProtocolError("host_unavailable", "The RPC session host is not ready.");
       if (command.hostRevision !== handler.hostState().revision) throw new ProtocolError("stale_host", "The host state changed; check the page before trying again.");
-      return handler.hostCommand(command.command);
+      return handler.hostCommand(command.command, hostCommandArgs(command.command, command.args), command.hostRevision);
     });
   }
   private command(peer: Peer, lease: Lease, command: CommandEnvelope): void {
@@ -523,6 +525,21 @@ export class Hub {
       this.send(peer, { t: "workbench_result", reqId: message.reqId, epoch: message.epoch, action: message.action, value });
     } catch (error) {
       this.send(peer, { t: "workbench_result", reqId: message.reqId, epoch: message.epoch, action: message.action, error: toWireError(error) });
+    } finally {
+      if (counted) { peer.workbenchReads!--; this.workbenchReads--; }
+    }
+  }
+  /** Directed host-level read. It needs an authenticated lease but no session, and shares the read limits. */
+  private async hostQuery(peer: Peer, message: HostQuery): Promise<void> {
+    let counted = false;
+    try {
+      if ((peer.workbenchReads ?? 0) >= 8 || this.workbenchReads >= 16) throw new ProtocolError("busy", "Too many reads are in progress.");
+      peer.workbenchReads = (peer.workbenchReads ?? 0) + 1; this.workbenchReads++; counted = true;
+      if (!this.hostHandler?.hostQuery) throw new ProtocolError("host_unavailable", "The RPC session host is not ready.");
+      const value = await this.hostHandler.hostQuery(message.action, hostQueryArgs(message.action, message.args));
+      this.send(peer, { t: "host_result", reqId: message.reqId, action: message.action, value });
+    } catch (error) {
+      this.send(peer, { t: "host_result", reqId: message.reqId, action: message.action, error: toWireError(error) });
     } finally {
       if (counted) { peer.workbenchReads!--; this.workbenchReads--; }
     }

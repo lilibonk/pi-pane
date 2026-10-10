@@ -86,6 +86,22 @@ export class ProjectRegistry {
     if (!(await this.read()).projects.some(project => project.lastSession?.file === file)) return;
     await this.change(registry => { for (const project of registry.projects) if (project.lastSession?.file === file) delete project.lastSession; });
   }
+  /**
+   * Points a listed project whose directory moved at the directory the user chose. The old path is
+   * hidden so history does not list it again; the last-session reference belonged to the old path.
+   */
+  async relocate(from: string, directory: string): Promise<ProjectEntry> {
+    const path = await realpath(directory);
+    return this.change(file => {
+      const project = file.projects.find(item => item.path === from);
+      if (!project) throw new ProjectRegistryError("unknown_project", "This project is no longer in the list.");
+      file.projects = file.projects.filter(item => item === project || item.path !== path);
+      if (!file.hidden.includes(from)) file.hidden.push(from);
+      file.hidden = file.hidden.filter(hidden => hidden !== path);
+      project.path = path; project.name = basename(path) || path; project.lastOpenedAt = new Date().toISOString(); delete project.lastSession;
+      return { ...project };
+    });
+  }
   /** Removes a project from the list only. Its directory and sessions stay; history will not re-add it. */
   async remove(path: string): Promise<void> {
     await this.change(file => {

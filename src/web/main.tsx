@@ -9,6 +9,7 @@ import {
 import { Message, ToolCard, type ToolContext } from "./messages.js";
 import { CommandMenu, Workbench, useWorkbenchQuery, type WorkbenchController } from "./workbench.js";
 import { resolveSlash } from "./commands.js";
+import { ProjectDialogs } from "./projects.js";
 import { extensionText } from "./ui-state.js";
 import "./style.css";
 
@@ -414,7 +415,7 @@ function App() {
       </footer>
       </>}
       </Workbench>
-      {state.dialogs[0] && <DialogView key={state.dialogs[0].id} dialog={state.dialogs[0]} online={online} />}
+      {state.dialogs[0] ? <DialogView key={state.dialogs[0].id} dialog={state.dialogs[0]} online={online} /> : <ProjectDialogs state={state} />}
     </div>
   );
 }

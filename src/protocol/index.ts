@@ -1,6 +1,8 @@
 /** Wire contract. Only broadcast events consume sequence numbers. */
 import { WORKBENCH_ACTIONS, type WorkbenchQuery, type WorkbenchResult } from "./workbench.js";
+import { HOST_QUERIES, type HostQuery, type HostQueryAction, type HostResult } from "./host.js";
 export * from "./workbench.js";
+export * from "./host.js";
 export const PROTOCOL = "pi-pane.v1";
 export const WS_PATH = "/ws";
 
@@ -53,7 +55,7 @@ export type ImageType = (typeof IMAGE_TYPES)[number];
 export const COMMANDS = ["prompt", "abort", "set_model", "set_thinking", "compact", "session_new", "session_switch", "session_fork", "session_clone", "session_rename", "run_command", "access_rotate"] as const;
 export type CommandName = (typeof COMMANDS)[number];
 /** Commands about the host itself. They need no live session: a failed runtime replacement is recovered through them. */
-export const HOST_COMMANDS = ["recover_retry", "recover_restore", "host_stop"] as const;
+export const HOST_COMMANDS = ["recover_retry", "recover_restore", "host_stop", "project_open", "project_create", "project_remove", "project_relocate"] as const;
 export type HostCommandName = (typeof HOST_COMMANDS)[number];
 
 /** `total` is present when `text` is a prefix of a longer block readable through content_page. */
@@ -280,7 +282,8 @@ export type ClientMessage =
   | ImagePageRequest
   | WorkbenchQuery
   | CommandEnvelope
-  | HostCommandEnvelope;
+  | HostCommandEnvelope
+  | HostQuery;
 export type ServerMessage =
   | { t: "welcome"; clientId: string; leaseExpiresAt: number; nextCommandNo: number }
   | Snapshot
@@ -288,6 +291,7 @@ export type ServerMessage =
   | { t: "session_reset"; epoch: string; sessionId: string; branchRevision: number; reason: string }
   | { t: "switching"; reason: string }
   | HostState
+  | HostResult
   | { t: "notice"; message: string }
   | UiRequest
   | ({ t: "ui_state" } & ExtensionUiState)
@@ -359,10 +363,43 @@ export function parseClientMessage(value: unknown): ClientMessage {
       shortString(value.clientId) && shortString(value.id) && Number.isSafeInteger(value.commandNo) && (value.commandNo as number) >= 1 &&
       nonNegativeInt(value.hostRevision) && value.id === `${value.clientId}:${value.commandNo}`) {
     if (!HOST_COMMANDS.includes(value.command as HostCommandName)) throw new ProtocolError("unknown_command", "Unknown host command.");
-    if (!isRecord(value.args) || Object.keys(value.args).length) throw new ProtocolError("invalid_args", "This host command takes no arguments.");
+    hostCommandArgs(value.command as HostCommandName, value.args);
     return value as unknown as HostCommandEnvelope;
   }
+  if (value.t === "host_query" && exactKeys(value, ["t", "reqId", "action", "args"]) && shortString(value.reqId, 64) &&
+      HOST_QUERIES.includes(value.action as HostQueryAction)) {
+    hostQueryArgs(value.action as HostQueryAction, value.args);
+    return value as unknown as HostQuery;
+  }
   throw new ProtocolError("invalid_envelope", "Invalid message envelope or command ID.");
+}
+/** A host path as typed or picked: absolute, bounded, and free of NUL. It is only ever passed to file APIs. */
+function hostPath(value: unknown): value is string {
+  return typeof value === "string" && value.length > 0 && value.length <= 4096 && value.startsWith("/") && !value.includes("\0");
+}
+export function hostCommandArgs(command: HostCommandName, value: unknown): Record<string, unknown> {
+  if (!isRecord(value)) throw new ProtocolError("invalid_args", "Command args must be an object.");
+  if (command === "project_open") {
+    if (!exactKeys(value, ["path", "trust"]) || !hostPath(value.path) || (value.trust !== undefined && value.trust !== "remember" && value.trust !== "withhold"))
+      throw new ProtocolError("invalid_args", "Provide an absolute directory path and, when asked, a trust choice.");
+  } else if (command === "project_create") {
+    if (!exactKeys(value, ["parent", "name"]) || !hostPath(value.parent) || typeof value.name !== "string" || value.name.length > 255)
+      throw new ProtocolError("invalid_args", "Provide an existing parent directory and one folder name.");
+  } else if (command === "project_remove") {
+    if (!exactKeys(value, ["path"]) || !hostPath(value.path)) throw new ProtocolError("invalid_args", "Provide the project path to remove from the list.");
+  } else if (command === "project_relocate") {
+    if (!exactKeys(value, ["from", "to"]) || !hostPath(value.from) || !hostPath(value.to)) throw new ProtocolError("invalid_args", "Provide the listed project path and its new directory.");
+  } else if (Object.keys(value).length) throw new ProtocolError("invalid_args", "This host command takes no arguments.");
+  return value;
+}
+export function hostQueryArgs(action: HostQueryAction, value: unknown): Record<string, unknown> {
+  if (!isRecord(value)) throw new ProtocolError("invalid_args", "Query args must be an object.");
+  if (action === "directories") {
+    if (!exactKeys(value, ["path"]) || (value.path !== undefined && !hostPath(value.path))) throw new ProtocolError("invalid_args", "Provide an absolute directory path.");
+  } else if (action === "project_inspect") {
+    if (!exactKeys(value, ["path"]) || !hostPath(value.path)) throw new ProtocolError("invalid_args", "Provide an absolute directory path.");
+  } else if (Object.keys(value).length) throw new ProtocolError("invalid_args", "This query takes no arguments.");
+  return value;
 }
 export function workbenchArgs(action: WorkbenchQuery["action"], value: unknown): Record<string, unknown> {
   if (!isRecord(value)) throw new ProtocolError("invalid_args", "Query args must be an object.");

@@ -102,13 +102,13 @@ try {
     });
   }
   {
-    const { fixture, client, other, foreign, rpc, first, original } = await start({ PI_M31_SHUTDOWN_DIALOG: "1" });
+    const { fixture, client, otherReal, foreign, rpc, first, original } = await start({ PI_M31_SHUTDOWN_DIALOG: "1" });
     await check("a shutdown dialog makes the planned stop incomplete: the target is not started and the host asks", async () => {
       await workbenchQuery(client, "sessions", { scope: "all" });
       const result = await run(client, "session_switch", { sessionId: foreign.id });
       assert.equal(result.status, "failed"); assert.equal(result.error.code, "recovery_required");
       const state = await waitFor(() => client.frames.filter(item => item.t === "host_state").at(-1)?.phase === "recovery_required" && client.frames.filter(item => item.t === "host_state").at(-1), "recovery state");
-      assert.equal(state.recovery.reason, "stop_incomplete"); assert.equal(state.recovery.canRestore, true); assert.equal(state.recovery.targetCwd, other);
+      assert.equal(state.recovery.reason, "stop_incomplete"); assert.equal(state.recovery.canRestore, true); assert.equal(state.recovery.targetCwd, otherReal);
       assert.ok(!JSON.stringify(state).includes(".jsonl"));
       assert.equal((await rpc()).length, 1, "no child was started for the target"); await waitFor(() => !alive(first.pid), "old child exited");
       assert.equal(fixture.exitCode, undefined); assert.equal(client.closed, false);

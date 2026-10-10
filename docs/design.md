@@ -126,6 +126,12 @@ WebSocket subprotocol 为 `pi-pane.v1`、`pi-pane.bearer.<token>`，握手先鉴
 
 替换失败进入 `recovery_required`：Hub 保持运行，没有会话，对话写入被拒绝，只接受一次明确的重试、恢复上一个会话或停止服务，不自动重启。`host_state {revision,phase,cwd,recovery?}` 在握手后先于快照下发；`host_command` 与普通命令共用租约编号和回执，按 `hostRevision` 校验。前台循环监督的是宿主而不是某一个子进程：只有已就绪子进程的非计划退出才结束服务。
 
+### 项目（M3.1 进行中）
+
+项目是运行 pi 的主机上的目录。`host_query` 提供项目列表、目录浏览和打开前的检查，只返回文件夹名，不读文件内容；凭据类目录（`.ssh`、`.aws`、`.pi` 等）以及 agent、会话目录不能作为项目根，也不列出其内容。项目列表存在 `<agentDir>/pi-pane/projects.json`，只记路径、名称、时间和最后的已保存会话，移除只是从列表隐藏。
+
+打开另一个项目就是换子进程。目标项目有最后的已保存会话则恢复它，否则子进程自己新建会话，宿主在得知路径后、第一条消息前加锁。项目带有需信任的配置且没有记录时，网页先问：信任并记住（写入 pi 的信任记录）、不加载继续（本次带 `--no-approve`）、取消；宿主从不生成 `--approve`。界面把用户的选择和实际加载情况分开显示。未发送的草稿和图片按项目保存在页面内存里。
+
 ### 扩展 UI
 
 `ui_request {id,method,title?,message?,options?,placeholder?,prefill?,expiresAt?}` → `ui_response {id,value?,confirmed?,cancelled?}` → `ui_resolved {id,reason?}`。答案独立于命令队列，否则等待扩展对话框的 prompt 会阻塞回答。第一份有效答案胜出；超时、会话替换和停止关闭所有 viewer 的请求。重连新快照后重发宿主仍待处理的请求，不把本地乐观关闭当作宿主已确认。

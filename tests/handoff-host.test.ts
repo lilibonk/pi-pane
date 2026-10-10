@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtemp, mkdir, rm, writeFile, appendFile, symlink } from "node:fs/promises";
+import { mkdtemp, mkdir, rm, writeFile, appendFile, symlink, realpath, readFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, dirname, basename } from "node:path";
 import { SessionManager, type ExtensionContext } from "@earendil-works/pi-coding-agent";
@@ -107,7 +107,7 @@ async function withHost(run: (host: HandoffHost, child: FakeChild, fixture: Fixt
     }
     fixture.launches.push({ args, cwd: directory, child: next }); return next;
   };
-  const host = new HandoffHost(hub, { sessionFile: manager.getSessionFile()!, sessionDir: custom, cwd, argv, theme, themes: [] }, line => { fixture.logs.push(line); }, { createChild, plannedStopMs: 50,
+  const host = new HandoffHost(hub, { sessionFile: manager.getSessionFile()!, sessionDir: custom, cwd, argv, theme, themes: [] }, line => { fixture.logs.push(line); }, { createChild, plannedStopMs: 50, agentDir: join(root, "agent"),
     listAll: ((directory?: string) => child.catalogOverride ? Promise.resolve(child.catalogOverride) : directory ? SessionManager.listAll(directory) : Promise.resolve([])) as typeof SessionManager.listAll });
   try { await host.start(); await run(host, child, fixture); }
   finally { await host.stop(); await rm(root, { recursive: true, force: true }); }
@@ -354,7 +354,7 @@ test("a session of another project gets a new child started there; the old one i
   const result = await host.command("session_switch", { sessionId: foreign.getSessionId() }) as { sessionId: string };
   assert.equal(result.sessionId, foreign.getSessionId()); assert.equal(launches.length, 2);
   assert.equal(child.running, false); assert(!child.calls.some(call => call.type === "switch_session"));
-  assert.equal(launches[1]!.cwd, foreign.getCwd()); assert.deepEqual(launches[1]!.args.slice(-2), ["--session", foreign.getSessionFile()]);
+  assert.equal(launches[1]!.cwd, await realpath(foreign.getCwd())); assert.deepEqual(launches[1]!.args.slice(-2), ["--session", foreign.getSessionFile()]);
   assert.deepEqual(suspended, ["replacing"]); assert.equal(bridges.at(-1)?.sessionId, foreign.getSessionId());
   assert.equal(host.status().phase, "ready"); assert.equal(await settled(host.finished), false);
   // Ownership moved with the runtime: the old transcript is free, the new one is held.
@@ -373,7 +373,7 @@ test("a busy or unverifiable old runtime is left running when a project switch i
   try { await assert.rejects(host.command("session_switch", { sessionId: foreign.getSessionId() }), { code: "session_locked" }); } finally { await lock.release(); }
   assert.equal(child.running, true); assert.equal(launches.length, 1); assert.equal(host.status().phase, "ready");
   await rm(foreign.getCwd(), { recursive: true });
-  await assert.rejects(host.command("session_switch", { sessionId: foreign.getSessionId() }), { code: "project_unavailable" });
+  await assert.rejects(host.command("session_switch", { sessionId: foreign.getSessionId() }), { code: "not_found" });
   assert.equal(child.running, true); assert.equal(await SessionFileLock.inspect(foreign.getSessionFile()!), undefined);
   await host.command("prompt", { text: "still here" });
 }));
@@ -388,7 +388,7 @@ test("a dialog during planned shutdown makes the stop incomplete: recovery, then
   await assert.rejects(host.command("prompt", { text: "write" }), { code: "recovery_required" });
   await assert.rejects(host.read("files"), { code: "recovery_required" });
   const wire = host.hostState(); assert.equal(wire.phase, "recovery_required"); assert.deepEqual(hostStates.map(state => state.phase).slice(-2), ["replacing", "recovery_required"]);
-  assert.deepEqual({ ...wire.recovery, message: "" }, { reason: "stop_incomplete", message: "", targetCwd: foreign.getCwd(), previousCwd: launches[0]!.cwd, canRestore: true });
+  assert.deepEqual({ ...wire.recovery, message: "" }, { reason: "stop_incomplete", message: "", targetCwd: await realpath(foreign.getCwd()), previousCwd: launches[0]!.cwd, canRestore: true });
   assert(!JSON.stringify(wire).includes(".jsonl")); // viewers choose by project, not by transcript path
   assert.deepEqual(await host.hostCommand("recover_restore"), { phase: "ready" }); const restored = host.status(); assert.equal(restored.recovery, undefined);
   assert.equal(hostStates.at(-1)?.phase, "ready"); assert(hostStates.every((state, index) => index === 0 || state.revision > hostStates[index - 1]!.revision));
@@ -442,4 +442,119 @@ test("stopping the host during a slow planned shutdown releases every lock and s
   const stopping = host.stop(); release(); await stopping;
   await assert.rejects(switching); assert.equal(launches.length, 1);
   assert.equal(await SessionFileLock.inspect(original), undefined); assert.equal(await SessionFileLock.inspect(foreign.getSessionFile()!), undefined);
+}));
+const registryOf = async (root: string) => JSON.parse(await readFile(join(root, "agent", "pi-pane", "projects.json"), "utf8")) as { projects: { path: string; source: string; lastSession?: { id: string; file: string } }[]; hidden: string[] };
+const gate = async (directory: string) => { await mkdir(join(directory, ".pi", "extensions"), { recursive: true }); await writeFile(join(directory, ".pi", "extensions", "x.ts"), "export default () => {};\n"); };
+test("an empty directory opens as a project with a new unsaved session, stays listed, and the old project is returned to its session", async () => withHost(async (host, child, { root, launches, bridges }) => {
+  const original = host.sessionFile; const originalId = bridges[0]!.sessionId; const first = await realpath(join(root, "project"));
+  const empty = join(root, "空 项目"); await mkdir(empty); const real = await realpath(empty);
+  assert.deepEqual(await host.hostCommand("project_open", { path: empty }), { path: real });
+  assert.equal(launches.length, 2); assert.equal(launches[1]!.cwd, real); assert(!launches[1]!.args.includes("--session")); assert.equal(child.running, false);
+  // No transcript exists until the first message; the path the child chose is already owned.
+  const session = launches[1]!.child.manager.getSessionFile()!; assert.equal(host.sessionFile, session); assert.equal(host.cwd, real);
+  await assert.rejects(readFile(session)); assert.equal((await SessionFileLock.inspect(session))?.pid, process.pid); assert.equal(await SessionFileLock.inspect(original), undefined);
+  const view = await host.hostQuery("projects");
+  assert.deepEqual(view.projects.map(project => [project.path, project.source, project.current, project.sessions]), [[real, "opened", true, 0], [first, "opened", false, 1], [await realpath(join(root, "other")), "history", false, 1]]);
+  assert.equal(view.current.path, real); assert.deepEqual(view.current.trust, { required: false, choice: "unknown", policy: "ask", ask: false, loaded: 0 });
+  const registry = await registryOf(root);
+  assert.deepEqual(registry.projects.map(project => project.path).sort(), [first, real].sort());
+  assert.deepEqual(registry.projects.find(project => project.path === first)?.lastSession, { id: originalId, file: original });
+  assert(!JSON.stringify(registry).includes("first user")); // entries only: no conversation text
+  // Leaving the unsaved session and coming back restores the saved one; the empty project remains, with a new session.
+  assert.deepEqual(await host.hostCommand("project_open", { path: join(root, "project") }), { path: first });
+  assert.deepEqual(launches[2]!.args, ["--session", original]); assert.equal(bridges.at(-1)?.sessionId, originalId); assert.equal(await SessionFileLock.inspect(session), undefined);
+  assert.deepEqual(await host.hostCommand("project_open", { path: join(root, "project") }), { path: first, unchanged: true }); assert.equal(launches.length, 3);
+  await host.hostCommand("project_open", { path: real }); assert(!launches[3]!.args.includes("--session"));
+  assert.deepEqual((await host.hostQuery("project_inspect", { path: empty })), { path: real, name: "空 项目", current: true, registered: true, sessions: 0, trust: { required: false, choice: "unknown", policy: "ask", ask: false, loaded: 0 } });
+}));
+test("creating a project makes exactly one folder; an existing name or a failed start never removes anything", async () => withHost(async (host, child, fixture) => {
+  const { root, launches } = fixture; const parent = join(root, "workspace"); await mkdir(parent); const real = await realpath(parent);
+  assert.deepEqual(await host.hostCommand("project_create", { parent, name: "新 app" }), { path: join(real, "新 app") });
+  assert.equal(launches[1]!.cwd, join(real, "新 app")); assert.equal((await registryOf(root)).projects.find(project => project.path === join(real, "新 app"))?.source, "created");
+  await writeFile(join(real, "新 app", "notes.md"), "mine");
+  await assert.rejects(host.hostCommand("project_create", { parent, name: "新 app" }), { code: "project_exists" }); assert.equal(launches.length, 2); assert.equal(launches[1]!.child.running, true);
+  assert.equal(await readFile(join(real, "新 app", "notes.md"), "utf8"), "mine");
+  await assert.rejects(host.hostCommand("project_create", { parent: join(root, "missing"), name: "x" }), { code: "not_found" }); assert.equal(launches[1]!.child.running, true);
+  await assert.rejects(host.hostCommand("project_create", { parent, name: "../escape" }), { code: "invalid_name" });
+  fixture.prepare = next => { next.intercept = async type => { if (type === "get_state") throw new Error("startup failed"); return { intercepted: false }; }; };
+  await assert.rejects(host.hostCommand("project_create", { parent, name: "second" }), { code: "recovery_required" });
+  assert((await realpath(join(parent, "second")))); assert((await registryOf(root)).projects.some(project => project.path === join(real, "second")));
+  assert.equal(host.hostState().recovery?.targetCwd, join(real, "second")); assert.equal(host.hostState().recovery?.previousCwd, join(real, "新 app"));
+}));
+test("an unknown project with trust-gated resources is asked about; the host never generates --approve", async () => withHost(async (host, child, { root, launches }) => {
+  const gated = join(root, "gated"); await gate(gated); const real = await realpath(gated);
+  assert.equal((await host.hostQuery("project_inspect", { path: gated })).trust.ask, true);
+  await assert.rejects(host.hostCommand("project_open", { path: gated }), { code: "trust_required" });
+  assert.equal(child.running, true); assert.equal(launches.length, 1); assert.equal((await host.hostQuery("projects")).projects.some(project => project.path === real), false);
+  // Continue without loading: process-wide, but in the direction of loading less, and only for this run.
+  await host.hostCommand("project_open", { path: gated, trust: "withhold" });
+  assert.deepEqual(launches[1]!.args, ["--no-skills", "--no-approve"]);
+  let trust = (await host.hostQuery("projects")).current.trust; assert.equal(trust.withheld, true); assert.equal(trust.choice, "unknown"); assert.equal(trust.ask, true);
+  // The same project again, now trusted and remembered: only a restart applies it, on the same (unsaved → new) session.
+  await host.hostCommand("project_open", { path: gated, trust: "remember" });
+  assert.deepEqual(launches[2]!.args, ["--no-skills"]); assert.equal(launches[2]!.cwd, real);
+  trust = (await host.hostQuery("projects")).current.trust; assert.deepEqual(trust, { required: true, choice: "trusted", policy: "ask", ask: false, loaded: 0 });
+  // The start project gets its own --approve back; it never travelled to the other project.
+  await host.hostCommand("project_open", { path: join(root, "project") });
+  assert.deepEqual(launches[3]!.args.slice(0, 2), ["--approve", "--no-skills"]); assert.equal((await host.hostQuery("projects")).current.trust.override, "approve");
+  assert(launches.slice(1, 3).every(launch => !launch.args.includes("--approve") && !launch.args.includes("-a")));
+  // A project opened by picking one of its sessions was not asked: it is opened without a trust flag and without recording anything.
+  await writeFile(join(root, "agent", "trust.json"), "{}").catch(() => undefined);
+}, undefined, ["--approve", "--no-skills"]));
+test("credential directories are refused as project roots, for projects and for sessions that live there", async () => withHost(async (host, child, { root, launches }) => {
+  const secret = join(root, ".ssh", "repo"); await mkdir(secret, { recursive: true });
+  await assert.rejects(host.hostCommand("project_open", { path: secret }), { code: "project_root_refused" });
+  await assert.rejects(host.hostCommand("project_open", { path: join(root, "agent") }), { code: "not_found" });
+  await mkdir(join(root, "agent"), { recursive: true }); await assert.rejects(host.hostCommand("project_open", { path: join(root, "agent") }), { code: "project_root_refused" });
+  await assert.rejects(host.hostCommand("project_open", { path: join(root, "custom") }), { code: "project_root_refused" }); // the session directory
+  const hidden = SessionManager.create(secret, join(root, "custom")); hidden.appendMessage({ role: "user", content: "in ssh", timestamp: 7 });
+  hidden.appendMessage({ role: "assistant", content: [{ type: "text", text: "a" }], api: "fixture", provider: "local", model: "fixture", timestamp: 8, stopReason: "stop", usage: { input: 0, output: 0, totalTokens: 0, cacheRead: 0, cacheWrite: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } } } as never);
+  await host.read("sessions", { scope: "all" });
+  await assert.rejects(host.command("session_switch", { sessionId: hidden.getSessionId() }), { code: "project_root_refused" });
+  assert.equal(child.running, true); assert.equal(launches.length, 1);
+  assert.equal((await host.hostQuery("directories", { path: secret })).refused, "credential_directory");
+  assert.equal((await host.hostQuery("directories")).path, await realpath(join(root, "project")));
+}));
+test("project switches are refused while busy, and two viewers acting on the same state do not both switch", async () => withHost(async (host, child, { root, launches }) => {
+  const a = join(root, "a"), b = join(root, "b"); await mkdir(a); await mkdir(b);
+  child.streaming = true; await assert.rejects(host.hostCommand("project_open", { path: a }), { code: "busy" }); child.streaming = false; await host.read("tree");
+  child.emit({ type: "extension_ui_request", id: "open", method: "confirm", title: "?" });
+  await assert.rejects(host.hostCommand("project_open", { path: a }), { code: "busy" }); host.answer("open", { cancelled: true });
+  assert.equal(launches.length, 1);
+  const revision = host.hostState().revision;
+  const [first, second] = await Promise.allSettled([host.hostCommand("project_open", { path: a }, revision), host.hostCommand("project_open", { path: b }, revision)]);
+  assert.equal(first.status, "fulfilled", String((first as PromiseRejectedResult).reason)); assert.equal(second.status, "rejected"); assert.equal((second as PromiseRejectedResult).reason.code, "stale_host");
+  assert.equal(launches.length, 2); assert.equal(host.cwd, await realpath(a));
+}));
+test("removing from the list keeps the directory and its sessions and survives history; the current project cannot be removed", async () => withHost(async (host, _child, { root, foreign }) => {
+  const other = await realpath(foreign.getCwd());
+  await assert.rejects(host.hostCommand("project_remove", { path: join(root, "project") }), { code: "project_current" });
+  assert.deepEqual(await host.hostCommand("project_remove", { path: foreign.getCwd() }), { path: other });
+  const view = await host.hostQuery("projects"); assert.equal(view.projects.some(project => project.path === other), false);
+  assert.deepEqual((await registryOf(root)).hidden, [other]); assert.equal(await readFile(join(other, "foreign.txt"), "utf8"), "foreign"); assert(await readFile(foreign.getSessionFile()!, "utf8"));
+  // Its sessions are still reachable, and opening it again lists it again.
+  assert((await host.read("sessions", { scope: "all" })).sessions.some(session => session.id === foreign.getSessionId()));
+  await host.hostCommand("project_open", { path: other }); assert.deepEqual((await registryOf(root)).hidden, []);
+  assert.equal((await host.hostQuery("projects")).projects.find(project => project.path === other)?.current, true);
+}));
+test("a moved project is shown unavailable and only relocated to a directory the user chooses", async () => withHost(async (host, _child, { root }) => {
+  const old = join(root, "moved-from"); await mkdir(old); const oldReal = await realpath(old);
+  await host.hostCommand("project_open", { path: old }); await host.hostCommand("project_open", { path: join(root, "project") });
+  await rm(old, { recursive: true }); await mkdir(join(root, "moved-to")); await mkdir(join(root, "moved-from-lookalike"));
+  assert.equal((await host.hostQuery("projects")).projects.find(project => project.path === oldReal)?.available, false);
+  await assert.rejects(host.hostCommand("project_open", { path: old }), { code: "not_found" });
+  await assert.rejects(host.hostCommand("project_relocate", { from: oldReal, to: join(root, ".ssh") }), { code: "not_found" });
+  const to = await realpath(join(root, "moved-to"));
+  assert.deepEqual(await host.hostCommand("project_relocate", { from: oldReal, to: join(root, "moved-to") }), { path: to });
+  const projects = (await host.hostQuery("projects")).projects; assert.equal(projects.find(project => project.path === to)?.available, true); assert.equal(projects.some(project => project.path === oldReal), false);
+  await assert.rejects(host.hostCommand("project_relocate", { from: oldReal, to }), { code: "unknown_project" });
+}));
+test("an unreadable project list is left untouched, reported, and does not block opening a project", async () => withHost(async (host, _child, { root, logs }) => {
+  await mkdir(join(root, "agent", "pi-pane"), { recursive: true }); const file = join(root, "agent", "pi-pane", "projects.json"); await writeFile(file, "{ not json");
+  const view = await host.hostQuery("projects"); assert.match(view.registryError ?? "", /not valid JSON/);
+  assert.deepEqual(view.projects.map(project => project.source), ["history", "history"]); assert.equal(view.projects[0]!.current, true);
+  const empty = join(root, "empty"); await mkdir(empty);
+  await host.hostCommand("project_open", { path: empty }); assert.equal(host.cwd, await realpath(empty));
+  assert.equal(await readFile(file, "utf8"), "{ not json"); assert(logs.some(line => line.includes("project list was not updated")));
+  await assert.rejects(host.hostCommand("project_remove", { path: join(root, "other") }), { code: "registry_corrupt" });
 }));

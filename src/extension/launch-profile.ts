@@ -1,4 +1,4 @@
-import { existsSync } from "node:fs";
+import { existsSync, realpathSync } from "node:fs";
 import { isAbsolute, resolve } from "node:path";
 import { launchOptions, optionTokens, type LaunchOption } from "./child-args.js";
 
@@ -8,6 +8,8 @@ const RESOURCE_PATH = new Set(["--extension", "-e", "--skill", "--prompt-templat
 const PROMPT_INPUT = new Set(["--system-prompt", "--append-system-prompt"]);
 /** pi's own test for package sources that are not paths (`isLocalPath`). */
 const REMOTE_SOURCE = /^(npm|git|github|http|https|ssh|builtin):/;
+/** Projects are compared by real path: the same directory reached through a link is the same project. */
+const canonical = (path: string): string => { try { return realpathSync(path); } catch { return resolve(path); } };
 const cwdIndependent = (value: string): boolean => isAbsolute(value) || value.startsWith("~") || value.startsWith("file:");
 
 /**
@@ -56,7 +58,7 @@ export class LaunchProfile {
    * - No `--session` for a new session: pi allocates the path in its own session directory.
    */
   args(target: LaunchTarget): string[] {
-    const inStartProject = resolve(target.cwd) === resolve(this.startCwd);
+    const inStartProject = canonical(target.cwd) === canonical(this.startCwd);
     const kept = this.options.filter(option => {
       if (option.kind === "value" && MODEL.has(option.name)) return !target.session?.saved;
       if (option.kind === "boolean" && TRUST.has(option.name)) return inStartProject && !target.withholdTrust;

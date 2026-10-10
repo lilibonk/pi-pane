@@ -1,8 +1,9 @@
 import { createStore } from "zustand/vanilla";
-import type { CommandName, ExtensionUiState, HostCommandName, HostState, ImageType, MessageView, PromptImage, Snapshot } from "../protocol/index.js";
+import type { CommandName, ExtensionUiState, HostCommandName, HostQueryAction, HostQueryValues, HostState, ProjectInspectView, ImageType, MessageView, PromptImage, Snapshot } from "../protocol/index.js";
 import { IMAGE_TYPES, LIMITS, applyProjectionEvent, boundedTools, decodeBase64, encodedSize, inspectImage, isTextContent, mergeOlderPage } from "../protocol/index.js";
 import type { WorkbenchAction, WorkbenchValues } from "../protocol/workbench.js";
 import { ForkDraftRecovery } from "./draft-recovery.js";
+import { ProjectDrafts } from "./project-drafts.js";
 import { EditorChangeGuard, extensionText } from "./ui-state.js";
 export type { ContentView, MessageView, Snapshot, ToolView } from "../protocol/index.js";
 
@@ -56,6 +57,8 @@ export interface WebState {
   host: HostState | null;
   /** The recovery command this page sent and has no result for yet. */
   hostAction: { id: string; command: HostCommandName } | null;
+  /** The open project dialog: a directory picker, or the trust question for one inspected directory. */
+  projectDialog: { mode: "open" | "create" } | { mode: "relocate"; from: string } | { mode: "trust"; project: ProjectInspectView } | null;
 }
 
 export const webStore = createStore<WebState>(() => ({
@@ -81,6 +84,7 @@ export const webStore = createStore<WebState>(() => ({
   ui: null,
   host: null,
   hostAction: null,
+  projectDialog: null,
 }));
 
 const TOKEN_KEY = "pi-pane.token";
@@ -103,6 +107,7 @@ const contentRequests = new Map<string, string>();
 const workbenchRequests = new Map<string, { epoch: string; action: WorkbenchAction; resolve: (value: any) => void; reject: (error: Error) => void; dispose: () => void }>();
 const forkDraftRecovery = new ForkDraftRecovery();
 let draftRevision = 0;
+const projectDrafts = new ProjectDrafts<Attachment>(16, attachments => { for (const item of attachments) URL.revokeObjectURL(item.url); });
 const editorChanges = new EditorChangeGuard();
 let assembling: { id: string; parts: number; chunks: string[] } | undefined;
 
@@ -243,6 +248,37 @@ function cancelWorkbenchReads() {
   }
   workbenchRequests.clear();
 }
+/** A failure reported by the host, with its code so the page can explain it in its own words. */
+export class HostError extends Error {
+  constructor(readonly code: string, message: string) { super(message); this.name = "HostError"; }
+}
+const hostRequests = new Map<string, { action: string; resolve: (value: any) => void; reject: (error: Error) => void; dispose: () => void }>();
+const hostCommands = new Map<string, { resolve: (value: any) => void; reject: (error: Error) => void }>();
+/** Host reads and commands outlive session changes but not the connection. */
+function cancelHostRequests() {
+  for (const request of hostRequests.values()) { request.dispose(); request.reject(new HostError("disconnected", "连接已断开，请重新加载。")); }
+  hostRequests.clear();
+  for (const command of hostCommands.values()) command.reject(new HostError("unknown_result", "连接已断开，结果未知。请查看页面当前状态，不要直接重复操作。"));
+  hostCommands.clear();
+}
+/** A directed read about the host's projects and directories. It needs a connection, not a session. */
+export function queryHost<A extends HostQueryAction>(action: A, args: Record<string, unknown> = {}, signal?: AbortSignal): Promise<HostQueryValues[A]> {
+  if (!webStore.getState().clientId) return Promise.reject(new HostError("disconnected", "尚未连接，请稍后重试。"));
+  if (signal?.aborted) return Promise.reject(new HostError("cancelled", "读取已取消。"));
+  return new Promise((resolve, reject) => {
+    const reqId = `host:${++requestNo}`;
+    const fail = (code: string, message: string) => {
+      const request = hostRequests.get(reqId);
+      if (!request) return;
+      hostRequests.delete(reqId); request.dispose(); reject(new HostError(code, message));
+    };
+    const onAbort = () => fail("cancelled", "读取已取消。");
+    const timer = setTimeout(() => fail("timeout", "读取超时，请重试。"), 15_000);
+    hostRequests.set(reqId, { action, resolve, reject, dispose: () => { clearTimeout(timer); signal?.removeEventListener("abort", onAbort); } });
+    signal?.addEventListener("abort", onAbort, { once: true });
+    if (!send({ t: "host_query", reqId, action, args })) fail("disconnected", "连接已断开，请重新加载。");
+  });
+}
 
 export function queryWorkbench<A extends WorkbenchAction>(action: A, args: Record<string, unknown> = {}, signal?: AbortSignal): Promise<WorkbenchValues[A]> {
   const state = webStore.getState();
@@ -318,6 +354,8 @@ function handleFrame(raw: unknown) {
       uncertainSubmissions(frame.epoch);
       resetReads();
       const snapshot = capHistory({ ...frame, state: { ...frame.state, tools: boundedTools(frame.state.tools) } } as Snapshot);
+      const moved = projectDrafts.enter(snapshot.session.cwd, { draft: current.draft, attachments: current.attachments });
+      if (moved) { draftRevision++; webStore.setState({ draft: moved.draft, attachments: moved.attachments, attachmentError: "" }); }
       webStore.setState(state => ({ snapshot, lastAppliedSeq: frame.seq, connection: "online", notice: "", snapshotCount: state.snapshotCount + 1 }));
       webStore.setState({ dialogs: [] });
       applyUiState(snapshot.ui, snapshot.epoch);
@@ -398,6 +436,16 @@ function handleFrame(raw: unknown) {
       cancelWorkbenchReads();
       webStore.setState({ connection: "switching", notice: current.host?.phase === "recovery_required" ? "" : "宿主正在切换会话，写操作暂时暂停…" });
       break;
+    case "host_result": {
+      const request = typeof frame.reqId === "string" ? hostRequests.get(frame.reqId) : undefined;
+      if (!request) break;
+      hostRequests.delete(frame.reqId); request.dispose();
+      if (frame.action !== request.action) request.reject(new HostError("mismatch", "读取结果不匹配，请重试。"));
+      else if (frame.error) request.reject(new HostError(String(frame.error.code ?? "failed"), typeof frame.error.message === "string" ? frame.error.message : "读取失败。"));
+      else if (frame.value === undefined) request.reject(new HostError("empty", "未收到数据。"));
+      else request.resolve(frame.value);
+      break;
+    }
     case "host_state":
       if (!Number.isSafeInteger(frame.revision) || typeof frame.phase !== "string") throw new Error("host_state shape");
       webStore.setState({ host: frame as unknown as HostState,
@@ -408,7 +456,11 @@ function handleFrame(raw: unknown) {
       if (typeof frame.id !== "string") throw new Error("ack id");
       if (Number.isSafeInteger(frame.nextCommandNo)) webStore.setState({ nextCommandNo: Math.max(current.nextCommandNo, frame.nextCommandNo) });
       if (current.hostAction?.id === frame.id) {
-        if (frame.status !== "dispatched") webStore.setState({ hostAction: null, notice: frame.error?.code === "stale_host" ? "宿主状态已变化，请按页面当前内容重新选择。" : frame.error?.message ?? "操作未被接受。" });
+        if (frame.status !== "dispatched") {
+          webStore.setState({ hostAction: null });
+          const waiter = hostCommands.get(frame.id); hostCommands.delete(frame.id);
+          waiter?.reject(new HostError(String(frame.error?.code ?? "rejected"), frame.error?.message ?? "操作未被接受。"));
+        }
         break;
       }
       updateSubmission(frame.id, {
@@ -420,8 +472,10 @@ function handleFrame(raw: unknown) {
     }
     case "command_result": {
       if (current.hostAction?.id === frame.id) {
-        // On failure the host has already published the updated recovery state with its reason.
-        webStore.setState({ hostAction: null, ...(frame.status === "completed" ? {} : { notice: frame.error?.code === "recovery_required" ? "" : frame.error?.message ?? "操作失败。" }) });
+        webStore.setState({ hostAction: null });
+        const waiter = hostCommands.get(frame.id); hostCommands.delete(frame.id);
+        if (frame.status === "completed") waiter?.resolve(frame.value);
+        else waiter?.reject(new HostError(String(frame.error?.code ?? "failed"), frame.error?.message ?? "操作失败。"));
         break;
       }
       const submission = current.submissions.find(item => item.id === frame.id);
@@ -568,6 +622,8 @@ function connect() {
     forkDraftRecovery.cancel();
     uncertainSubmissions();
     cancelWorkbenchReads();
+    cancelHostRequests();
+    webStore.setState({ hostAction: null });
     if (stopped) return;
     if (event.reason === "connection_replaced" || event.reason === "client_expired") {
       stopped = true;
@@ -667,15 +723,30 @@ export function answerDialog(id: string, response: { value?: string; confirmed?:
   }
   if (webStore.getState().connection === "online" && send({ t: "ui_response", id, ...response })) webStore.setState(state => ({ dialogs: state.dialogs.filter(dialog => dialog.id !== id) }));
 }
-/** Retry, restore or stop after a failed runtime replacement. Needs no session, only the host state this page shows. */
-export function issueHostCommand(command: HostCommandName) {
+/**
+ * A command about the host itself (projects, recovery). It needs no session, only the host state this
+ * page shows, and is never resent: after a lost connection its result is reported as unknown.
+ */
+export function runHostCommand<T = unknown>(command: HostCommandName, args: Record<string, unknown> = {}): Promise<T> {
   const state = webStore.getState();
-  if (!state.clientId || !state.host || state.hostAction || state.connection === "disconnected" || state.connection === "fatal" || state.connection === "login") return;
+  if (!state.clientId || !state.host || state.connection === "disconnected" || state.connection === "fatal" || state.connection === "login")
+    return Promise.reject(new HostError("disconnected", "尚未连接，请稍后重试。"));
+  if (state.hostAction) return Promise.reject(new HostError("busy", "上一个操作还在进行。"));
   const commandNo = state.nextCommandNo;
   const id = `${state.clientId}:${commandNo}`;
-  if (!send({ t: "host_command", clientId: state.clientId, commandNo, id, hostRevision: state.host.revision, command, args: {} })) return;
+  if (!send({ t: "host_command", clientId: state.clientId, commandNo, id, hostRevision: state.host.revision, command, args }))
+    return Promise.reject(new HostError("disconnected", "连接已断开，请重新加载。"));
   webStore.setState({ notice: "", nextCommandNo: commandNo + 1, hostAction: { id, command } });
+  return new Promise<T>((resolve, reject) => { hostCommands.set(id, { resolve, reject }); });
 }
+/** Retry, restore or stop after a failed runtime replacement. */
+export function issueHostCommand(command: "recover_retry" | "recover_restore" | "host_stop") {
+  // On failure the host has already published the updated recovery state with its reason.
+  runHostCommand(command).catch((error: HostError) => {
+    if (error.code !== "recovery_required") webStore.setState({ notice: error.code === "stale_host" ? "宿主状态已变化，请按页面当前内容重新选择。" : error.message });
+  });
+}
+export function setProjectDialog(dialog: WebState["projectDialog"]) { webStore.setState({ projectDialog: dialog }); }
 export function issueCommand(command: CommandName, args: Record<string, unknown> = {}, text?: string, mode?: "followUp" | "steer") {
   const state = webStore.getState();
   const snapshot = state.snapshot;

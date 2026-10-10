@@ -341,3 +341,29 @@ test("host state and host commands work without a session and share the lease's 
     await c.close();
   } finally { await f.close(); }
 });
+test("host queries are directed, need a lease but no session, and unauthenticated sockets get nothing", async () => {
+  const f = await fixture();
+  try {
+    const asked: unknown[] = [];
+    f.hub.setHostHandler({ command: async () => ({}), read: async () => ({ commands: [] }), answer: () => {}, pendingDialogs: () => [], uiState: () => ({ revision: 0, statuses: {}, widgets: {} }),
+      hostState: () => ({ t: "host_state", revision: 1, phase: "replacing", cwd: "/fixture" }),
+      hostQuery: async (action: string, args: unknown) => { asked.push([action, args]); if (action === "project_inspect") throw new ProtocolError("project_root_refused", "refused"); return { path: "/fixture", home: "/home", entries: [{ name: "src", hidden: false }], truncated: false, writable: true }; },
+    } as unknown as HostHandler);
+    f.hub.suspendBridge("replacing");
+    const c = await client(f.hub); const other = await client(f.hub); await c.wait("welcome"); await other.wait("welcome");
+    let from = c.frames.length; const seen = other.frames.length;
+    c.send({ t: "host_query", reqId: "q1", action: "directories", args: { path: "/fixture" } });
+    const result = await c.wait("host_result", from); assert.ok(result.t === "host_result"); assert.equal(result.reqId, "q1"); assert.deepEqual((result.value as { entries: unknown[] }).entries, [{ name: "src", hidden: false }]);
+    from = c.frames.length; c.send({ t: "host_query", reqId: "q2", action: "project_inspect", args: { path: "/fixture/.ssh" } });
+    const refused = await c.wait("host_result", from); assert.ok(refused.t === "host_result"); assert.equal(refused.error?.code, "project_root_refused"); assert.equal(refused.value, undefined);
+    await delay(20); assert.equal(other.frames.slice(seen).some(frame => frame.t === "host_result"), false); // never broadcast
+    from = c.frames.length; c.send({ t: "host_query", reqId: "q3", action: "directories", args: { path: "relative" } });
+    const invalid = await c.wait("error", from); assert.ok(invalid.t === "error"); assert.equal(invalid.error.code, "invalid_args");
+    assert.deepEqual(asked, [["directories", { path: "/fixture" }], ["project_inspect", { path: "/fixture/.ssh" }]]);
+    // No bearer, no listing: the socket never reaches the handler.
+    const anonymous = new WebSocket(`${f.hub.origin.replace("http:", "ws:")}/ws`, ["pi-pane.v1"], { origin: f.hub.origin });
+    const outcome = await new Promise<string>(resolve => { anonymous.once("open", () => { anonymous.send(JSON.stringify({ t: "host_query", reqId: "q", action: "directories", args: {} })); }); anonymous.once("message", raw => resolve(raw.toString())); anonymous.once("close", () => resolve("closed")); anonymous.once("error", () => resolve("refused")); setTimeout(() => resolve("silent"), 500); });
+    assert(!outcome.includes("entries")); assert.equal(asked.length, 2);
+    anonymous.terminate(); await c.close(); await other.close();
+  } finally { await f.close(); }
+});

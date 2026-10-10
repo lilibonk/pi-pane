@@ -9,7 +9,7 @@ function evidence(event: string, data: Record<string, unknown> = {}) {
 
 export default function m31Probe(pi: ExtensionAPI) {
   pi.on("session_start", (event, ctx) => {
-    evidence("m31_session", { reason: event.reason, mode: ctx.mode, ctxCwd: ctx.cwd, processCwd: process.cwd(),
+    evidence("m31_session", { reason: event.reason, mode: ctx.mode, ctxCwd: ctx.cwd, processCwd: process.cwd(), argv: process.argv.slice(2),
       sessionId: ctx.sessionManager.getSessionId(), sessionFile: ctx.sessionManager.getSessionFile() });
   });
   // A global extension that answers the project trust question, like a policy extension would.

@@ -39,6 +39,7 @@ npm run m2:install
 npm run m3:handoff
 npm run m3:workbench
 npm run m31:runtime
+npm run m31:projects
 ```
 
 | Script | Handoff coverage |
@@ -57,6 +58,7 @@ npm run m31:runtime
 | `m3:handoff` | Real TUI shutdown, one RPC writer, four extension dialogs, cancellation/timeout/late answers, reconnect UI state, rename/clone/current marker, `/web`-only session lock (a second TUI is warned, stays open, and its `/web` is refused; two ordinary TUIs share a session), extension entries persisted after a turn settled, Ctrl+C/SIGHUP/SIGKILL/child crash and unexpected external file changes. `PI_M3_LONG=1` adds an extension dialog answered after 130 s |
 | `m3:workbench` | Session/commands/resources reads, file confinement and real Git diff, extension once-only dispatch, RPC slash/template/skill expansion, new/cancel/scope queue, discovered-ID resume, cross-cwd roots, user-entry fork draft, receipt dedup and slow-stream reconnect |
 | `m31:runtime` | M3.1 runtime control with a real TUI and real RPC children: a session of another project starts a new child in that directory (process cwd, lock ownership, old child's shutdown handlers finished, Hub and viewers stay connected); a child that moves itself to another project's session stops the service; a shutdown dialog leaves `recovery_required` (no target child, late viewer sees the state first), then restore and stop through `host_command`; a 3 s shutdown handler is waited for and its non-message entry accepted; Ctrl+C after a replacement names the current project's session |
+| `m31:projects` | M3.1 project management with a real TUI and real RPC children: host directory listing (folder names only, credential and agent directories refused), opening an empty directory (no transcript until the first prompt, path already locked), first prompt and native reopen, exclusive creation with literal names, the trust question (withhold → `--no-approve`, remember → trust store, never `--approve`, global veto shown as not loaded), return to the start project without leaks, model and prompt replay rules, busy and two-viewer races, a locked target, symlink aliases, moved projects and relocation, removal from the list, Ctrl+C after several switches |
 
 Script definitions are not passing results. The frozen release candidate passed typecheck, build and **136/136 unit tests**, with logs and `build-checks.json` under `build-artifacts/releases/0.2.0/`. The sequential deterministic run has **121/121 checks across 13 report suites** in `regression/summary.json`, including `PI_M3_LONG=1` handoff **15/15**, performance **3/3** and theme **2/2**. The exact candidate archive installation passed another **4/4** in `install/report.json`, making **125/125 across 14 suites**. Source and built-asset hashes were unchanged during the matrix; the runner temporary HOME and 25 referenced fixture roots were removed. The independently recorded daily-package discovery check is additional and does not change this total.
 
