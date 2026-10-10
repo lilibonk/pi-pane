@@ -1,5 +1,5 @@
 import { createStore } from "zustand/vanilla";
-import type { CommandName, ExtensionUiState, HostCommandName, HostQueryAction, HostQueryValues, HostState, ProjectInspectView, ImageType, MessageView, PromptImage, Snapshot } from "../protocol/index.js";
+import type { AccountOperation, CommandName, ExtensionUiState, HostCommandName, HostQueryAction, HostQueryValues, HostState, ProjectInspectView, ImageType, MessageView, PromptImage, Snapshot } from "../protocol/index.js";
 import { IMAGE_TYPES, LIMITS, applyProjectionEvent, boundedTools, decodeBase64, encodedSize, inspectImage, isTextContent, mergeOlderPage } from "../protocol/index.js";
 import type { WorkbenchAction, WorkbenchValues } from "../protocol/workbench.js";
 import { ForkDraftRecovery } from "./draft-recovery.js";
@@ -59,6 +59,12 @@ export interface WebState {
   hostAction: { id: string; command: HostCommandName } | null;
   /** The open project dialog: a directory picker, or the trust question for one inspected directory. */
   projectDialog: { mode: "open" | "create" } | { mode: "relocate"; from: string } | { mode: "trust"; project: ProjectInspectView } | null;
+  /** The account operation as this page may see it: with its steps when this page started it. */
+  account: AccountOperation | null;
+  /** Why the last answer to a login step was not accepted. */
+  accountError: string;
+  /** The finished or running operation whose dialog this page closed. */
+  accountDismissed: string;
 }
 
 export const webStore = createStore<WebState>(() => ({
@@ -85,6 +91,9 @@ export const webStore = createStore<WebState>(() => ({
   host: null,
   hostAction: null,
   projectDialog: null,
+  account: null,
+  accountError: "",
+  accountDismissed: "",
 }));
 
 const TOKEN_KEY = "pi-pane.token";
@@ -346,7 +355,8 @@ function handleFrame(raw: unknown) {
     case "welcome":
       if (typeof frame.clientId !== "string" || !Number.isSafeInteger(frame.nextCommandNo)) throw new Error("welcome shape");
       saveSession(CLIENT_KEY, frame.clientId);
-      webStore.setState({ clientId: frame.clientId, nextCommandNo: frame.nextCommandNo, hostAction: null });
+      // The host sends the account operation again after this when one exists.
+      webStore.setState({ clientId: frame.clientId, nextCommandNo: frame.nextCommandNo, hostAction: null, account: null, accountError: "" });
       break;
     case "snapshot": {
       if (typeof frame.epoch !== "string" || !Number.isSafeInteger(frame.seq) ||
@@ -435,6 +445,12 @@ function handleFrame(raw: unknown) {
     case "switching":
       cancelWorkbenchReads();
       webStore.setState({ connection: "switching", notice: current.host?.phase === "recovery_required" ? "" : "宿主正在切换会话，写操作暂时暂停…" });
+      break;
+    case "account_state":
+      webStore.setState({ account: (frame.operation ?? null) as AccountOperation | null, ...(frame.operation?.step ? {} : { accountError: "" }) });
+      break;
+    case "account_error":
+      if (current.account?.id === frame.operationId) webStore.setState({ accountError: String(frame.error?.code ?? "failed") });
       break;
     case "host_result": {
       const request = typeof frame.reqId === "string" ? hostRequests.get(frame.reqId) : undefined;
@@ -746,6 +762,15 @@ export function issueHostCommand(command: "recover_retry" | "recover_restore" | 
     if (error.code !== "recovery_required") webStore.setState({ notice: error.code === "stale_host" ? "宿主状态已变化，请按页面当前内容重新选择。" : error.message });
   });
 }
+/**
+ * Answers the current login step. The value may be a key: it goes out once on this connection and is
+ * kept nowhere on the page — not in the store, a draft, a submission record or storage.
+ */
+export function answerAccount(operationId: string, stepId: string, value: string): boolean {
+  webStore.setState({ accountError: "" });
+  return send({ t: "account_answer", operationId, stepId, value });
+}
+export function dismissAccount(operationId: string) { webStore.setState({ accountDismissed: operationId, accountError: "" }); }
 export function setProjectDialog(dialog: WebState["projectDialog"]) { webStore.setState({ projectDialog: dialog }); }
 export function issueCommand(command: CommandName, args: Record<string, unknown> = {}, text?: string, mode?: "followUp" | "steer") {
   const state = webStore.getState();

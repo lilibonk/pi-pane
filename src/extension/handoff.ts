@@ -2,7 +2,7 @@ import { SessionManager, getAgentDir, type ExtensionContext } from "@earendil-wo
 import { existsSync } from "node:fs";
 import { open, realpath, stat } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
-import { ProtocolError, isRecord, isCommandInvocationName, workbenchArgs, type HostCommandName, type HostQueryAction, type HostQueryValues, type HostState, type ProjectItem, type ProjectInspectView, type ProjectsView, type ProjectTrustView, type WorkbenchAction, type WorkbenchValues, type WorkbenchCommand, type SessionCatalogItem } from "../protocol/index.js";
+import { ProtocolError, isRecord, isCommandInvocationName, workbenchArgs, type AccountState, type AccountsView, type HostCommandName, type HostQueryAction, type HostQueryValues, type HostState, type ProjectItem, type ProjectInspectView, type ProjectsView, type ProjectTrustView, type WorkbenchAction, type WorkbenchValues, type WorkbenchCommand, type SessionCatalogItem } from "../protocol/index.js";
 import { Bridge } from "./bridge.js";
 import type { Hub, HostHandler } from "./hub.js";
 import { LaunchProfile, type LaunchTarget } from "./launch-profile.js";
@@ -12,6 +12,7 @@ import { SessionFileLock, type KnownEntry } from "./session-lock.js";
 import { WorkspaceService } from "./workspace.js";
 import { ProjectRegistry, ProjectRegistryError, type ProjectView } from "./project-registry.js";
 import { ProjectService } from "./projects.js";
+import { AuthController, type AuthRuntime } from "./auth-controller.js";
 export { childArgs } from "./child-args.js";
 export { LaunchProfile } from "./launch-profile.js";
 export { SessionFileLock } from "./session-lock.js";
@@ -56,6 +57,9 @@ interface HandoffDependencies {
   plannedStopMs?: number;
   /** pi's agent directory: the project list, the trust store and global settings live under it. */
   agentDir?: string;
+  /** pi's public auth runtime for the host-side login; tests script it. */
+  createAuthRuntime?: () => Promise<AuthRuntime>;
+  accountLimitMs?: number;
 }
 /** A planned replacement waits for slow shutdown handlers; an emergency stop (Ctrl+C) does not. */
 const PLANNED_STOP_MS = 20_000;
@@ -68,7 +72,9 @@ const BUILTINS: WorkbenchCommand[] = [
   ["settings", "查看资源", "resources"], ["session", "会话信息", "status"], ["name", "重命名会话", "rename"], ["clone", "克隆当前分支", "clone"],
 ].map(([name, description, action]) => ({ name: name!, description: description!, source: "builtin", available: true, browserAction: action as WorkbenchCommand["browserAction"] }));
 BUILTINS.push({ name: "tree", description: "切换历史分支", source: "builtin", available: false, reason: "需要 pi 上游提供 RPC tree 导航；当前只能从用户消息分叉。", browserAction: "tree" });
-for (const name of ["web", "scoped-models", "export", "import", "share", "bug", "copy", "changelog", "hotkeys", "trust", "login", "logout", "reload", "quit", "debug", "arminsayshi", "dementedelves"])
+for (const [name, description] of [["login", "登录模型服务商"], ["logout", "退出模型服务商"]])
+  BUILTINS.push({ name: name!, description: description!, source: "builtin", available: true, browserAction: "accounts" });
+for (const name of ["web", "scoped-models", "export", "import", "share", "bug", "copy", "changelog", "hotkeys", "trust", "reload", "quit", "debug", "arminsayshi", "dementedelves"])
   BUILTINS.push({ name, description: "pi 内置终端命令", source: "builtin", available: false, terminalOnly: true, reason: "交接模式不支持此终端命令；Ctrl+C 后在终端执行。" });
 const BUILTIN_NAMES = new Set(BUILTINS.map(command => command.name));
 const SESSION_WRITES = new Set(["session_new", "session_switch", "session_fork", "session_clone"]);
@@ -135,6 +141,10 @@ export class HandoffHost implements HostHandler {
   readonly finished = new Promise<HostEnd>(resolve => { this.end = resolve; });
   private readonly registry: ProjectRegistry;
   private readonly projects: ProjectService;
+  private readonly accounts: AuthController;
+  /** pi's auth file changed and the running session has not reloaded it. */
+  private pendingApply = false;
+  private applyError?: string;
   constructor(private readonly hub: Hub, private readonly target: HandoffTarget, private readonly log: (line: string) => void,
     private readonly dependencies: HandoffDependencies = {}) {
     this.activeCwd = this.runtimeCwd = target.cwd; this.lastSessionFile = target.sessionFile;
@@ -142,6 +152,8 @@ export class HandoffHost implements HostHandler {
     const agentDir = dependencies.agentDir ?? getAgentDir();
     this.registry = new ProjectRegistry(agentDir);
     this.projects = new ProjectService({ agentDir, protectedDirectories: () => [agentDir, ...this.directories] });
+    this.accounts = new AuthController({ agentDir, publish: () => this.hub.publishAccountState(), changed: () => this.credentialsChanged(),
+      ...(dependencies.createAuthRuntime ? { createRuntime: dependencies.createAuthRuntime } : {}), ...(dependencies.accountLimitMs ? { limitMs: dependencies.accountLimitMs } : {}) });
     this.rememberDirectory(target.sessionDir ?? dirname(target.sessionFile));
   }
   get sessionFile(): string { return this.lastSessionFile; }
@@ -157,15 +169,113 @@ export class HandoffHost implements HostHandler {
     return { t: "host_state", revision: this.hostRevision, phase: this.phase === "recovery_required" ? "recovery_required" : this.phase === "ready" ? "ready" : "replacing", cwd: this.activeCwd,
       ...(recovery ? { recovery: { reason: recovery.reason, message: clip(recovery.message, 2000), targetCwd: recovery.target.cwd, previousCwd: recovery.previous.cwd, canRestore: recovery.canRestore } } : {}) };
   }
-  hostCommand(name: HostCommandName, args: Record<string, unknown> = {}, revision = this.hostRevision): Promise<unknown> {
+  hostCommand(name: HostCommandName, args: Record<string, unknown> = {}, revision = this.hostRevision, leaseId = ""): Promise<unknown> {
+    // Account commands act on the operation or provider they name, not on a page's picture of the host.
+    if (name === "account_begin") return this.accounts.begin(leaseId, String(args.provider), args.method === "oauth" ? "oauth" : "api_key");
+    if (name === "account_cancel") return Promise.resolve().then(() => { this.accounts.cancel(String(args.operationId)); return {}; });
+    if (name === "account_logout") return this.accounts.logout(String(args.provider)).then(() => ({ pendingApply: this.pendingApply }));
+    if (name === "account_apply") return this.applyCredentials(true).then(() => ({ pendingApply: this.pendingApply }));
+    if (revision !== this.hostRevision) return Promise.reject(new ProtocolError("stale_host", "The host state changed; check the page before trying again."));
     if (name === "recover_retry" || name === "recover_restore" || name === "host_stop")
       return this.recover(name === "recover_retry" ? "retry" : name === "recover_restore" ? "restore" : "stop").then(() => ({ phase: this.hostState().phase }));
     return this.projectCommand(name, args, revision);
   }
-  async hostQuery<A extends HostQueryAction>(action: A, args: Record<string, unknown> = {}): Promise<HostQueryValues[A]> {
+  accountState(leaseId: string): AccountState { return { t: "account_state", operation: this.accounts.view(leaseId) }; }
+  accountAnswer(leaseId: string, operationId: string, stepId: string, value: string): void { this.accounts.answer(leaseId, operationId, stepId, value); }
+  leaseEnded(leaseId: string): void { this.accounts.leaseEnded(leaseId); }
+  /**
+   * Providers as pi's auth file and the running session see them. The stored kind comes from pi's
+   * credential list; availability is what the session's model list offers. Neither resolves a key.
+   */
+  private async accountsView(): Promise<AccountsView> {
+    let providers: AccountsView["providers"] = [], storeError: string | undefined;
+    try { providers = await this.accounts.providers(); } catch (error) { storeError = clip(error instanceof Error ? error.message : String(error), 400); }
+    const available = this.phase === "ready" && this.child?.running
+      ? await this.child.request<{ models: Array<{ provider: string }> }>("get_available_models").then(result => result.models, () => []) : [];
+    const counts = new Map<string, number>();
+    for (const model of available) counts.set(model.provider, (counts.get(model.provider) ?? 0) + 1);
+    for (const provider of providers) { provider.models = counts.get(provider.id) ?? 0; counts.delete(provider.id); }
+    // Providers the session has but pi's built-in list does not: registered by an extension or models.json.
+    for (const [id, models] of counts) providers.push({ id: clip(id, 128), name: clip(id, 128), methods: [{ type: "api_key", label: "", web: false, reason: "extension" }], models, knownModels: models });
+    const rank = (provider: AccountsView["providers"][number]) => provider.stored ? 0 : provider.models ? 1 : 2;
+    providers.sort((a, b) => rank(a) - rank(b) || a.name.localeCompare(b.name));
+    return { providers, pendingApply: this.pendingApply, ...(this.applyError ? { applyError: this.applyError } : {}), ...(storeError ? { storeError } : {}) };
+  }
+  /** Saving or removing a credential does not reach a running session by itself. Apply at once when nothing is in progress. */
+  private credentialsChanged(): void {
+    this.pendingApply = true; this.applyError = undefined; this.touch();
+    void this.applyCredentials(false).catch(() => undefined);
+  }
+  /**
+   * Makes the running session reload pi's credentials, in process: a saved session is reopened on its
+   * own file and an unsaved one is replaced by a new one. Session ID, model and history stay; extensions
+   * keep their veto. Only when the session is idle; otherwise it stays pending until the user asks.
+   */
+  private applyCredentials(explicit: boolean): Promise<void> {
+    const waiting = (reason: string): Promise<void> => {
+      if (!explicit) return Promise.resolve();
+      this.applyError = reason; this.touch(); return Promise.reject(new ProtocolError("busy", reason));
+    };
+    if (!this.pendingApply) return Promise.resolve();
+    if (this.phase !== "ready" || !this.mirror || this.stopping) return waiting("No session is running to apply this to.");
+    if (this.dialogs.size || !this.mirror.idle || this.queuedWrites) return waiting("Wait until replies, queued messages and dialogs have settled, then apply.");
+    this.queuedWrites++;
+    const result = this.writes.then(async () => {
+      if (this.control) await this.control;
+      if (!this.pendingApply) return;
+      this.assertLive();
+      const outcome = await this.reloadRuntime();
+      if (outcome.cancelled) { this.applyError = "An extension declined to reload the session. The credential is saved; try again later."; throw new ProtocolError("apply_cancelled", this.applyError); }
+      this.pendingApply = false; this.applyError = undefined;
+    }).catch(error => {
+      if ((error as { code?: string }).code !== "apply_cancelled") this.applyError = clip(error instanceof Error ? error.message : String(error), 400);
+      throw error;
+    }).finally(() => { this.queuedWrites--; this.touch(); });
+    this.writes = result.catch(() => undefined); return result;
+  }
+  /** Reopens the current session in the same child so its model runtime is rebuilt. The lock and transcript stay as they are. */
+  private async reloadRuntime(): Promise<{ cancelled: boolean }> {
+    const child = this.child!; await this.mirror!.synchronize();
+    if (!this.mirror!.idle) throw new ProtocolError("busy", "Wait until replies and queued messages have settled.");
+    await this.verifyOwnedChanges();
+    const saved = existsSync(this.lastSessionFile), before = await this.currentModel(), sessionId = this.mirror!.sessionId;
+    this.clearDialogs("session_changed", true); const previousUi = this.ui;
+    this.ui = { revision: previousUi.revision + 1, statuses: {}, widgets: {} }; this.publishUi();
+    this.sessionChangePending = true;
+    let nextLock: SessionFileLock | undefined;
+    try {
+      const result = await child.request<{ cancelled?: boolean }>(saved ? "switch_session" : "new_session", saved ? { sessionPath: this.lastSessionFile } : {});
+      if (result.cancelled) {
+        this.ui = { ...previousUi, revision: this.ui.revision + 1 }; this.publishUi();
+        await this.mirror!.synchronize(); await this.lock!.acceptChanges(); return { cancelled: true };
+      }
+      const state = await child.request<{ sessionFile?: string }>("get_state");
+      if (!state.sessionFile) throw new Error("The reloaded RPC session has no session path.");
+      if (saved) {
+        if (!(await this.lock!.matchesPath(state.sessionFile))) throw new Error("The RPC child reopened a different session.");
+        await this.lock!.acceptChanges();
+      } else {
+        nextLock = await this.hold(state.sessionFile);
+        if (child.pid) await nextLock.setWriterPid(child.pid);
+        const previousLock = this.lock; this.lock = nextLock; nextLock = undefined;
+        await this.lock.acceptChanges(); await this.drop(previousLock);
+      }
+      await this.rebind("reload");
+      await this.reportModelChange(before, "before the account change", "账户变更前");
+      return { cancelled: false };
+    } catch (error) {
+      const state = await child.request<{ sessionFile?: string; sessionId?: string }>("get_state").catch(() => undefined);
+      const unchanged = !!state?.sessionFile && state.sessionId === sessionId && await this.lock?.matchesPath(state.sessionFile).catch(() => false);
+      if (!unchanged) await this.stop();
+      else { this.ui = { ...previousUi, revision: this.ui.revision + 1 }; this.publishUi(); }
+      throw error;
+    } finally { this.sessionChangePending = false; await this.drop(nextLock); }
+  }
+  async hostQuery<A extends HostQueryAction>(action: A, args: Record<string, unknown> = {}, _leaseId = ""): Promise<HostQueryValues[A]> {
     if (this.stopping) throw new ProtocolError("host_stopped", "The service is stopping.");
     let value: HostQueryValues[HostQueryAction];
-    if (action === "directories") value = await this.projects.directories(typeof args.path === "string" ? args.path : this.runtimeCwd);
+    if (action === "accounts") value = await this.accountsView();
+    else if (action === "directories") value = await this.projects.directories(typeof args.path === "string" ? args.path : this.runtimeCwd);
     else if (action === "project_inspect") value = await this.inspectProject(await this.projects.root(String(args.path)));
     else value = await this.projectsView();
     return value as HostQueryValues[A];
@@ -362,6 +472,8 @@ export class HandoffHost implements HostHandler {
       })(), new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new Error("RPC handoff startup timed out.")), 10_000); timer.unref?.(); })]);
       stopped();
       this.readyChild = child;
+      // A newly started child read pi's credentials itself.
+      this.pendingApply = false; this.applyError = undefined;
       if (!child.running) this.childExit(child, null);
     } catch (error) {
       unsubscribe(); this.mirror?.dispose(); this.bridge?.dispose(); this.mirror = undefined; this.bridge = undefined; this.workspace = undefined;
@@ -492,7 +604,7 @@ export class HandoffHost implements HostHandler {
         capabilities: [{ name: "session", available: true, detail: "RPC 新建、恢复、用户消息分叉、克隆与重命名。" }, { name: "workspace", available: true, detail: "文件和 Git 查询跟随当前会话 cwd。" },
           { name: "dialogs", available: true, detail: "RPC 扩展对话框在网页处理。" }, { name: "tools", available: false, detail: "需要 pi 上游提供 RPC 工具列表与启停。" },
           { name: "tree-navigation", available: false, detail: "需要 pi 上游提供 RPC tree 导航；可读取历史并从用户消息分叉。" },
-          { name: "authentication", available: false, detail: "Ctrl+C 后在终端使用 /login。" }, { name: "resource-management", available: false, detail: "安装和配置扩展仍在终端完成。" }] };
+          { name: "authentication", available: true, detail: "在“账户”里登录或退出 pi 内置的模型服务商；需要本机回调的登录方式仍在终端完成。" }, { name: "resource-management", available: false, detail: "安装和配置扩展仍在终端完成。" }] };
     } else if (action === "tree") {
       await this.mirror!.synchronize(); const entries = this.mirror!.getEntries().filter(entry => !isRecord(entry.message) || entry.message.role !== "system" || visibleText(entry.message.content).trim()); const retained = entries.slice(-2000);
       value = { entries: retained.map(entry => { const message = isRecord(entry.message) ? entry.message : undefined;
@@ -818,6 +930,7 @@ export class HandoffHost implements HostHandler {
   stop(): Promise<void> {
     if (this.stopPromise) return this.stopPromise;
     const remembered = this.phase === "ready" ? this.rememberSession(false) : Promise.resolve();
+    this.accounts.dispose();
     this.stopping = true; this.clearDialogs("stopped", true); this.mirror?.dispose(); this.bridge?.dispose(); this.unsubscribe?.();
     this.stopPromise = (async () => {
       try { await remembered; await this.child?.stop(); }

@@ -311,7 +311,7 @@ test("host state and host commands work without a session and share the lease's 
     const hostCalls: string[] = [];
     f.hub.setHostHandler({ command: async () => ({ disposition: "started" }), read: async () => ({ commands: [] }), answer: () => {}, pendingDialogs: () => [],
       uiState: () => ({ revision: 0, statuses: {}, widgets: {} }), hostState: () => ({ ...state }),
-      hostCommand: async (name: string) => { hostCalls.push(name); if (name === "recover_retry") throw new ProtocolError("recovery_required", "still failing"); return { phase: "ready" }; },
+      hostCommand: async (name: string, _args: unknown, revision: number) => { if (revision !== state.revision) throw new ProtocolError("stale_host", "changed"); hostCalls.push(name); if (name === "recover_retry") throw new ProtocolError("recovery_required", "still failing"); return { phase: "ready" }; },
     } as unknown as HostHandler);
     f.hub.suspendBridge("replacing");
     const c = await client(f.hub);
@@ -322,7 +322,7 @@ test("host state and host commands work without a session and share the lease's 
     // Session commands are refused while no session is bound; they still consume their number.
     c.send(envelope(welcome.clientId, f.hub, 1)); const refused = await c.wait("ack"); assert.ok(refused.t === "ack"); assert.equal(refused.error?.code, "stale_session"); assert.equal(f.calls(), 0);
     let from = c.frames.length;
-    c.send(host(2, "recover_restore", 2)); const stale = await c.wait("ack", from); assert.ok(stale.t === "ack"); assert.equal(stale.status, "rejected"); assert.equal(stale.error?.code, "stale_host"); assert.deepEqual(hostCalls, []);
+    c.send(host(2, "recover_restore", 2)); const stale = await c.wait("command_result", from); assert.ok(stale.t === "command_result"); assert.equal(stale.status, "failed"); assert.equal(stale.error?.code, "stale_host"); assert.deepEqual(hostCalls, []);
     from = c.frames.length;
     c.send(host(3, "recover_retry")); const failed = await c.wait("command_result", from); assert.ok(failed.t === "command_result"); assert.equal(failed.status, "failed"); assert.equal(failed.error?.code, "recovery_required");
     from = c.frames.length;
@@ -365,5 +365,46 @@ test("host queries are directed, need a lease but no session, and unauthenticate
     const outcome = await new Promise<string>(resolve => { anonymous.once("open", () => { anonymous.send(JSON.stringify({ t: "host_query", reqId: "q", action: "directories", args: {} })); }); anonymous.once("message", raw => resolve(raw.toString())); anonymous.once("close", () => resolve("closed")); anonymous.once("error", () => resolve("refused")); setTimeout(() => resolve("silent"), 500); });
     assert(!outcome.includes("entries")); assert.equal(asked.length, 2);
     anonymous.terminate(); await c.close(); await other.close();
+  } finally { await f.close(); }
+});
+test("login answers are directed, leave no receipt, and each lease gets its own view of the operation", async () => {
+  const f = await fixture();
+  try {
+    const answers: unknown[] = []; const ended: string[] = []; let owner = "";
+    f.hub.setHostHandler({ command: async () => ({}), read: async () => ({ commands: [] }), answer: () => {}, pendingDialogs: () => [], uiState: () => ({ revision: 0, statuses: {}, widgets: {} }),
+      hostState: () => ({ t: "host_state", revision: 1, phase: "ready", cwd: "/fixture" }),
+      hostCommand: async (name: string, _args: unknown, _revision: number, leaseId: string) => { if (name === "account_begin") owner = leaseId; return { operationId: "op-1" }; },
+      accountState: (leaseId: string) => ({ t: "account_state", operation: !owner ? null : leaseId === owner
+        ? { id: "op-1", providerId: "acme", providerName: "Acme", method: "api_key", status: "running", owner: true, startedAt: 1, expiresAt: 2, step: { id: "s1", kind: "secret", message: "Key" } }
+        : { id: "op-1", providerId: "acme", providerName: "Acme", method: "api_key", status: "running", owner: false, startedAt: 1, expiresAt: 2 } }),
+      accountAnswer: (leaseId: string, operationId: string, stepId: string, value: string) => { if (leaseId !== owner) throw new ProtocolError("not_owner", "not yours"); answers.push([operationId, stepId, value.length]); },
+      leaseEnded: (leaseId: string) => { ended.push(leaseId); },
+    } as unknown as HostHandler);
+    const a = await client(f.hub); const b = await client(f.hub);
+    const wa = await a.wait("welcome"); const wb = await b.wait("welcome"); assert.ok(wa.t === "welcome" && wb.t === "welcome");
+    assert.equal(a.frames.some(frame => frame.t === "account_state"), false); // nothing running: nothing sent
+    a.send({ t: "host_command", clientId: wa.clientId, commandNo: 1, id: `${wa.clientId}:1`, hostRevision: 999, command: "account_begin", args: { provider: "acme", method: "api_key" } });
+    await a.wait("command_result"); assert.equal(owner, wa.clientId);
+    f.hub.publishAccountState();
+    const mine = await a.wait("account_state"); const theirs = await b.wait("account_state");
+    assert.ok(mine.t === "account_state" && theirs.t === "account_state"); assert.equal(mine.operation?.step?.kind, "secret"); assert.equal(theirs.operation?.owner, false); assert.equal(theirs.operation?.step, undefined);
+    const secret = "sk-HUB-SENTINEL-0123456789";
+    let from = b.frames.length; b.send({ t: "account_answer", operationId: "op-1", stepId: "s1", value: secret });
+    const refused = await b.wait("account_error", from); assert.ok(refused.t === "account_error"); assert.equal(refused.error.code, "not_owner"); assert.deepEqual(answers, []);
+    const framesBefore = a.frames.length;
+    a.send({ t: "account_answer", operationId: "op-1", stepId: "s1", value: secret }); await until(() => answers.length === 1, "answer delivered");
+    assert.deepEqual(answers, [["op-1", "s1", secret.length]]);
+    // No acknowledgement, receipt or echo exists for the answer; the number sequence is untouched.
+    await delay(30); assert.equal(a.frames.slice(framesBefore).some(frame => frame.t === "ack" || frame.t === "command_result"), false);
+    from = a.frames.length; a.send({ t: "receipt_query", clientId: wa.clientId, id: `${wa.clientId}:2` }); const none = await a.wait("error", from); assert.ok(none.t === "error"); assert.equal(none.error.code, "not_seen");
+    assert(![...a.frames, ...b.frames].some(frame => JSON.stringify(frame).includes("SENTINEL")));
+    for (const bad of [{ t: "account_answer", operationId: "op-1", stepId: "s1", value: "x".repeat(8193) }, { t: "account_answer", operationId: "op-1", stepId: "s1", value: 1 }, { t: "account_answer", operationId: "op-1", stepId: "s1", value: "x", authPath: "/tmp/a" }]) {
+      from = a.frames.length; a.send(bad); const error = await a.wait("error", from); assert.ok(error.t === "error"); assert.equal(error.error.code, "invalid_envelope");
+    }
+    // A page that connects later is told that an operation is running, as its own lease may see it.
+    const late = await client(f.hub); const lateState = await late.wait("account_state"); assert.ok(lateState.t === "account_state"); assert.equal(lateState.operation?.owner, false);
+    // Revoking access ends every lease, and the host is told so it can cancel an operation nobody may see any more.
+    f.hub.rotateToken(); assert(ended.includes(wa.clientId) && ended.includes(wb.clientId));
+    await until(() => a.closed() && b.closed() && late.closed(), "revoked viewers disconnected");
   } finally { await f.close(); }
 });

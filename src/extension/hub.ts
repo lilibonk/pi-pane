@@ -8,7 +8,7 @@ import type { Duplex } from "node:stream";
 import { WebSocket, WebSocketServer, type RawData } from "ws";
 import {
   LIMITS, PROTOCOL, WS_PATH, ProtocolError, isRecord, parseClientMessage, toWireError,
-  commandArgs, hostCommandArgs, hostQueryArgs, type HostQuery, type HostQueryAction, type HostQueryValues, type Ack, type ClientMessage, type CommandEnvelope, type CommandResult, type HostCommandEnvelope, type HostCommandName, type HostState, type ProjectionEvent, type ServerMessage,
+  commandArgs, hostCommandArgs, hostQueryArgs, type AccountState, type HostQuery, type HostQueryAction, type HostQueryValues, type Ack, type ClientMessage, type CommandEnvelope, type CommandResult, type HostCommandEnvelope, type HostCommandName, type HostState, type ProjectionEvent, type ServerMessage,
   type ExtensionUiState, type WorkbenchAction, type WorkbenchValues,
 } from "../protocol/index.js";
 import type { Bridge } from "./bridge.js";
@@ -34,8 +34,14 @@ export interface HostHandler {
   uiState(): ExtensionUiState;
   /** Host state and its commands do not depend on a live session. */
   hostState?(): HostState;
-  hostCommand?(name: HostCommandName, args: Record<string, unknown>, revision: number): Promise<unknown>;
-  hostQuery?(action: HostQueryAction, args: Record<string, unknown>): Promise<HostQueryValues[HostQueryAction]>;
+  /** `revision` is the host state the viewer acted on; the handler decides which commands depend on it. */
+  hostCommand?(name: HostCommandName, args: Record<string, unknown>, revision: number, leaseId: string): Promise<unknown>;
+  hostQuery?(action: HostQueryAction, args: Record<string, unknown>, leaseId: string): Promise<HostQueryValues[HostQueryAction]>;
+  /** The account operation as this lease may see it: its steps go to the lease that started it only. */
+  accountState?(leaseId: string): AccountState;
+  accountAnswer?(leaseId: string, operationId: string, stepId: string, value: string): void;
+  /** A lease expired or was revoked. */
+  leaseEnded?(leaseId: string): void;
 }
 export interface HubOptions {
   host?: string;
@@ -350,7 +356,7 @@ export class Hub {
   private revoke(session: AuthSession, reason: string): void {
     clearTimeout(session.timer);
     this.authSessions.delete(session.digest);
-    for (const [id, lease] of this.leases) if (lease.auth === session) this.leases.delete(id);
+    for (const [id, lease] of this.leases) if (lease.auth === session) { this.leases.delete(id); this.hostHandler?.leaseEnded?.(id); }
     for (const peer of this.peers) if (peer.auth === session) { peer.socket.close(AUTH_EXPIRED, reason); this.terminateLater(peer); }
   }
   private pruneAuth(): void {
@@ -408,6 +414,8 @@ export class Hub {
       // Before the snapshot: a page that (re)connects during a failed switch must see the recovery state.
       const hostState = this.hostHandler?.hostState?.();
       if (hostState) this.send(peer, hostState);
+      const accountState = this.hostHandler?.accountState?.(lease.id);
+      if (accountState?.operation) this.send(peer, accountState);
       this.sendSnapshot(peer);
       this.notifyCount();
       return;
@@ -423,6 +431,14 @@ export class Hub {
     if (message.t === "history_page" || message.t === "content_page" || message.t === "image_page") { this.page(peer, message); return; }
     if (message.t === "workbench_query") { void this.workbench(peer, message); return; }
     if (message.t === "host_query") { void this.hostQuery(peer, message); return; }
+    if (message.t === "account_answer") {
+      // Not a numbered command: the value may be a secret, so nothing about it is retained here.
+      try {
+        if (!this.hostHandler?.accountAnswer) throw new ProtocolError("host_unavailable", "The RPC session host is not ready.");
+        this.hostHandler.accountAnswer(lease.id, message.operationId, message.stepId, message.value);
+      } catch (error) { this.send(peer, { t: "account_error", operationId: message.operationId, stepId: message.stepId, error: toWireError(error) }); }
+      return;
+    }
     if (message.clientId !== lease.id) throw new ProtocolError("client_mismatch", "Command does not belong to this connection.");
     if (message.t === "receipt_query") {
       const prefix = `${lease.id}:`;
@@ -452,9 +468,8 @@ export class Hub {
   private hostCommand(peer: Peer, lease: Lease, command: HostCommandEnvelope): void {
     this.dispatch(peer, lease, command, this._epoch, () => {
       const handler = this.hostHandler;
-      if (!handler?.hostState || !handler.hostCommand) throw new ProtocolError("host_unavailable", "The RPC session host is not ready.");
-      if (command.hostRevision !== handler.hostState().revision) throw new ProtocolError("stale_host", "The host state changed; check the page before trying again.");
-      return handler.hostCommand(command.command, hostCommandArgs(command.command, command.args), command.hostRevision);
+      if (!handler?.hostCommand) throw new ProtocolError("host_unavailable", "The RPC session host is not ready.");
+      return handler.hostCommand(command.command, hostCommandArgs(command.command, command.args), command.hostRevision, lease.id);
     });
   }
   private command(peer: Peer, lease: Lease, command: CommandEnvelope): void {
@@ -536,7 +551,7 @@ export class Hub {
       if ((peer.workbenchReads ?? 0) >= 8 || this.workbenchReads >= 16) throw new ProtocolError("busy", "Too many reads are in progress.");
       peer.workbenchReads = (peer.workbenchReads ?? 0) + 1; this.workbenchReads++; counted = true;
       if (!this.hostHandler?.hostQuery) throw new ProtocolError("host_unavailable", "The RPC session host is not ready.");
-      const value = await this.hostHandler.hostQuery(message.action, hostQueryArgs(message.action, message.args));
+      const value = await this.hostHandler.hostQuery(message.action, hostQueryArgs(message.action, message.args), peer.lease!.id);
       this.send(peer, { t: "host_result", reqId: message.reqId, action: message.action, value });
     } catch (error) {
       this.send(peer, { t: "host_result", reqId: message.reqId, action: message.action, error: toWireError(error) });
@@ -564,7 +579,7 @@ export class Hub {
   }
   private pruneLeases(): void {
     for (const [id, lease] of this.leases) if (lease.expiresAt <= Date.now()) {
-      this.leases.delete(id);
+      this.leases.delete(id); this.hostHandler?.leaseEnded?.(id);
       for (const peer of this.peers) if (peer.lease === lease) peer.socket.close(1008, "client_expired");
     }
   }
@@ -602,6 +617,10 @@ export class Hub {
   private hostHandler?: HostHandler;
   setHostHandler(handler: HostHandler | undefined): void { this.hostHandler = handler; }
   get hosted(): boolean { return !!this.hostHandler; }
+  /** The account operation changed. Each viewer gets its own view: steps and codes go to the owning lease only. */
+  publishAccountState(): void {
+    for (const peer of this.peers) { const state = peer.lease && this.hostHandler?.accountState?.(peer.lease.id); if (state) this.send(peer, state); }
+  }
   /** The host's own state changed: every viewer learns it, with or without a session. */
   publishHostState(): void { const state = this.hostHandler?.hostState?.(); if (state) this.broadcast(state); }
   /** Unsequenced notices from the session host (dialogs), delivered to every authenticated viewer. */
@@ -660,6 +679,7 @@ export class Hub {
     this._token = token;
     for (const session of this.authSessions.values()) clearTimeout(session.timer);
     this.authSessions.clear();
+    for (const id of this.leases.keys()) this.hostHandler?.leaseEnded?.(id);
     this.leases.clear();
     for (const peer of this.peers) { peer.socket.close(1008, "token_rotated"); this.terminateLater(peer); }
     try { this.options.onCredentialRotation?.(this.url); } catch { /* Rotation still revokes access. */ }

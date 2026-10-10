@@ -46,6 +46,8 @@
     "m3:handoff": "node scripts/m3-handoff.mjs",
     "m31:runtime": "node --import tsx scripts/m31-runtime.mjs",
     "m31:projects": "node --import tsx scripts/m31-projects.mjs",
+    "m31:auth": "node --import tsx scripts/m31-auth.mjs",
+    "m31:auth-real": "node --import tsx scripts/m31-auth-real.mjs",
     "m31:gates": "node --import tsx scripts/m31-g1.mjs && node --import tsx scripts/m31-g2.mjs && node --import tsx scripts/m31-g3.mjs && node --import tsx scripts/m31-g4g5.mjs"
   },
   "peerDependencies": {

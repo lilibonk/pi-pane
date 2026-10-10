@@ -1,6 +1,6 @@
 /** Wire contract. Only broadcast events consume sequence numbers. */
 import { WORKBENCH_ACTIONS, type WorkbenchQuery, type WorkbenchResult } from "./workbench.js";
-import { HOST_QUERIES, type HostQuery, type HostQueryAction, type HostResult } from "./host.js";
+import { HOST_QUERIES, type AccountAnswer, type AccountAnswerError, type AccountState, type HostQuery, type HostQueryAction, type HostResult } from "./host.js";
 export * from "./workbench.js";
 export * from "./host.js";
 export const PROTOCOL = "pi-pane.v1";
@@ -43,6 +43,8 @@ export const LIMITS = {
   imagesTotalBytes: 10 * 1024 * 1024,
   imagePixels: 20_000_000,
   commandFrameBytes: 16 * 1024 * 1024,
+  /** One answer to a login step: a key, a pasted code or a pasted redirect address. */
+  accountAnswerChars: 8192,
   /** One image_page response (decoded bytes); larger history images are not sent. */
   imageReadBytes: 5 * 1024 * 1024,
   /** Browser-side cap for decoded history images held as object URLs. */
@@ -55,7 +57,8 @@ export type ImageType = (typeof IMAGE_TYPES)[number];
 export const COMMANDS = ["prompt", "abort", "set_model", "set_thinking", "compact", "session_new", "session_switch", "session_fork", "session_clone", "session_rename", "run_command", "access_rotate"] as const;
 export type CommandName = (typeof COMMANDS)[number];
 /** Commands about the host itself. They need no live session: a failed runtime replacement is recovered through them. */
-export const HOST_COMMANDS = ["recover_retry", "recover_restore", "host_stop", "project_open", "project_create", "project_remove", "project_relocate"] as const;
+export const HOST_COMMANDS = ["recover_retry", "recover_restore", "host_stop", "project_open", "project_create", "project_remove", "project_relocate",
+  "account_begin", "account_cancel", "account_logout", "account_apply"] as const;
 export type HostCommandName = (typeof HOST_COMMANDS)[number];
 
 /** `total` is present when `text` is a prefix of a longer block readable through content_page. */
@@ -283,7 +286,8 @@ export type ClientMessage =
   | WorkbenchQuery
   | CommandEnvelope
   | HostCommandEnvelope
-  | HostQuery;
+  | HostQuery
+  | AccountAnswer;
 export type ServerMessage =
   | { t: "welcome"; clientId: string; leaseExpiresAt: number; nextCommandNo: number }
   | Snapshot
@@ -292,6 +296,8 @@ export type ServerMessage =
   | { t: "switching"; reason: string }
   | HostState
   | HostResult
+  | AccountState
+  | AccountAnswerError
   | { t: "notice"; message: string }
   | UiRequest
   | ({ t: "ui_state" } & ExtensionUiState)
@@ -366,6 +372,9 @@ export function parseClientMessage(value: unknown): ClientMessage {
     hostCommandArgs(value.command as HostCommandName, value.args);
     return value as unknown as HostCommandEnvelope;
   }
+  // A login answer may be a secret. It has no command number, so no receipt or digest of it is ever kept.
+  if (value.t === "account_answer" && exactKeys(value, ["t", "operationId", "stepId", "value"]) && shortString(value.operationId, 64) && shortString(value.stepId, 64) &&
+      typeof value.value === "string" && value.value.length <= LIMITS.accountAnswerChars) return value as unknown as AccountAnswer;
   if (value.t === "host_query" && exactKeys(value, ["t", "reqId", "action", "args"]) && shortString(value.reqId, 64) &&
       HOST_QUERIES.includes(value.action as HostQueryAction)) {
     hostQueryArgs(value.action as HostQueryAction, value.args);
@@ -387,6 +396,13 @@ export function hostCommandArgs(command: HostCommandName, value: unknown): Recor
       throw new ProtocolError("invalid_args", "Provide an existing parent directory and one folder name.");
   } else if (command === "project_remove") {
     if (!exactKeys(value, ["path"]) || !hostPath(value.path)) throw new ProtocolError("invalid_args", "Provide the project path to remove from the list.");
+  } else if (command === "account_begin") {
+    if (!exactKeys(value, ["provider", "method"]) || !shortString(value.provider, 128) || (value.method !== "api_key" && value.method !== "oauth"))
+      throw new ProtocolError("invalid_args", "Provide a provider and a login method.");
+  } else if (command === "account_cancel") {
+    if (!exactKeys(value, ["operationId"]) || !shortString(value.operationId, 64)) throw new ProtocolError("invalid_args", "Provide the operation to cancel.");
+  } else if (command === "account_logout") {
+    if (!exactKeys(value, ["provider"]) || !shortString(value.provider, 128)) throw new ProtocolError("invalid_args", "Provide the provider to sign out of.");
   } else if (command === "project_relocate") {
     if (!exactKeys(value, ["from", "to"]) || !hostPath(value.from) || !hostPath(value.to)) throw new ProtocolError("invalid_args", "Provide the listed project path and its new directory.");
   } else if (Object.keys(value).length) throw new ProtocolError("invalid_args", "This host command takes no arguments.");

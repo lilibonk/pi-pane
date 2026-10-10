@@ -320,6 +320,22 @@ div.code-block > pre.shiki { white-space: pre; }
 .dialog .create-preview code, .dialog .trust-path { font-family: var(--mono, ui-monospace, monospace); color: var(--fg); overflow-wrap: anywhere; }
 .dialog .error-text { color: var(--err); margin: 10px 0 0; }
 .dialog-options button span { display: block; margin-top: 2px; font-size: 11px; color: var(--fg-muted); }
+.account-item .account-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin-top: 8px; }
+.account-item .account-actions button { font-size: 11px; padding: 4px 9px; }
+.account-reason { font-size: 11px; line-height: 1.6; color: var(--fg-muted); }
+p.account-reason { margin: 6px 0 0; }
+.account-banner { display: flex; align-items: center; gap: 10px; margin: 0 12px 10px; padding: 8px 10px; border: 1px solid var(--border); border-radius: 6px; font-size: 12px; line-height: 1.6; color: var(--warn); background: color-mix(in srgb, var(--warn) 8%, var(--bg)); }
+.account-banner span { flex: 1; }
+.account-banner button { flex-shrink: 0; font-size: 11px; padding: 4px 9px; }
+.account-more { margin: 4px 12px 10px; font-size: 11px; color: var(--fg-muted); }
+.account-step { display: flex; flex-direction: column; gap: 8px; }
+.account-step label { font-size: 13px; color: var(--fg); }
+.account-step input { font: inherit; font-size: 14px; font-family: var(--mono, ui-monospace, monospace); padding: 8px 10px; border: 1px solid var(--border); border-radius: 6px; background: transparent; color: var(--fg); }
+.account-step button { align-self: flex-end; }
+.dialog .account-hint { font-size: 11px; color: var(--fg-muted); margin: 0 0 8px; }
+.account-device a { overflow-wrap: anywhere; color: var(--accent); }
+.dialog .account-code { display: flex; align-items: center; gap: 12px; font-family: var(--mono, ui-monospace, monospace); font-size: 22px; letter-spacing: 0.08em; color: var(--fg); user-select: all; }
+.account-code button { font-size: 11px; letter-spacing: 0; padding: 3px 8px; user-select: none; }
 .new-session-button { margin: 0 12px 12px; display: flex; align-items: center; justify-content: center; gap: 7px; padding: 8px; color: var(--fg); background: color-mix(in srgb, var(--fg) 3%, var(--sidebar-bg)); }
 .panel-search { display: flex; align-items: center; gap: 7px; margin: 0 12px 12px; padding: 7px 9px; border: 1px solid var(--border); border-radius: 6px; color: var(--fg-muted); }
 .panel-search input { font: inherit; font-size: 12px; width: 100%; min-width: 0; color: var(--fg); border: 0; outline: none; background: transparent; }

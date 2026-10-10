@@ -121,7 +121,7 @@ export function ProjectSection({ state, canSwitch, onSwitched }: { state: WebSta
 }
 
 /** A modal that owns focus while open and gives it back afterwards. Rendered as a child of the app shell. */
-function Modal({ titleId, onClose, wide, children }: { titleId: string; onClose: () => void; wide?: boolean; children: ComponentChildren }) {
+export function Modal({ titleId, onClose, wide, children }: { titleId: string; onClose: () => void; wide?: boolean; children: ComponentChildren }) {
   const panel = useRef<HTMLDivElement>(null);
   const close = useRef(onClose); close.current = onClose;
   useLayoutEffect(() => {
@@ -132,7 +132,7 @@ function Modal({ titleId, onClose, wide, children }: { titleId: string; onClose:
     const background = [...(shell?.children ?? [])].filter(child => child !== element.parentElement) as HTMLElement[];
     const inertStates = background.map(child => child.inert);
     for (const child of background) child.inert = true;
-    const controls = () => [...element.querySelectorAll<HTMLElement>('button:not(:disabled), input:not(:disabled)')].filter(control => control.getClientRects().length);
+    const controls = () => [...element.querySelectorAll<HTMLElement>('button:not(:disabled), input:not(:disabled), a[href]')].filter(control => control.getClientRects().length);
     (element.querySelector<HTMLElement>("[data-autofocus]") || controls()[0] || element).focus();
     const keys = (event: KeyboardEvent) => {
       if (event.key === "Escape") { event.preventDefault(); close.current(); return; }

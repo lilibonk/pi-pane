@@ -9,6 +9,8 @@ import { SessionFileLock } from "../src/extension/session-lock.js";
 import type { Hub } from "../src/extension/hub.js";
 import type { Bridge } from "../src/extension/bridge.js";
 import type { HostState } from "../src/protocol/index.js";
+import type { AuthInteraction } from "@earendil-works/pi-ai";
+import type { AuthRuntime } from "../src/extension/auth-controller.js";
 import { RpcReadTimeoutError, type RpcConnection, type RpcRecord } from "../src/extension/rpc-child.js";
 
 class FakeChild implements RpcConnection {
@@ -27,7 +29,10 @@ class FakeChild implements RpcConnection {
   commands = [{ name: "mark", description: "record", source: "extension" }, { name: "shared", source: "prompt" }, { name: "shared", source: "extension" }, { name: "model", source: "extension" }];
   intercept?: (type: string, payload: Record<string, unknown>) => Promise<{ intercepted: boolean; value?: unknown }>;
   constructor(manager: SessionManager, private readonly root: string) { this.manager = manager; this.entries = manager.getEntries() as unknown as Record<string, unknown>[]; }
-  start() { this.running = true; }
+  /** Like pi: the model runtime reads stored credentials when a session is opened, not while it runs. */
+  credentials?: () => string[];
+  loaded: string[] = [];
+  start() { this.running = true; this.loaded = this.credentials?.() ?? []; }
   emit(record: RpcRecord) { for (const listener of this.listeners) listener(record); }
   onRecord(listener: (record: RpcRecord) => void) { this.listeners.add(listener); return () => this.listeners.delete(listener); }
   respondUi(id: string, response: Record<string, unknown>) { this.responses.push({ id, response }); this.onUiResponse?.(id, response); }
@@ -53,11 +58,12 @@ class FakeChild implements RpcConnection {
       const since = entries.findIndex(entry => entry.id === payload.since);
       if (payload.since && since < 0) throw new Error(`Entry ${String(payload.since)} not found`);
       value = { entries: structuredClone(payload.since ? entries.slice(since + 1) : entries), leafId: entries.at(-1)?.id ?? null };
-    } else if (type === "get_available_models") value = { models: [this.model] };
+    } else if (type === "get_available_models") value = { models: [this.model, ...this.loaded.map(provider => ({ provider, id: `${provider}-model`, name: provider }))] };
     else if (type === "get_available_thinking_levels") value = { levels: ["off", "low", "high"] };
     else if (type === "get_commands") value = { commands: this.commands };
     else if (["new_session", "switch_session", "fork", "clone"].includes(type)) {
       if (this.cancelNext) { this.cancelNext = false; return { cancelled: true } as T; }
+      this.loaded = this.credentials?.() ?? [];
       if (type === "switch_session") this.manager = SessionManager.open(String(payload.sessionPath));
       else {
         const next = SessionManager.create(this.manager.getCwd(), join(this.root, "custom"));
@@ -76,11 +82,27 @@ class FakeChild implements RpcConnection {
     return value as T;
   }
 }
+/** pi's auth runtime as the controller uses it: a credential map and a login that is scripted per test. */
+class FakeAuth implements AuthRuntime {
+  stored = new Map<string, { type: "api_key" | "oauth"; key?: string }>();
+  script: (provider: string, type: "api_key" | "oauth", interaction: AuthInteraction) => Promise<{ type: "api_key" | "oauth"; key?: string }> =
+    async (_provider, type, interaction) => ({ type, key: await interaction.prompt({ type: "secret", message: "Enter API key" }) });
+  logins = 0;
+  getProviders() { return [{ id: "acme", name: "Acme AI", auth: { apiKey: { name: "Acme API key", login: true }, oauth: { name: "Acme subscription" } } },
+    { id: "kimi-coding", name: "Kimi For Coding", auth: { apiKey: { name: "Kimi API key", login: true }, oauth: { name: "Kimi Code (subscription)" } } },
+    { id: "cloud", name: "Cloud Ambient", auth: { apiKey: { name: "Cloud credentials" } } }]; }
+  getModels(id: string) { return id === "acme" ? [1, 2] : id === "kimi-coding" ? [1] : []; }
+  async listCredentials() { return [...this.stored].map(([providerId, value]) => ({ providerId, type: value.type })); }
+  async login(provider: string, type: "api_key" | "oauth", interaction: AuthInteraction) { this.logins++; const credential = await this.script(provider, type, interaction); this.stored.set(provider, credential); return credential; }
+  async logout(provider: string) { this.stored.delete(provider); }
+}
 interface Fixture {
   root: string; foreign: SessionManager; bridges: Bridge[]; notices: unknown[];
   /** Every child the host started, with its arguments and directory. The first is the handoff child. */
   launches: { args: string[]; cwd: string; child: FakeChild }[];
-  suspended: string[]; logs: string[]; hostStates: HostState[];
+  suspended: string[]; logs: string[]; hostStates: HostState[]; accountStates: number;
+  /** Scripted stand-in for pi's auth runtime; its credentials are what the fake children report as available. */
+  auth: FakeAuth;
   /** Adjusts a replacement child before the host starts it. */
   prepare?: (child: FakeChild, cwd: string) => void;
 }
@@ -93,9 +115,10 @@ async function withHost(run: (host: HandoffHost, child: FakeChild, fixture: Fixt
   const foreign = SessionManager.create(other, custom); foreign.appendMessage({ role: "user", content: "foreign", timestamp: 4 });
   foreign.appendMessage({ role: "assistant", content: [{ type: "text", text: "foreign answer" }], api: "fixture", provider: "local", model: "fixture", timestamp: 5, stopReason: "stop", usage: { input: 0, output: 0, totalTokens: 0, cacheRead: 0, cacheWrite: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } } } as never);
   const child = new FakeChild(manager, root); const bridges: Bridge[] = []; const notices: unknown[] = [];
+  child.credentials = () => [...fixture.auth.stored.keys()];
   beforeStart?.(child);
-  const fixture: Fixture = { root, foreign, bridges, notices, launches: [], suspended: [], logs: [], hostStates: [] };
-  const hub = { setHostHandler() {}, bindBridge(bridge: Bridge) { bridges.push(bridge); }, notifyAll(record: unknown) { notices.push(record); }, suspendBridge(reason: string) { fixture.suspended.push(reason); }, publishHostState() { fixture.hostStates.push(host.hostState()); } } as unknown as Hub;
+  const fixture: Fixture = { root, foreign, bridges, notices, launches: [], suspended: [], logs: [], hostStates: [], accountStates: 0, auth: new FakeAuth() };
+  const hub = { setHostHandler() {}, bindBridge(bridge: Bridge) { bridges.push(bridge); }, notifyAll(record: unknown) { notices.push(record); }, suspendBridge(reason: string) { fixture.suspended.push(reason); }, publishHostState() { fixture.hostStates.push(host.hostState()); }, publishAccountState() { fixture.accountStates++; } } as unknown as Hub;
   const theme = { appearance: "dark", colors: {} } as unknown as ExtensionContext["ui"]["theme"];
   // Like pi: `--session` opens that transcript; without it the child creates a session in its directory.
   const createChild = (args: string[], directory: string): FakeChild => {
@@ -103,11 +126,12 @@ async function withHost(run: (host: HandoffHost, child: FakeChild, fixture: Fixt
     if (fixture.launches.length) {
       const session = args.includes("--session") ? args[args.indexOf("--session") + 1] : undefined;
       next = new FakeChild(session ? SessionManager.open(session) : SessionManager.create(directory, custom), root);
+      next.credentials = () => [...fixture.auth.stored.keys()];
       fixture.prepare?.(next, directory);
     }
     fixture.launches.push({ args, cwd: directory, child: next }); return next;
   };
-  const host = new HandoffHost(hub, { sessionFile: manager.getSessionFile()!, sessionDir: custom, cwd, argv, theme, themes: [] }, line => { fixture.logs.push(line); }, { createChild, plannedStopMs: 50, agentDir: join(root, "agent"),
+  const host = new HandoffHost(hub, { sessionFile: manager.getSessionFile()!, sessionDir: custom, cwd, argv, theme, themes: [] }, line => { fixture.logs.push(line); }, { createChild, plannedStopMs: 50, agentDir: join(root, "agent"), createAuthRuntime: async () => fixture.auth, accountLimitMs: 400,
     listAll: ((directory?: string) => child.catalogOverride ? Promise.resolve(child.catalogOverride) : directory ? SessionManager.listAll(directory) : Promise.resolve([])) as typeof SessionManager.listAll });
   try { await host.start(); await run(host, child, fixture); }
   finally { await host.stop(); await rm(root, { recursive: true, force: true }); }
@@ -557,4 +581,102 @@ test("an unreadable project list is left untouched, reported, and does not block
   await host.hostCommand("project_open", { path: empty }); assert.equal(host.cwd, await realpath(empty));
   assert.equal(await readFile(file, "utf8"), "{ not json"); assert(logs.some(line => line.includes("project list was not updated")));
   await assert.rejects(host.hostCommand("project_remove", { path: join(root, "other") }), { code: "registry_corrupt" });
+}));
+const waitFor = async <T>(read: () => T | undefined | null | false | Promise<T | undefined | null | false>, label = "condition"): Promise<T> => {
+  for (let index = 0; index < 400; index++) { const value = await read(); if (value) return value; await new Promise(resolve => setTimeout(resolve, 5)); }
+  throw new Error(`Timed out: ${label}`);
+};
+async function signIn(host: HandoffHost, lease: string, provider: string, key: string) {
+  const { operationId } = await host.hostCommand("account_begin", { provider, method: "api_key" }, 0, lease) as { operationId: string };
+  const step = await waitFor(() => host.accountState(lease).operation?.step, "key step");
+  host.accountAnswer(lease, operationId, step.id, key);
+  await waitFor(() => host.accountState(lease).operation?.status === "saved", "saved");
+}
+const models = async (host: HandoffHost, provider: string) => (await host.hostQuery("accounts")).providers.find(item => item.id === provider);
+test("a key saved from the browser reaches the running session in process: same child, same session, same lock", async () => withHost(async (host, child, { launches, bridges, auth, hostStates }) => {
+  const session = host.sessionFile, sessionId = bridges[0]!.sessionId;
+  let accounts = await host.hostQuery("accounts");
+  assert.deepEqual(accounts.providers.map(provider => [provider.id, provider.stored, provider.models]), [["local", undefined, 1], ["acme", undefined, 0], ["cloud", undefined, 0], ["kimi-coding", undefined, 0]]);
+  assert.deepEqual(accounts.providers[0]!.methods, [{ type: "api_key", label: "", web: false, reason: "extension" }]); assert.equal(accounts.pendingApply, false);
+  // Stale page state does not block an account command; it has its own operation identity.
+  await signIn(host, "lease-1", "acme", "sk-web-key");
+  await waitFor(() => !child.calls.every(call => call.type !== "switch_session") && host.hostState().phase === "ready", "applied");
+  await waitFor(async () => (await models(host, "acme"))?.models === 1, "model list refreshed");
+  accounts = await host.hostQuery("accounts");
+  assert.deepEqual(accounts.providers.map(provider => [provider.id, provider.stored, provider.models]).slice(0, 2), [["acme", "api_key", 1], ["local", undefined, 1]]); assert.equal(accounts.pendingApply, false);
+  assert.deepEqual(child.calls.filter(call => call.type === "switch_session").map(call => call.payload.sessionPath), [session]);
+  assert.equal(launches.length, 1); assert.equal(child.running, true); assert.equal(host.sessionFile, session); assert.equal(bridges.at(-1)?.sessionId, sessionId); assert.equal(bridges.length, 2);
+  assert.equal((await SessionFileLock.inspect(session))?.pid, process.pid); assert.equal(auth.stored.get("acme")?.key, "sk-web-key");
+  assert(!JSON.stringify([accounts, host.accountState("lease-1"), host.hostState(), hostStates]).includes("sk-web-key"));
+  await host.command("prompt", { text: "still the same conversation" });
+  // Signing out removes the stored credential and is applied the same way.
+  assert.deepEqual(await host.hostCommand("account_logout", { provider: "acme" }, 0, "lease-2"), { pendingApply: true });
+  await waitFor(() => child.calls.filter(call => call.type === "switch_session").length === 2, "logout applied");
+  await waitFor(async () => (await host.hostQuery("accounts")).pendingApply === false, "apply settled");
+  assert.deepEqual([(await models(host, "acme"))?.stored, (await models(host, "acme"))?.models], [undefined, 0]);
+  await assert.rejects(host.hostCommand("account_logout", { provider: "acme" }, 0, "lease-2"), { code: "not_stored" });
+}));
+test("an unsaved session is replaced by a new one to apply a credential; its lock follows", async () => withHost(async (host, _child, { root, launches }) => {
+  const empty = join(root, "empty"); await mkdir(empty); await host.hostCommand("project_open", { path: empty });
+  const runtime = launches[1]!.child, before = host.sessionFile;
+  await signIn(host, "lease-1", "acme", "sk-key");
+  await waitFor(() => runtime.calls.some(call => call.type === "new_session"), "new session");
+  await waitFor(async () => (await host.hostQuery("accounts")).pendingApply === false, "apply settled");
+  assert(!runtime.calls.some(call => call.type === "switch_session")); assert.equal(launches.length, 2); assert.equal((await models(host, "acme"))?.models, 1);
+  assert.notEqual(host.sessionFile, before); assert.equal(await SessionFileLock.inspect(before), undefined); assert.equal((await SessionFileLock.inspect(host.sessionFile))?.pid, process.pid);
+  assert.equal(host.cwd, await realpath(empty));
+}));
+test("a credential saved while pi is busy waits for the user; it is never applied behind a running reply", async () => withHost(async (host, child) => {
+  child.streaming = true; await host.read("tree");
+  await signIn(host, "lease-1", "acme", "sk-key");
+  await new Promise(resolve => setTimeout(resolve, 40));
+  let accounts = await host.hostQuery("accounts"); assert.equal(accounts.pendingApply, true); assert.equal(accounts.providers.find(provider => provider.id === "acme")?.stored, "api_key"); assert.equal(accounts.providers.find(provider => provider.id === "acme")?.models, 0);
+  assert(!child.calls.some(call => call.type === "switch_session"));
+  await assert.rejects(host.hostCommand("account_apply", {}, 0, "lease-2"), { code: "busy" });
+  assert.match((await host.hostQuery("accounts")).applyError ?? "", /settled/);
+  child.streaming = false; await host.read("tree"); await new Promise(resolve => setTimeout(resolve, 40));
+  assert(!child.calls.some(call => call.type === "switch_session"), "the end of a reply does not trigger the apply");
+  assert.deepEqual(await host.hostCommand("account_apply", {}, 0, "lease-2"), { pendingApply: false }); // any signed-in page may apply
+  accounts = await host.hostQuery("accounts"); assert.equal(accounts.pendingApply, false); assert.equal(accounts.applyError, undefined); assert.equal(accounts.providers.find(provider => provider.id === "acme")?.models, 1);
+  assert.deepEqual(await host.hostCommand("account_apply", {}, 0, "lease-2"), { pendingApply: false }); assert.equal(child.calls.filter(call => call.type === "switch_session").length, 1);
+}));
+test("an extension may decline the reload: the credential stays saved, the session stays usable, and applying can be retried", async () => withHost(async (host, child, { auth }) => {
+  child.cancelNext = true;
+  await signIn(host, "lease-1", "acme", "sk-key");
+  await waitFor(async () => (await host.hostQuery("accounts")).applyError, "declined");
+  const accounts = await host.hostQuery("accounts"); assert.equal(accounts.pendingApply, true); assert.match(accounts.applyError!, /declined/); assert.equal(auth.stored.has("acme"), true);
+  assert.equal(child.running, true); await host.command("prompt", { text: "old runtime still answers" });
+  assert.deepEqual(await host.hostCommand("account_apply", {}, 0, "lease-1"), { pendingApply: false }); assert.equal((await models(host, "acme"))?.models, 1);
+}));
+test("login steps are private to the starting page, survive its absence, and end with the service", async () => withHost(async (host, _child, fixture) => {
+  let approve!: () => void;
+  fixture.auth.script = async (_provider, type, interaction) => {
+    interaction.notify({ type: "device_code", userCode: "QRST-UVWX", verificationUri: "https://provider.example/device", expiresInSeconds: 600 });
+    await new Promise<void>((resolve, reject) => { approve = resolve; interaction.signal!.addEventListener("abort", () => reject(new Error("aborted"))); });
+    return { type };
+  };
+  const published = fixture.accountStates;
+  const { operationId } = await host.hostCommand("account_begin", { provider: "kimi-coding", method: "oauth" }, 0, "phone") as { operationId: string };
+  await waitFor(() => host.accountState("phone").operation?.notices, "device code");
+  assert(fixture.accountStates > published); assert(JSON.stringify(host.accountState("phone")).includes("QRST-UVWX"));
+  const other = host.accountState("desktop"); assert.equal(other.operation?.status, "running"); assert.equal(other.operation?.owner, false); assert(!JSON.stringify(other).includes("QRST")); assert(!JSON.stringify(other).includes("provider.example"));
+  assert.throws(() => host.accountAnswer("desktop", operationId, "x", "y"), { code: "not_owner" });
+  await assert.rejects(host.hostCommand("account_begin", { provider: "acme", method: "api_key" }, 0, "desktop"), { code: "account_busy" });
+  // Conversation and project work go on while the user is away approving.
+  await host.command("prompt", { text: "while waiting" }); assert.equal(host.accountState("phone").operation?.status, "running");
+  // Another lease ending changes nothing; the owner's lease ending cancels.
+  host.leaseEnded("desktop"); assert.equal(host.accountState("phone").operation?.status, "running");
+  approve(); await waitFor(() => host.accountState("phone").operation?.status === "saved", "saved"); assert.equal(host.accountState("desktop").operation, null);
+  await host.hostCommand("account_begin", { provider: "kimi-coding", method: "oauth" }, 0, "phone"); await waitFor(() => host.accountState("phone").operation?.notices, "second code");
+  host.leaseEnded("phone"); await waitFor(() => host.accountState("phone").operation?.status === "cancelled", "owner gone");
+  const third = await host.hostCommand("account_begin", { provider: "kimi-coding", method: "oauth" }, 0, "phone") as { operationId: string };
+  await host.hostCommand("account_cancel", { operationId: third.operationId }, 0, "desktop"); await waitFor(() => host.accountState("phone").operation?.status === "cancelled", "cancelled by another page");
+  await host.hostCommand("account_begin", { provider: "kimi-coding", method: "oauth" }, 0, "phone"); await waitFor(() => host.accountState("phone").operation?.notices, "fourth code");
+  await host.stop(); await waitFor(() => host.accountState("phone").operation?.status === "cancelled", "service stop");
+}));
+test("the built-in login and logout commands open the account page instead of being sent to the model", async () => withHost(async (host, child) => {
+  const commands = (await host.read("commands")).commands;
+  for (const name of ["login", "logout"]) { const command = commands.find(item => item.name === name)!; assert.equal(command.available, true); assert.equal(command.browserAction, "accounts"); assert.equal(command.terminalOnly, undefined); }
+  await assert.rejects(host.command("prompt", { text: "/login" }), { code: "picker_required" }); assert(!child.calls.some(call => call.type === "prompt"));
+  assert.equal((await host.read("resources")).capabilities.find(capability => capability.name === "authentication")?.available, true);
 }));
