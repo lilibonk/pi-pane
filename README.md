@@ -2,7 +2,7 @@
 
 在 pi 终端里输入 `/web`，把当前会话交给浏览器：TUI 正常退出，同一进程继续在前台提供网页服务，`pi --mode rpc` 子进程负责会话写入。浏览器提供会话导航、流式对话、工具输出、图片、文件与 Git 差异面板。终端按 **Ctrl+C** 停止服务，再按恢复提示回到终端会话；关闭终端也会结束服务。
 
-**本文描述尚未发布的 0.2.0 源码。** npm 当前正式版本仍是 `@lilibonk/pi-pane@0.1.0`，其行为是终端与网页并行的会话镜像。0.2.0 是不兼容变化，发布由维护者执行。开发与验证基线为 pi 1.1.0、Node ≥ 22.19、macOS/Linux；Windows 暂不支持交接。实现与验收进度见 [M3 状态](docs/m3-status.md)，设计见 [设计方案](docs/design.md)。
+**本文对应 0.2.0 交接工作台。** 与终端、网页并行的 0.1.0 镜像版相比，这是不兼容变化。开发与验证基线为 pi 1.1.0、Node ≥ 22.19、macOS/Linux；Windows 暂不支持交接。发布由维护者执行，实际发布与验收状态见 [M3 状态](https://github.com/lilibonk/pi-pane/blob/main/docs/m3-status.md)，设计见 [设计方案](docs/design.md)。
 
 ## 从 0.1.0 迁移
 
@@ -15,13 +15,13 @@
 
 ## 安装与源码试用
 
-目前 npm 安装得到的是已发布的 **0.1.0 镜像版**：
+0.2.0 发布到 npm 后，安装或升级到指定版本：
 
 ```sh
-pi install npm:@lilibonk/pi-pane@0.1.0
+pi install npm:@lilibonk/pi-pane@0.2.0
 ```
 
-试用当前交接源码时，在包含 M3 改动的 checkout 构建后加载：
+发布前试用交接源码时，在包含 M3 改动的 checkout 构建后加载：
 
 ```sh
 npm ci
@@ -29,7 +29,7 @@ npm run build
 pi -e .
 ```
 
-启动后输入 `/web`。本地包也可通过 `pi install .` 安装；该操作会改变日常包来源，隔离验收使用临时 HOME/agent 目录。包内自带预构建网页，发布后安装不需要构建。本项目采用 MIT 许可证，公开仓库为 [lilibonk/pi-pane](https://github.com/lilibonk/pi-pane)。
+升级后重启已打开的 pi，再输入 `/web`。本地包也可通过 `pi install .` 安装；切换本地与 npm 来源时，用 `pi remove <旧来源>` 移除旧配置并以 `pi list` 确认只加载一份。隔离验收使用临时 HOME/agent 目录。包内自带预构建网页，npm 安装不需要构建。本项目采用 MIT 许可证，公开仓库为 [lilibonk/pi-pane](https://github.com/lilibonk/pi-pane)。
 
 ## 使用
 

@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { RpcSessionMirror } from "../src/extension/rpc-session.js";
 import { Bridge } from "../src/extension/bridge.js";
-import type { RpcConnection, RpcRecord } from "../src/extension/rpc-child.js";
+import { RpcReadTimeoutError, type RpcConnection, type RpcRecord } from "../src/extension/rpc-child.js";
 
 class Wire implements RpcConnection {
   running = true; diagnostics = ""; exited = Promise.resolve(0); records: Record<string, unknown>[] = []; listeners = new Set<(record: RpcRecord) => void>();
@@ -41,6 +41,27 @@ test("persisted-before-end retains one bubble and replaces terminal-event text w
   wire.emit({ type: "message_start", message }); wire.records = [entry("answer", null, "assistant", "post-handler durable")];
   await mirror.synchronize(); wire.emit({ type: "message_end", message: { role: "assistant", timestamp: 10, content: [{ type: "text", text: "terminal event" }] } });
   await mirror.synchronize(); assert.deepEqual(text(bridge), ["post-handler durable"]); assert.equal((mirror.context().sessionManager.getEntry("answer") as unknown as { message: unknown })?.message, message);
+}));
+test("a timed-out full refresh preserves the request and later replaces already cached durable content", async () => fixture(async (wire, mirror, bridge) => {
+  const message = { role: "assistant", timestamp: 10, content: [{ type: "text", text: "live" }] };
+  wire.emit({ type: "message_start", message });
+  wire.records = [entry("answer", null, "assistant", "previously persisted")]; await mirror.synchronize();
+  wire.records = [entry("answer", null, "assistant", "final post-handler content")];
+  const original = wire.request.bind(wire); const queries: Record<string, unknown>[] = [];
+  wire.request = async <T>(type: string, payload: Record<string, unknown> = {}): Promise<T> => {
+    if (type === "get_entries") {
+      queries.push(payload);
+      if (queries.length === 1) throw new RpcReadTimeoutError(type, 30_000);
+    }
+    return original<T>(type, payload);
+  };
+  wire.emit({ type: "message_end", message: { role: "assistant", timestamp: 10, content: [{ type: "text", text: "terminal event" }] } });
+  await new Promise(resolve => setImmediate(resolve)); // let the failed event refresh settle
+  assert.deepEqual(queries, [{}], "the timeout does not cause an implicit retry");
+  wire.emit({ type: "agent_settled" });
+  await mirror.synchronize();
+  assert.deepEqual(queries.slice(0, 2), [{}, {}], "the later event still reloads existing entries instead of fetching only new IDs");
+  assert.deepEqual(text(bridge), ["final post-handler content"]); assert.equal(wire.running, true);
 }));
 test("persisted-before-start pairs new public entries without pairing events to historical entries", async () => fixture(async (wire, mirror, bridge) => {
   wire.records = [entry("new", null, "user", "durable")]; await mirror.synchronize();

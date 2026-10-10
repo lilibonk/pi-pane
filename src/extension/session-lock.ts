@@ -2,16 +2,16 @@ import { createHash, randomUUID } from "node:crypto";
 import { constants } from "node:fs";
 import { open, realpath, stat, unlink, type FileHandle } from "node:fs/promises";
 import { dirname, join, basename } from "node:path";
+import { isDeepStrictEqual } from "node:util";
 import { ProtocolError } from "../protocol/index.js";
 
 interface LockRecord { version: 1; pid: number; token: string; sessionFile: string; created: string; writerPid?: number }
 interface Fingerprint { dev: number; ino: number; size: number; mtimeMs: number; ctimeMs: number }
-/** A transcript entry as the owning writer reports it; enough to recognise its own appended lines. */
-export interface KnownEntry { id: string; type: string }
-/** What has been accepted: complete lines up to `offset`, the bytes just before it, and the last entry ID. */
-interface Baseline { fingerprint?: Fingerprint; offset: number; tail: string; lastId?: string }
+/** The complete transcript entry as the owning writer reports it. */
+export interface KnownEntry { id: string; type: string; [key: string]: unknown }
+/** What has been accepted: complete lines up to `offset`, their digest, and the last entry ID. */
+interface Baseline { fingerprint?: Fingerprint; offset: number; prefix: string; lastId?: string }
 
-const TAIL_BYTES = 4096;
 const CHUNK = 64 * 1024;
 /** A guard older than this belongs to an acquisition that cannot still be running. */
 const GUARD_STALE_MS = 30_000;
@@ -41,8 +41,16 @@ async function readRange(file: FileHandle, start: number, end: number): Promise<
   return buffer.subarray(0, read);
 }
 const digest = (bytes: Buffer): string => createHash("sha256").update(bytes).digest("hex");
-async function tailDigest(file: FileHandle, offset: number): Promise<string> {
-  return digest(await readRange(file, Math.max(0, offset - TAIL_BYTES), offset));
+/** Hash the entire accepted prefix with fixed-size reads, including history far before the tail. */
+async function prefixHash(file: FileHandle, offset: number) {
+  const hash = createHash("sha256");
+  for (let start = 0; start < offset; start += CHUNK) {
+    const end = Math.min(offset, start + CHUNK);
+    const bytes = await readRange(file, start, end);
+    if (bytes.length !== end - start) throw new ProtocolError("session_conflict", "The session file was truncated while checking its accepted history.");
+    hash.update(bytes);
+  }
+  return hash;
 }
 /** End of the last complete line at or before `size` (0 when there is none). */
 async function lastLineEnd(file: FileHandle, size: number): Promise<number> {
@@ -76,7 +84,7 @@ function liveOwner(record: Partial<LockRecord>): LockOwner | undefined {
  * checks that every change to the transcript is an append of entries its own writer knows.
  */
 export class SessionFileLock {
-  private baseline: Baseline = { offset: 0, tail: digest(Buffer.alloc(0)) };
+  private baseline: Baseline = { offset: 0, prefix: digest(Buffer.alloc(0)) };
   private released = false;
   private constructor(readonly sessionFile: string, readonly lockPath: string, private readonly record: LockRecord) {}
 
@@ -179,19 +187,23 @@ export class SessionFileLock {
       return;
     }
     const replaced = !this.baseline.fingerprint || current.dev !== this.baseline.fingerprint.dev || current.ino !== this.baseline.fingerprint.ino;
-    const start = replaced ? 0 : this.baseline.offset;
+    // A replacement inode must retain the same accepted history as an in-place append.
+    // pi's loading/migration and session-fork rewrites get a fresh baseline from acceptChanges;
+    // a normal write to this already active session never removes or changes accepted entries.
+    const start = this.baseline.offset;
     const file = await open(this.sessionFile, constants.O_RDONLY | constants.O_NOFOLLOW);
     try {
-      if (!replaced) {
-        if (current.size < start) throw conflict("it was truncated");
-        if (await tailDigest(file, start) !== this.baseline.tail) throw conflict("earlier content was rewritten");
-      }
+      if (current.size < start) throw conflict("it was truncated");
+      const hash = await prefixHash(file, start);
+      if (hash.copy().digest("hex") !== this.baseline.prefix) throw conflict("earlier content was rewritten");
       const end = await lastLineEnd(file, current.size);
       if (end <= start) {
-        this.baseline = replaced ? { fingerprint: current, offset: 0, tail: await tailDigest(file, 0) } : { ...this.baseline, fingerprint: current };
+        this.baseline = { ...this.baseline, fingerprint: current };
         return;
       }
-      const lines = (await readRange(file, start, end)).toString("utf8").slice(0, -1).split("\n");
+      const appended = await readRange(file, start, end);
+      if (appended.length !== end - start) throw conflict("it was truncated while checking appended entries");
+      const lines = appended.toString("utf8").slice(0, -1).split("\n");
       const entries = new Map((await known(replaced ? undefined : this.baseline.lastId)).map(entry => [entry.id, entry]));
       let lastId: string | undefined;
       for (const [index, line] of lines.entries()) {
@@ -199,11 +211,11 @@ export class SessionFileLock {
         try { value = JSON.parse(line) as typeof value; } catch { throw conflict("a line is not a transcript entry"); }
         if (start === 0 && index === 0 && value.type === "session") continue; // the header
         const entry = typeof value.id === "string" ? entries.get(value.id) : undefined;
-        if (!entry || entry.type !== value.type) throw conflict("an entry this host did not write was appended");
+        if (!entry || !isDeepStrictEqual(entry, value)) throw conflict("an entry this host did not write was appended");
         lastId = entry.id;
       }
       // An incomplete last line stays beyond `offset` and is checked once it is complete.
-      this.baseline = { fingerprint: current, offset: end, tail: await tailDigest(file, end), lastId: lastId ?? (replaced ? undefined : this.baseline.lastId) };
+      this.baseline = { fingerprint: current, offset: end, prefix: hash.update(appended).digest("hex"), lastId: lastId ?? this.baseline.lastId };
     } finally { await file.close(); }
   }
   private async assertOwned(): Promise<void> {
@@ -219,11 +231,11 @@ export class SessionFileLock {
   async acceptChanges(): Promise<void> { await this.assertOwned(); await this.resetBaseline(); }
   private async resetBaseline(): Promise<void> {
     const current = await fingerprint(this.sessionFile);
-    if (!current) { this.baseline = { offset: 0, tail: digest(Buffer.alloc(0)) }; return; }
+    if (!current) { this.baseline = { offset: 0, prefix: digest(Buffer.alloc(0)) }; return; }
     const file = await open(this.sessionFile, constants.O_RDONLY | constants.O_NOFOLLOW);
     try {
       const offset = await lastLineEnd(file, current.size);
-      this.baseline = { fingerprint: current, offset, tail: await tailDigest(file, offset), lastId: await lastLineId(file, offset) };
+      this.baseline = { fingerprint: current, offset, prefix: (await prefixHash(file, offset)).digest("hex"), lastId: await lastLineId(file, offset) };
     } finally { await file.close(); }
   }
   /** RPC can report lexical /var or symlink paths while the ownership sidecar is canonical. */

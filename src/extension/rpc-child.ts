@@ -34,6 +34,14 @@ export function runningPiRpcEntry(cliPath = process.argv[1]): string | undefined
 export const RPC_READS = new Set(["get_state", "get_entries", "get_messages", "get_commands", "get_available_models",
   "get_available_thinking_levels", "get_tree", "get_fork_messages", "get_session_stats", "get_last_assistant_text"]);
 export const DEFAULT_READ_TIMEOUT_MS = 30_000;
+/** A failed read can be retried by a later operation; it does not imply loss of the writer. */
+export class RpcReadTimeoutError extends Error {
+  readonly code = "rpc_read_timeout";
+  constructor(readonly command: string, readonly timeoutMs: number) {
+    super(`pi RPC ${command} did not answer within ${Math.round(timeoutMs / 1000)} s.`);
+    this.name = "RpcReadTimeoutError";
+  }
+}
 
 /** One RPC record from the child: a response, a session event or an extension UI request. */
 export type RpcRecord = { type: string; [key: string]: unknown };
@@ -135,7 +143,7 @@ export class RpcChild implements RpcConnection {
       const timer = limit === undefined ? undefined : setTimeout(() => {
         // A late response is then ignored; reads change nothing, so the child keeps running.
         this.pending.delete(id);
-        reject(new Error(`pi RPC ${type} did not answer within ${Math.round(limit / 1000)} s.`));
+        reject(new RpcReadTimeoutError(type, limit));
       }, limit);
       timer?.unref?.();
       this.pending.set(id, { resolve: (value) => { clearTimeout(timer); resolve(value); }, reject: (error) => { clearTimeout(timer); reject(error); } });

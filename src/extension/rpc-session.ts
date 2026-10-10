@@ -2,7 +2,7 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 import { parseStreamingJson } from "@earendil-works/pi-ai";
 import { isRecord } from "../protocol/index.js";
 import type { Bridge, BridgeOptions } from "./bridge.js";
-import type { RpcConnection, RpcRecord } from "./rpc-child.js";
+import { RpcReadTimeoutError, type RpcConnection, type RpcRecord } from "./rpc-child.js";
 
 type Entry = { type: string; id: string; parentId: string | null; [key: string]: unknown };
 type Message = { role: string; timestamp?: number; content?: unknown; [key: string]: unknown };
@@ -85,11 +85,23 @@ export class RpcSessionMirror {
 
   /** Appends entries after the last known one; a moved leaf on an unknown cursor reloads everything. */
   private async syncEntries(): Promise<void> {
-    const last = this.reloadEntries ? undefined : this.entries.at(-1)?.id;
+    let fullReload = this.reloadEntries;
+    const last = fullReload ? undefined : this.entries.at(-1)?.id;
     this.reloadEntries = false;
     let result: { entries: Entry[]; leafId: string | null };
-    try { result = await this.child.request("get_entries", last ? { since: last } : {}); }
-    catch { result = await this.child.request("get_entries"); this.entries = []; this.byId.clear(); }
+    try {
+      try { result = await this.child.request("get_entries", last ? { since: last } : {}); }
+      catch (error) {
+        if (error instanceof RpcReadTimeoutError) throw error;
+        fullReload = true;
+        result = await this.child.request("get_entries"); this.entries = []; this.byId.clear();
+      }
+    } catch (error) {
+      // An unsuccessful read must not consume a message_end full-refresh request.
+      // Preserve another event's request too if it arrived while this read was pending.
+      this.reloadEntries ||= fullReload;
+      throw error;
+    }
     for (const entry of result.entries) {
       const known = this.byId.get(entry.id);
       if (known) {

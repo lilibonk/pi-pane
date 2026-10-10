@@ -5,7 +5,7 @@ import { ProtocolError, isRecord, isCommandInvocationName, workbenchArgs, type W
 import { Bridge } from "./bridge.js";
 import type { Hub, HostHandler } from "./hub.js";
 import { childArgs } from "./child-args.js";
-import { RpcChild, type RpcConnection, type RpcRecord } from "./rpc-child.js";
+import { RpcChild, RpcReadTimeoutError, type RpcConnection, type RpcRecord } from "./rpc-child.js";
 import { RpcSessionMirror } from "./rpc-session.js";
 import { SessionFileLock, type KnownEntry } from "./session-lock.js";
 import { WorkspaceService } from "./workspace.js";
@@ -128,6 +128,9 @@ export class HandoffHost implements HostHandler {
       if (this.stopping || !this.lock) return;
       try { await this.lock.verifyAppends(since => this.childEntries(since)); }
       catch (error) {
+        // No ownership decision or dependent write was made. Keep the baseline and child
+        // intact so a later command can retry the read and check the same pending appends.
+        if (error instanceof RpcReadTimeoutError) throw error;
         this.log((error as { code?: string }).code === "session_conflict"
           ? "Session ownership conflict detected; stopping the RPC child without restarting it."
           : "Session ownership disappeared; stopping the sole RPC writer.");
@@ -141,7 +144,10 @@ export class HandoffHost implements HostHandler {
   /** The child's entries after `since` (all of them when the ID is unknown to it). */
   private async childEntries(since?: string): Promise<KnownEntry[]> {
     const request = (payload: Record<string, unknown>) => this.child!.request<{ entries: KnownEntry[] }>("get_entries", payload);
-    const result = since ? await request({ since }).catch(() => request({})) : await request({});
+    const result = since ? await request({ since }).catch(error => {
+      if (error instanceof RpcReadTimeoutError) throw error;
+      return request({});
+    }) : await request({});
     return result.entries;
   }
   private async rebind(reason: string): Promise<void> {

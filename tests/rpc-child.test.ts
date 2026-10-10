@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { mkdtemp, writeFile, rm, readFile, access } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { RpcChild } from "../src/extension/rpc-child.js";
+import { RpcChild, RpcReadTimeoutError } from "../src/extension/rpc-child.js";
 
 async function fixture(run: (root: string, entry: string) => Promise<void>) {
   const root = await mkdtemp(join(tmpdir(), "pi-pane-rpc-child-")); const entry = join(root, "entry.mjs");
@@ -26,7 +26,7 @@ test("a slow read fails on its own and leaves the child running", async () => fi
   const child = new RpcChild([], root, entry, { HOME: root, MARKER: join(root, "started.json"), HANG: "get_state" }, 50);
   try {
     child.start(); child.activate(); await child.request("ready");
-    await assert.rejects(child.request("get_state"), /did not answer/); assert.equal(child.running, true);
+    await assert.rejects(child.request("get_state"), error => error instanceof RpcReadTimeoutError && error.code === "rpc_read_timeout" && error.command === "get_state"); assert.equal(child.running, true);
     assert.deepEqual(await child.request("ready"), { type: "ready" });
   } finally { await child.stop(); }
 }));

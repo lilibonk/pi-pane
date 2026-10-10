@@ -3,6 +3,7 @@
 // into a clean agent directory and npm cache installs it without a build; the installed package serves /web.
 // By default, a local registry serves this package's tarball and proxies other packages to public npm.
 // PI_M2_PUBLISHED_TARBALL=/absolute/package.tgz skips packing and verifies installation from public npm.
+// PI_M2_CANDIDATE_TARBALL=/absolute/package.tgz installs that frozen candidate through the local registry.
 // Gallery listing and real-provider conversations are not covered by this deterministic installation test.
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
@@ -25,6 +26,9 @@ await mkdir(reportDir, { recursive: true });
 const pkg = JSON.parse(await readFile(join(project, "package.json"), "utf8"));
 const UPSTREAM = "https://registry.npmjs.org";
 const publishedTarball = process.env.PI_M2_PUBLISHED_TARBALL;
+const candidateTarball = process.env.PI_M2_CANDIDATE_TARBALL;
+assert.ok(!(publishedTarball && candidateTarball), "Select either a candidate or a published tarball, not both");
+const suppliedTarball = publishedTarball || candidateTarball;
 const mode = publishedTarball ? "published" : "simulated";
 const report = { scope: "A11 install: npm tarball contents and pi install from a registry into a clean agent directory", mode,
   registry: publishedTarball ? `${UPSTREAM}/` : "temporary local registry (proxies other packages to public npm)",
@@ -52,10 +56,10 @@ try {
   let tarball, tarballBytes, files, manifest;
   await check("the npm tarball carries the prebuilt extension and web assets, and no sources or tests", async () => {
     let info;
-    if (publishedTarball) {
-      assert.ok(isAbsolute(publishedTarball), "PI_M2_PUBLISHED_TARBALL must be an absolute path");
-      tarball = publishedTarball;
-      assert.ok((await stat(tarball)).isFile(), "the published tarball exists");
+    if (suppliedTarball) {
+      assert.ok(isAbsolute(suppliedTarball), "The supplied tarball must be an absolute path");
+      tarball = suppliedTarball;
+      assert.ok((await stat(tarball)).isFile(), "the supplied tarball exists");
       const { stdout } = await run("tar", ["-tzf", tarball], { maxBuffer: 16 * 1024 * 1024 });
       const entries = stdout.trim().split("\n").filter(Boolean);
       for (const entry of entries) assert.ok(entry.startsWith("package/") && !entry.split("/").includes(".."), `unexpected tarball entry ${entry}`);
@@ -81,11 +85,12 @@ try {
     assert.ok(manifest.pi.themes.includes("./themes/*.json"), "bundled themes are discoverable by pi");
     assert.ok(manifest.keywords.includes("pi-package"));
     report.package = { name: manifest.name, version: manifest.version };
-    return { filename: basename(tarball), packedBytes: tarballBytes.length, ...(info ? { unpackedBytes: info.unpackedSize } : {}), files: files.length, packing: publishedTarball ? "skipped (supplied published tarball)" : "npm pack --ignore-scripts after caller build" };
+    return { filename: basename(tarball), packedBytes: tarballBytes.length, ...(info ? { unpackedBytes: info.unpackedSize } : {}), files: files.length, packing: suppliedTarball ? `skipped (supplied ${publishedTarball ? "published" : "candidate"} tarball)` : "npm pack --ignore-scripts after caller build" };
   });
 
   const integrity = `sha512-${createHash("sha512").update(tarballBytes).digest("base64")}`;
   const shasum = createHash("sha1").update(tarballBytes).digest("hex");
+  report.archive = { filename: basename(tarball), sha256: createHash("sha256").update(tarballBytes).digest("hex"), integrity, shasum };
   const requests = [];
   let registryUrl = `${UPSTREAM}/`;
   if (publishedTarball) {

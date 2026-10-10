@@ -1,7 +1,7 @@
 {
   "name": "pi pane",
   "stage": "M3",
-  "stageStatus": "handoff-local-acceptance-complete-unreleased",
+  "stageStatus": "release-candidate-validation-complete-unpublished",
   "m0CompletedDate": "2026-10-08",
   "m1LocalAcceptanceCompletedDate": "2026-10-08",
   "m2LocalAcceptanceCompletedDate": "2026-10-08",
@@ -18,40 +18,42 @@
   "evidencePage": "https://chatgpt.com/space/page_b3f2b1dc1800819189f2b90d540f931c",
   "localFollowUpAutomationId": "pi-pane-m0-space",
   "localFollowUpStatus": "PAUSED",
-  "evidenceDirectory": "build-artifacts/m2/pi-1.1-trial",
+  "evidenceDirectory": "build-artifacts/releases/0.2.0",
   "liveTaskStatusSource": "docs/m3-status.md",
   "nextSteps": [
-    "Track daily stability and upstream RPC tool/tree gaps",
-    "Design explicit support for custom TUI and Plan/Goal/Agent semantics",
-    "Maintainer reviews migration and publishes the breaking 0.2.0 release"
+    "Maintainer reauthenticates npm (whoami returned E401) and publishes the verified frozen 0.2.0 archive",
+    "Verify public-registry version/integrity and installation, then replace the local daily source with npm:@lilibonk/pi-pane@0.2.0",
+    "Restart already-open pi processes to load the local candidate; collect daily stability feedback",
+    "Keep 38152e1 CUA 19-check evidence historical unless explicitly rerun",
+    "Track upstream RPC tool/tree gaps and design custom TUI and Plan/Goal/Agent semantics"
   ],
   "pi110CompatibilityStatus": "key-regressions-passed",
-  "dailyPackageLoadStatus": "verified",
-  "realModelTrialStatus": "passed",
-  "realModelTrialCompletedDate": "2026-10-09",
+  "dailyPackageLoadStatus": "local-candidate-registration-and-isolated-auto-discovery-verified-restart-required",
+  "realModelTrialStatus": "release-candidate-passed",
+  "realModelTrialCompletedDate": "2026-10-10",
   "trialProvider": "qwen-token-plan-cn",
   "trialModel": "qwen3.7-max",
   "license": "MIT",
-  "npmAuthenticationStatus": "logged-in",
+  "npmAuthenticationStatus": "requires-login-current-whoami-E401",
   "npmAccount": "lilibonk",
   "npmTwoFactorStatus": "verified",
   "npmPublishAttemptStatus": "published",
-  "releaseCandidateStatus": "published-and-integrity-verified",
+  "releaseCandidateStatus": "validated-local-candidate-unpublished",
   "publicationEvidenceDirectory": "build-artifacts/m2/npm-release",
-  "m3Status": "local-handoff-acceptance-complete",
+  "m3Status": "release-candidate-local-acceptance-complete",
   "npmPackageName": "@lilibonk/pi-pane",
   "npmPackageVersion": "0.1.0",
   "npmPackageUrl": "https://www.npmjs.com/package/@lilibonk/pi-pane",
   "formalInstallationStatus": "passed",
   "galleryStatus": "not-yet-visible",
   "publicationCompletedDate": "2026-10-09",
-  "dailyPackageSource": "npm:@lilibonk/pi-pane@0.1.0",
+  "dailyPackageSource": "local/pi-pane/0.2.0-5bba224d3b10",
   "publishedRealModelTrialStatus": "passed",
   "publishedRealModelTrialCompletedDate": "2026-10-09",
   "galleryLastCheckedDate": "2026-10-09",
   "formalInstallationCompletedDate": "2026-10-09",
-  "m3ImplementationStatus": "foreground-handoff-migration-verified",
-  "uiParityStatus": "handoff-workbench-verified-with-documented-upstream-gaps",
+  "m3ImplementationStatus": "foreground-handoff-with-review-and-release-fixes",
+  "uiParityStatus": "handoff-workbench-historical-cua-pass-with-documented-upstream-gaps",
   "uiAuditEvidenceDirectory": "build-artifacts/kimi-alignment/current",
   "m3Reference": {
     "package": "@moonshot-ai/kimi-code",
@@ -68,108 +70,161 @@
     "Isolated real-provider trial; maintainer release"
   ],
   "m3StartedDate": "2026-10-09",
-  "m3ImplementationBranch": "codex/m3-handoff",
-  "m3EvidenceDirectory": "build-artifacts/m3/handoff",
+  "m3ImplementationBranch": "main",
+  "m3EvidenceDirectory": "build-artifacts/releases/0.2.0",
   "m3SourcePublicationStatus": "unreleased-maintainer-publishes",
-  "m3AStatus": "workbench-desktop-mobile-verified",
-  "m3BStatus": "rpc-workbench-verified",
-  "m3CStatus": "standard-rpc-ui-verified-resource-config-incomplete",
-  "m3DStatus": "foreground-handoff-verified-12-checks",
+  "m3AStatus": "workbench-desktop-mobile-cua-passed-on-38152e1-not-rerun-after-review",
+  "m3BStatus": "candidate-rpc-workbench-verified-16-checks",
+  "m3CStatus": "candidate-standard-rpc-ui-verified-resource-config-incomplete",
+  "m3DStatus": "candidate-foreground-handoff-long-mode-verified-15-checks",
   "m3Verification": {
     "hostVersion": "1.1.0",
+    "implementationBasis": "d5cd02d plus release-review fixes; identified by source/build hashes and candidate archive hash",
+    "candidateSha256": "5bba224d3b106139ee56614e5ec83079ba97f324a56bfc11c29a0656177f2eb0",
     "typecheck": "passed",
     "build": "passed",
+    "buildChecksReport": "build-artifacts/releases/0.2.0/build-checks.json",
     "unitTests": {
-      "passed": 121,
-      "total": 121,
-      "status": "passed"
+      "passed": 136,
+      "total": 136,
+      "status": "passed",
+      "log": "build-artifacts/releases/0.2.0/test.log"
     },
     "frontendFocusedTests": {
       "passed": 7,
       "total": 7,
-      "status": "passed"
+      "status": "included-in-unit-suite"
     },
     "integration": {
       "status": "passed",
+      "passed": 125,
+      "total": 125,
+      "suiteCount": 14,
       "suites": {
-        "smoke": {
+        "m0:smoke": {
           "passed": 22,
-          "total": 22
+          "total": 22,
+          "report": "build-artifacts/releases/0.2.0/regression/m0/smoke/smoke-report.json"
         },
-        "boundaries": {
-          "passed": 22,
-          "total": 22
-        },
-        "lifecycle": {
-          "passed": 9,
-          "total": 9
-        },
-        "browser": {
+        "m0:browser": {
           "passed": 10,
-          "total": 10
+          "total": 10,
+          "report": "build-artifacts/releases/0.2.0/regression/m0/browser/browser-report.json"
         },
-        "projection": {
+        "m0:lifecycle": {
+          "passed": 9,
+          "total": 9,
+          "report": "build-artifacts/releases/0.2.0/regression/m0/lifecycle/lifecycle-report.json"
+        },
+        "m0:boundaries": {
+          "passed": 22,
+          "total": 22,
+          "report": "build-artifacts/releases/0.2.0/regression/m0/boundaries/boundary-report.json"
+        },
+        "m0:projection": {
           "passed": 2,
-          "total": 2
+          "total": 2,
+          "report": "build-artifacts/releases/0.2.0/regression/m0/projection/report.json"
         },
-        "render": {
+        "m1:render": {
           "passed": 7,
-          "total": 7
+          "total": 7,
+          "report": "build-artifacts/releases/0.2.0/regression/m1/render/render-report.json"
         },
-        "a6": {
+        "m1:a6": {
           "passed": 2,
-          "total": 2
+          "total": 2,
+          "report": "build-artifacts/releases/0.2.0/regression/m1/a6/report.json"
         },
-        "images": {
+        "m2:images": {
           "passed": 5,
-          "total": 5
+          "total": 5,
+          "report": "build-artifacts/releases/0.2.0/regression/m2/images/report.json"
         },
-        "external": {
+        "m2:external": {
           "passed": 6,
-          "total": 6
+          "total": 6,
+          "report": "build-artifacts/releases/0.2.0/regression/m2/external/report.json"
         },
-        "localPackageInstallation": {
-          "passed": 4,
-          "total": 4
+        "m3:handoff-long": {
+          "passed": 15,
+          "total": 15,
+          "report": "build-artifacts/releases/0.2.0/regression/m3/handoff-long/report.json"
         },
-        "handoff": {
-          "passed": 12,
-          "total": 12
-        },
-        "workbench": {
+        "m3:workbench": {
           "passed": 16,
-          "total": 16
+          "total": 16,
+          "report": "build-artifacts/releases/0.2.0/regression/m3/workbench/report.json"
         },
-        "performance": {
+        "m0:performance": {
           "passed": 3,
-          "total": 3
+          "total": 3,
+          "report": "build-artifacts/releases/0.2.0/regression/m0/performance/report.json"
         },
-        "initialTheme": {
+        "m0:theme": {
           "passed": 2,
-          "total": 2
+          "total": 2,
+          "report": "build-artifacts/releases/0.2.0/regression/m0/theme/report.json"
+        },
+        "m2:install": {
+          "passed": 4,
+          "total": 4,
+          "report": "build-artifacts/releases/0.2.0/install/report.json",
+          "candidateSha256": "5bba224d3b106139ee56614e5ec83079ba97f324a56bfc11c29a0656177f2eb0"
         }
+      },
+      "reports": [
+        "build-artifacts/releases/0.2.0/regression/summary.json",
+        "build-artifacts/releases/0.2.0/install/report.json"
+      ],
+      "sourceAndBuildUnchanged": true,
+      "longHandoff": {
+        "passed": 15,
+        "total": 15,
+        "status": "passed",
+        "dialogWaitSeconds": 130,
+        "report": "build-artifacts/releases/0.2.0/regression/m3/handoff-long/report.json"
       },
       "performance": {
         "passed": 3,
         "total": 3,
-        "status": "passed-quick-single-observation",
-        "report": "build-artifacts/m3/handoff/m0/performance/report.json",
-        "notCovered": [
-          "Independent web-host CPU/RSS",
-          "Reliable production tail latency or long-term leak soak",
-          "20-second overload profile"
+        "status": "passed-three-observations-per-configuration",
+        "repetitions": 3,
+        "report": "build-artifacts/releases/0.2.0/regression/m0/performance/report.json",
+        "rpcViewers": [
+          0,
+          4,
+          8
         ],
-        "telemetryScope": "sole RPC writer; TUI versus RPC ratios do not isolate pi-pane overhead"
-      },
-      "passed": 122,
-      "total": 122,
-      "suiteCount": 14,
-      "report": "build-artifacts/m3/handoff/regression-matrix.json"
+        "writerDurationMedianMs": [
+          331.3067500000002,
+          323.8605000000001,
+          319.651167
+        ],
+        "writerEventLoopP95MedianMs": [
+          11.051007,
+          10.944511,
+          10.829823
+        ],
+        "telemetryScope": "RPC writer only; TUI-vs-RPC mode comparisons do not isolate pane overhead; separate Hub complete-prefix verification I/O and resources are not measured",
+        "notCovered": [
+          "Independent web-host CPU/RSS and full-prefix verification I/O",
+          "Reliable production tail latency or long-term leak soak"
+        ],
+        "overloadDiagnostic": {
+          "observationLimitMs": 20000,
+          "tuiCompleted": false,
+          "tuiBytesAtCutoff": 1383424,
+          "rpcFourViewersCompleted": true,
+          "rpcDurationMs": 2308.195708,
+          "scope": "Cross-mode diagnostic only; unfinished TUI observation retained, not an overall overload acceptance pass"
+        }
+      }
     },
     "browser": {
       "passed": 19,
       "total": 19,
-      "status": "passed",
+      "status": "passed-on-38152e1-not-rerun-after-review-fixes",
       "method": "CUA",
       "widths": [
         1280,
@@ -190,14 +245,16 @@
           "build-artifacts/m3/handoff/browser-clone-first.txt",
           "build-artifacts/m3/handoff/cua-empty-fork-clone-failure/"
         ]
-      }
+      },
+      "sourceCommit": "38152e1b0a585c549f3ef71d11715c29589b61ad"
     },
     "deterministicRealModelCalls": 0,
     "realProviderTrial": {
       "passed": 5,
       "total": 5,
-      "status": "passed",
+      "status": "passed-new-explicit-this-trial-only-authorization",
       "piVersion": "1.1.0",
+      "piCli": "/Users/zile.zhou/.pi/agent/install/releases/1.1.0/node_modules/@earendil-works/pi-coding-agent/dist/bundle/cli.js",
       "provider": "qwen-token-plan-cn",
       "model": "qwen3.7-max",
       "submittedPrompts": 3,
@@ -205,10 +262,12 @@
       "pageErrors": 0,
       "protocolErrors": 0,
       "authenticationMode": "user-authorized-existing-auth-via-symlink",
-      "credentialContentReadOrCopiedByHarness": false,
+      "credentialContentReadOrCopiedByWrapper": false,
       "temporaryCredentialReferenceCleanup": "verified",
-      "report": "build-artifacts/m3/handoff/m2/real-model/report.json",
-      "screenshot": "build-artifacts/m3/handoff/m2/real-model/browser.png",
+      "candidateSha256": "5bba224d3b106139ee56614e5ec83079ba97f324a56bfc11c29a0656177f2eb0",
+      "report": "build-artifacts/releases/0.2.0/real-model/report.json",
+      "screenshot": "build-artifacts/releases/0.2.0/real-model/browser.png",
+      "cleanupReport": "build-artifacts/releases/0.2.0/real-model-cleanup.json",
       "notCovered": [
         "Daily stability beyond this short trial",
         "Exact provider request count, billing or retries",
@@ -219,20 +278,39 @@
       "passed": 2,
       "total": 2,
       "runs": 20,
-      "wsToRenderedP95Ms": 47.8,
+      "wsToRenderedP95Ms": 48.200000047683716,
       "messages": 1000,
       "normalizedTextCharacters": 912000,
       "images": 0,
-      "report": "build-artifacts/m3/handoff/m1/a6/report.json"
+      "report": "build-artifacts/releases/0.2.0/regression/m1/a6/report.json"
     },
     "cleanup": {
       "status": "verified",
-      "scope": "CUA preview and original failed fixture; real-provider temporary authentication reference separately removed",
-      "report": "build-artifacts/m3/handoff/cleanup.json"
+      "runnerTemporaryHomeRemoved": true,
+      "referencedFixtureRootsRemoved": 25,
+      "temporaryAuthorizedAgentRemoved": true,
+      "originalCredentialMode": "0600",
+      "reports": [
+        "build-artifacts/releases/0.2.0/regression/summary.json",
+        "build-artifacts/releases/0.2.0/real-model-cleanup.json"
+      ]
     },
-    "summary": "build-artifacts/m3/handoff/regression-matrix.json"
+    "dailyInstallation": {
+      "status": "registered-and-isolated-auto-discovery-passed",
+      "source": "local/pi-pane/0.2.0-5bba224d3b10",
+      "path": "/Users/zile.zhou/.pi/agent/local/pi-pane/0.2.0-5bba224d3b10",
+      "otherSettingsHashesUnchanged": true,
+      "explicitPaneExtensionFlag": false,
+      "handoffAndDeterministicReply": "passed",
+      "protocolErrors": 0,
+      "temporaryResourcesRemoved": true,
+      "requiresRestartOfOpenPi": true,
+      "includedInDeterministicMatrix": false,
+      "report": "build-artifacts/releases/0.2.0/daily-install.json"
+    },
+    "summary": "build-artifacts/releases/0.2.0/release-readiness.json"
   },
-  "m3RealProviderTrialStatus": "passed-explicit-this-trial-only-authorization",
+  "m3RealProviderTrialStatus": "candidate-passed-new-explicit-this-trial-only-authorization",
   "m3FollowUps": [
     {
       "name": "historical-slow-reconnect-timeout",
@@ -297,5 +375,60 @@
     "status": "superseded-by-handoff-adjustment"
   },
   "m3SourceVersion": "0.2.0",
-  "m3LocalAcceptanceCompletedDate": "2026-10-10"
+  "m3LocalAcceptanceCompletedDate": "2026-10-10",
+  "m3HistoricalHandoffCommit": "38152e1b0a585c549f3ef71d11715c29589b61ad",
+  "npmAuthenticationLastCheckedDate": "2026-10-10",
+  "npmAuthenticationEvidenceScope": "Current publish preparation; prior successful authentication belongs to the 0.1.0 release",
+  "publicationStatusScope": "Published 0.1.0 only; candidate 0.2.0 is installed locally and remains unpublished",
+  "historicalM3ReviewFixes": {
+    "sourceCommit": "d5cd02d3dd82f2bcf7ef0eb4d35795448d6a0832",
+    "unitTests": {
+      "passed": 129,
+      "total": 129,
+      "status": "maintainer-reported-pass-no-standalone-log-found"
+    },
+    "deterministic": {
+      "passed": 124,
+      "total": 124,
+      "suites": 14,
+      "evidenceDirectory": "build-artifacts/m3/handoff",
+      "evidenceBasis": "Independently updated reports; aggregate regression-matrix.json and validation.json remain 38152e1 history"
+    },
+    "longHandoff": {
+      "passed": 15,
+      "total": 15,
+      "report": "build-artifacts/m3/handoff-long/report.json"
+    },
+    "browserRerun": false,
+    "realProviderRerun": false
+  },
+  "m3ImplementationBasis": {
+    "baseCommit": "d5cd02d3dd82f2bcf7ef0eb4d35795448d6a0832",
+    "releaseFixes": [
+      "Complete accepted-prefix chunked SHA-256 and atomic-replacement protection",
+      "Deep comparison of appended entries against the RPC writer",
+      "Ownership read timeout refuses only dependent operation without stopping writer",
+      "No implicit retry after read timeout; retain failed full-refresh intent"
+    ],
+    "candidateSha256": "5bba224d3b106139ee56614e5ec83079ba97f324a56bfc11c29a0656177f2eb0"
+  },
+  "dailyPackageAbsolutePath": "/Users/zile.zhou/.pi/agent/local/pi-pane/0.2.0-5bba224d3b10",
+  "dailyPackageLoadEvidence": "build-artifacts/releases/0.2.0/daily-install.json",
+  "releaseCandidate": {
+    "version": "0.2.0",
+    "archive": "build-artifacts/releases/0.2.0/candidate/lilibonk-pi-pane-0.2.0.tgz",
+    "sha256": "5bba224d3b106139ee56614e5ec83079ba97f324a56bfc11c29a0656177f2eb0",
+    "installedLocalPath": "/Users/zile.zhou/.pi/agent/local/pi-pane/0.2.0-5bba224d3b10",
+    "publicationStatus": "unpublished",
+    "publicRegistryInstallationStatus": "pending-after-publication",
+    "gitPushStatus": "not-performed",
+    "readinessReport": "build-artifacts/releases/0.2.0/release-readiness.json",
+    "integrityVerification": {
+      "status": "passed",
+      "packagedFilesCompared": 83,
+      "regressionSourceAndBuildHashesMatched": 131,
+      "scope": "archive, repository and daily unpacked installation",
+      "report": "build-artifacts/releases/0.2.0/integrity-verification.json"
+    }
+  }
 }

@@ -8,7 +8,7 @@ import { HandoffHost } from "../src/extension/handoff.js";
 import { SessionFileLock } from "../src/extension/session-lock.js";
 import type { Hub } from "../src/extension/hub.js";
 import type { Bridge } from "../src/extension/bridge.js";
-import type { RpcConnection, RpcRecord } from "../src/extension/rpc-child.js";
+import { RpcReadTimeoutError, type RpcConnection, type RpcRecord } from "../src/extension/rpc-child.js";
 
 class FakeChild implements RpcConnection {
   running = false; diagnostics = ""; pid = undefined;
@@ -236,6 +236,46 @@ test("entries an extension in the child persists later (after agent_end) are its
   assert.equal(child.running, true); assert.equal(child.calls.filter(call => call.type === "prompt").length, 2);
   await appendFile(host.sessionFile, `${JSON.stringify({ type: "custom", id: "not-the-childs", parentId: null })}\n`);
   await assert.rejects(host.command("prompt", { text: "third" }), { code: "session_conflict" }); assert.equal(child.running, false);
+}));
+test("a read timeout during ownership verification rejects only the pending write and later retries it safely", async () => withHost(async (host, child) => {
+  child.manager.appendCustomEntry("delayed-extension", { run: 1 });
+  let entryReads = 0;
+  child.intercept = async type => {
+    // The first read synchronizes the mirror; the second verifies the file append.
+    if (type === "get_entries" && ++entryReads === 2) throw new RpcReadTimeoutError(type, 30_000);
+    return { intercepted: false };
+  };
+  await assert.rejects(host.command("prompt", { text: "retry later" }), { code: "rpc_read_timeout" });
+  assert.equal(child.running, true); assert.equal(entryReads, 2, "the timed-out ownership read is not retried implicitly");
+  assert(!child.calls.some(call => call.type === "prompt"), "a write is not submitted until ownership is verified");
+  await host.command("prompt", { text: "retry later" });
+  assert.equal(child.calls.filter(call => call.type === "prompt").length, 1); assert.equal(child.running, true);
+  await appendFile(host.sessionFile, `${JSON.stringify({ type: "custom", id: "foreign", parentId: null })}\n`);
+  await assert.rejects(host.command("prompt", { text: "must refuse" }), { code: "session_conflict" });
+  assert.equal(child.running, false, "a real ownership conflict still stops the writer");
+}));
+test("a read timeout while synchronizing before a write is not retried and the writer stays available", async () => withHost(async (host, child) => {
+  let entryReads = 0;
+  child.intercept = async type => {
+    if (type === "get_entries" && ++entryReads === 1) throw new RpcReadTimeoutError(type, 30_000);
+    return { intercepted: false };
+  };
+  await assert.rejects(host.command("prompt", { text: "retry later" }), { code: "rpc_read_timeout" });
+  assert.equal(child.running, true); assert.equal(entryReads, 1);
+  assert(!child.calls.some(call => call.type === "prompt"));
+  await host.command("prompt", { text: "retry later" });
+  assert.equal(child.calls.filter(call => call.type === "prompt").length, 1);
+}));
+test("a timed-out workbench read fails once and a later read succeeds without replacing the child", async () => withHost(async (host, child) => {
+  let commandReads = 0;
+  child.intercept = async type => {
+    if (type === "get_commands" && ++commandReads === 1) throw new RpcReadTimeoutError(type, 30_000);
+    return { intercepted: false };
+  };
+  await assert.rejects(host.read("commands"), { code: "rpc_read_timeout" });
+  assert.equal(child.running, true); assert.equal(commandReads, 1);
+  assert((await host.read("commands")).commands.some(command => command.name === "mark"));
+  assert.equal(commandReads, 2); assert.equal(child.running, true);
 }));
 test("trusted child startup persistence is acknowledged before first browser command", async () => withHost(async (host, child) => {
   await host.command("prompt", { text: "first" }); assert(child.calls.some(call => call.type === "prompt"));

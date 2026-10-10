@@ -1,9 +1,9 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { appendFile, mkdtemp, writeFile, readFile, rm, stat, symlink, truncate, utimes } from "node:fs/promises";
+import { appendFile, mkdtemp, writeFile, readFile, rename, rm, stat, symlink, truncate, utimes } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { SessionFileLock } from "../src/extension/session-lock.js";
+import { SessionFileLock, type KnownEntry } from "../src/extension/session-lock.js";
 
 async function fixture(run: (path: string, root: string) => Promise<void>) {
   const root = await mkdtemp(join(tmpdir(), "pi-pane-lock-")); const path = join(root, "session.jsonl");
@@ -37,25 +37,25 @@ test("uncooperative changes while idle fail the strict check; accepted contents 
 }));
 
 const line = (value: Record<string, unknown>) => `${JSON.stringify(value)}\n`;
-async function transcript(run: (path: string, lock: SessionFileLock, known: Array<{ id: string; type: string }>, asked: Array<string | undefined>) => Promise<void>) {
+async function transcript(run: (path: string, lock: SessionFileLock, known: KnownEntry[], asked: Array<string | undefined>) => Promise<void>) {
   return fixture(async path => {
     await writeFile(path, line({ type: "session", id: "session-1", cwd: "/" }) + line({ type: "message", id: "a", parentId: null }));
-    const lock = await SessionFileLock.acquire(path); const known = [{ id: "a", type: "message" }]; const asked: Array<string | undefined> = [];
+    const lock = await SessionFileLock.acquire(path); const known: KnownEntry[] = [{ id: "a", type: "message", parentId: null }]; const asked: Array<string | undefined> = [];
     try { await run(path, lock, known, asked); } finally { await lock.release(); }
   });
 }
-const writer = (known: Array<{ id: string; type: string }>, asked: Array<string | undefined>) => async (since?: string) => {
+const writer = (known: KnownEntry[], asked: Array<string | undefined>) => async (since?: string) => {
   asked.push(since); const index = since ? known.findIndex(entry => entry.id === since) : -1; return index >= 0 ? known.slice(index + 1) : known;
 };
 test("entries the owned writer appends at any time are accepted, read incrementally from the last one", async () => transcript(async (path, lock, known, asked) => {
-  await appendFile(path, line({ type: "custom", id: "b", parentId: "a" })); known.push({ id: "b", type: "custom" });
+  await appendFile(path, line({ type: "custom", id: "b", parentId: "a" })); known.push({ id: "b", type: "custom", parentId: "a" });
   await lock.verifyAppends(writer(known, asked));
-  await appendFile(path, line({ type: "message", id: "c", parentId: "b" })); known.push({ id: "c", type: "message" });
+  await appendFile(path, line({ type: "message", id: "c", parentId: "b" })); known.push({ id: "c", type: "message", parentId: "b" });
   await lock.verifyAppends(writer(known, asked));
   assert.deepEqual(asked, ["a", "b"]); await lock.assertUnchanged();
 }));
 test("an incomplete last line waits for completion instead of failing", async () => transcript(async (path, lock, known, asked) => {
-  const next = line({ type: "message", id: "b", parentId: "a" }); known.push({ id: "b", type: "message" });
+  const next = line({ type: "message", id: "b", parentId: "a" }); known.push({ id: "b", type: "message", parentId: "a" });
   await appendFile(path, next.slice(0, 10)); await lock.verifyAppends(writer(known, asked)); assert.deepEqual(asked, []);
   await appendFile(path, next.slice(10)); await lock.verifyAppends(writer(known, asked)); assert.deepEqual(asked, ["a"]);
 }));
@@ -71,14 +71,40 @@ test("unknown entries, blank lines, truncation and rewritten history are conflic
     await truncate(path, 10); await assert.rejects(lock.verifyAppends(writer(known, asked)), { code: "session_conflict" });
   });
   await transcript(async (path, lock, known, asked) => {
-    const text = await readFile(path, "utf8"); await writeFile(path, `${text.replace('"a"', '"z"')}${line({ type: "message", id: "b", parentId: "a" })}`); known.push({ id: "b", type: "message" });
+    const text = await readFile(path, "utf8"); await writeFile(path, `${text.replace('"a"', '"z"')}${line({ type: "message", id: "b", parentId: "a" })}`); known.push({ id: "b", type: "message", parentId: "a" });
     await assert.rejects(lock.verifyAppends(writer(known, asked)), { code: "session_conflict" });
   });
 });
-test("a replaced transcript is accepted only when every entry is the writer's", async () => transcript(async (path, lock, known, asked) => {
+test("a replacement that preserves accepted history and appends complete writer entries is accepted", async () => transcript(async (path, lock, known, asked) => {
   const content = await readFile(path, "utf8"); await rm(path); await writeFile(path, content + line({ type: "message", id: "b", parentId: "a" }));
-  known.push({ id: "b", type: "message" }); await lock.verifyAppends(writer(known, asked)); assert.deepEqual(asked, [undefined]);
+  known.push({ id: "b", type: "message", parentId: "a" }); await lock.verifyAppends(writer(known, asked)); assert.deepEqual(asked, [undefined]);
   await rm(path); await writeFile(path, content + line({ type: "message", id: "x", parentId: "a" }));
+  await assert.rejects(lock.verifyAppends(writer(known, asked)), { code: "session_conflict" });
+}));
+test("rewriting accepted history before the last 4 KiB conflicts, with or without an owned append", async () => {
+  for (const append of [false, true]) await transcript(async (path, lock, known, asked) => {
+    const large = { type: "custom", id: "large", parentId: "a", data: "x".repeat(128 * 1024) };
+    await appendFile(path, line(large)); known.push(large); await lock.verifyAppends(writer(known, asked));
+    const contents = await readFile(path, "utf8");
+    const next = { type: "custom", id: "next", parentId: "large", data: "owned" }; known.push(next);
+    await writeFile(path, contents.replace('"a"', '"z"') + (append ? line(next) : ""));
+    await assert.rejects(lock.verifyAppends(writer(known, asked)), { code: "session_conflict" });
+  });
+});
+test("atomic replacement cannot truncate accepted history, change its contents, or alter its header", async () => {
+  for (const mutation of ["truncate", "content", "header"]) await transcript(async (path, lock, known, asked) => {
+    const next = { type: "custom", id: "b", parentId: "a", data: "original" };
+    const original = await readFile(path, "utf8");
+    await appendFile(path, line(next)); known.push(next); await lock.verifyAppends(writer(known, asked));
+    const contents = await readFile(path, "utf8");
+    const replacement = mutation === "truncate" ? original : mutation === "content" ? contents.replace("original", "tampered") : contents.replace("session-1", "session-2");
+    await writeFile(`${path}.replacement`, replacement); await rename(`${path}.replacement`, path);
+    await assert.rejects(lock.verifyAppends(writer(known, asked)), { code: "session_conflict" });
+  });
+});
+test("an appended entry must match the writer's full contents, not only its ID and type", async () => transcript(async (path, lock, known, asked) => {
+  known.push({ type: "custom", id: "b", parentId: "a", data: "owned" });
+  await appendFile(path, line({ type: "custom", id: "b", parentId: "a", data: "foreign" }));
   await assert.rejects(lock.verifyAppends(writer(known, asked)), { code: "session_conflict" });
 }));
 test("an acquisition guard left by a dead or finished process is reclaimed; a live one refuses", async () => fixture(async path => {
