@@ -1,6 +1,6 @@
 # M3 交接工作台状态
 
-更新：2026-10-10，Asia/Shanghai。当前分支：`main`。本次 0.2.0 发布候选以 `d5cd02d` 为基线，包含下述发布前修复，已通过确定性回归、真实模型试用和精确包安装。日常 pi 已改为加载本地 0.2.0 候选；公共 npm 仍为 0.1.0，尚未发布 0.2.0 或推送本次改动。
+更新：2026-10-10，Asia/Shanghai。当前分支：`main`。0.2.0 对应源码 `439c545`（以 `d5cd02d` 为基线并包含下述发布前修复），已通过确定性回归、真实模型试用和精确候选包安装。用户授权后已重新登录 npm 并发布冻结包；公共版本元数据与安装索引显示 0.2.0，下载的 tarball SHA-256 与冻结候选一致，独立公共安装 **5/5** 通过。日常 pi 已切换为正式 `npm:@lilibonk/pi-pane@0.2.0`，重启现有 pi 即可加载；尚未推送 Git 改动。
 
 维护者的 [M3 调整说明](m3-codex-adjustment.md) 已完整阅读并作为本次范围：`/web` 先正常退出 TUI，同进程留在前台提供网页服务，单个 `pi --mode rpc` 子进程是唯一会话写入者。Ctrl+C 停止服务并打印最新会话恢复命令，关闭终端同时结束服务；镜像路径、内部命令网关、nonce 与跨 Bridge 写屏障删除。
 
@@ -32,7 +32,7 @@
 
 本次候选证据目录为 `build-artifacts/releases/0.2.0/`。类型检查、生产构建和单元测试 **136/136** 通过，日志见 `build-checks.json`、`typecheck.log`、`build.log`、`test.log`。确定性回归使用临时 HOME、agent/session/workspace 和本地 provider，远程模型调用为 **0**，不读取日常认证。
 
-完整矩阵 **125/125，14 组**：smoke 22、浏览器 10、生命周期 9、边界 22、投影 2、渲染 7、A6 2、图片 5、外部访问 6、正式交接长时模式 15、工作台 16、性能 3、初始主题 2，另加精确候选包安装 4。`regression/summary.json` 保存前 13 组 **121/121** 的实际结果及源码/构建 SHA-256；安装证据独立保存于 `install/report.json`。本次未重跑旧 19 项 CUA，不能把它们计入新版验收。
+完整矩阵 **125/125，14 组**：smoke 22、浏览器 10、生命周期 9、边界 22、投影 2、渲染 7、A6 2、图片 5、外部访问 6、正式交接长时模式 15、工作台 16、性能 3、初始主题 2，另加精确候选包安装 4。`regression/summary.json` 保存前 13 组 **121/121** 的实际结果及源码/构建 SHA-256；安装证据独立保存于 `install/report.json`。发布后公共 registry 安装另记 **5/5**，不合并进这个候选矩阵。本次未重跑旧 19 项 CUA，不能把它们计入新版验收。
 
 | 检查 | 本次候选状态 | 证据（相对本次候选目录） |
 |---|---|---|
@@ -46,8 +46,9 @@
 | 真实 provider | 5/5，新获限定授权 | real-model/report.json；real-model/browser.png |
 | 冻结候选安装 | 4/4；精确 tgz 经本地模拟 registry 安装 | install/report.json |
 | 清理 | runner HOME、25 个报告引用的 fixture 根、临时认证引用均已清理 | regression/summary.json；real-model-cleanup.json |
-| 日常插件来源 | 已切换本地 0.2.0；自动发现、交接与确定性回复通过 | daily-install.json |
-| 公共 npm 发布及正式安装 | 未执行；npm whoami 返回 E401，需维护者重新登录发布 | 发布后再验证公共 registry 安装 |
+| 日常插件来源 | 已切换为唯一 npm 0.2.0 来源；83 个包文件与冻结候选一致，其余 settings 哈希未变 | daily-public-install.json |
+| 公共 npm 发布 | 已发布 0.2.0；版本/安装索引、integrity 与下载 SHA-256 均匹配 | publication.json |
+| 公共 registry 正式安装 | 5/5；日常 pi 1.1.0 CLI、隔离 HOME、确定性 provider | public-install/report.json；public-install-cleanup.json |
 
 性能在 macOS arm64 / Node 24.20.0 / pi 1.1.0 的隔离环境单独执行，源码和构建产物在测试前后 SHA-256 一致。相同 256 KiB RPC writer 工作负载每配置 3 轮，0/4/8 viewer 耗时中位数约 **331/324/320 ms**，writer event-loop P95 中位数约 **11.05/10.94/10.83 ms**。暂停客户端以 1013/slow_client 回收，其他 3 个读取端继续工作；2 MiB 工具结果可经 17 页完整读取；历史快照 200 条，可分页取回全部 1,228 条。
 
@@ -55,13 +56,15 @@
 
 真实试用加载同一候选解包目录，使用日常 pi 1.1.0 的 Node CLI 与 `qwen-token-plan-cn/qwen3.7-max`，在隔离 HOME、会话与工作区执行 3 次短提示、一次 builtin bash；工具运行中刷新/重连，最终与 fresh canonical snapshot 一致，0 page/protocol errors，**5/5** 通过。临时 agent 以 symlink 引用用户新获授权的本地认证，wrapper 不读取或复制认证内容；试用后临时目录/链接已删除，原凭据仍为 0600。授权仅用于这次限定试用，不扩展为后续自动读取日常凭据。`submittedPrompts=3` 不等于 provider 请求/计费次数，短试用不证明长期稳定性。
 
-`integrity-verification.json` 确认候选 tgz、仓库与日常解包安装中的 83 个包文件逐字节一致，131 个回归源码和构建哈希仍匹配。冻结候选：`build-artifacts/releases/0.2.0/candidate/lilibonk-pi-pane-0.2.0.tgz`，SHA-256：
+`integrity-verification.json` 保存源码 `439c545` 冻结时的校验：候选 tgz、当时仓库与日常解包安装中的 83 个包文件逐字节一致，131 个回归源码和构建哈希匹配。发布后仓库文档更新发布状态，不重打包或修改已发布 tgz；公共下载与当前日常正式安装的 83 个包文件仍与冻结候选一致。冻结候选：`build-artifacts/releases/0.2.0/candidate/lilibonk-pi-pane-0.2.0.tgz`，SHA-256：
 
 ```text
 5bba224d3b106139ee56614e5ec83079ba97f324a56bfc11c29a0656177f2eb0
 ```
 
-日常 pi 已通过 `pi remove` / `pi install` 切换为 `/Users/zile.zhou/.pi/agent/local/pi-pane/0.2.0-5bba224d3b10`。只有该包来源变更，其余 settings 哈希保持不变。隔离 HOME 复用相同相对来源及实际日常 pi 1.1.0 CLI，未显式 `-e` 加载 pane，自动发现、`/web` 与确定性回复通过，0 协议错误且临时资源已清理；此检查单列，不计入 125 项矩阵。已打开的 pi 需重启后加载新版。这是同一候选的本地安装，公共 npm 仍为 0.1.0；本地安装和真实试用不替代发布后 registry 完整性与安装验证。发布准备汇总见 `build-artifacts/releases/0.2.0/release-readiness.json`。
+候选阶段曾通过 `pi remove` / `pi install` 切换至本地冻结目录，并在隔离 HOME 中验证相同相对来源的自动发现、`/web` 与确定性回复，0 协议错误；记录保留在 `daily-install.json`，不计入 125 项矩阵。公共 npm 0.2.0 包下载及独立安装 **5/5** 通过后，日常 pi 已切换为唯一来源 `npm:@lilibonk/pi-pane@0.2.0`，实际路径 `/Users/zile.zhou/.pi/agent/npm/node_modules/@lilibonk/pi-pane`。npm lock 的公共 tarball/integrity 匹配，83 个包文件与冻结候选逐字节一致，其余 settings 哈希未变；临时 npm 配置和 cache 已清理，记录见 `daily-public-install.json`。本地候选目录保留为未注册的回退快照，不会重复加载。已打开的 pi 需重启后加载新版。
+
+公共安装使用临时 HOME/agent/cache、实际日常 pi 1.1.0 CLI 和本地确定性 provider，0 真实模型调用，不读取日常凭据；临时 runner HOME 已清理。发布汇总见 `build-artifacts/releases/0.2.0/release-readiness.json`。
 
 `38152e1` 的 CUA 覆盖实际 Git diff/文件引用、模型/thinking、四类扩展对话框与 UTF-8 超限、移动端抽屉/嵌套模态焦点和 inert、重命名/当前标记/跨 cwd、用户 fork、空分支 clone 失败后继续对话、已保存分支 clone、第二浏览器竞争回答、待处理对话框刷新、慢流 partial 刷新及凭据轮换后本页刷新。审阅修正未改网页源码，但没有重跑这 19 项实际交互。普通未发送草稿不跨全页面刷新保存。
 
@@ -110,14 +113,8 @@
 
 ## 后续边界与发布
 
-本次候选开发、确定性验收、限定真实模型试用和日常本地版本切换已完成；新版 CUA 19 项未复跑，公共 npm 发布与发布后正式安装验证尚待维护者执行。当前 npm 登录返回 E401，需要重新登录。
+本次候选开发、确定性验收、限定真实模型试用和日常本地版本切换已完成；新版 CUA 19 项未复跑。用户明确授权重新检查登录并执行发布后，npm 登录与本次发布认证已完成，精确冻结包发布命令退出码为 0，返回 `+ @lilibonk/pi-pane@0.2.0`。版本元数据与安装索引显示 0.2.0，dist integrity 与下载 tarball SHA-256 均与候选一致；记录见 `build-artifacts/releases/0.2.0/publication.json`。
 
-维护者在仓库根目录登录后，可发布已验证的精确候选包：
-
-```sh
-npm publish build-artifacts/releases/0.2.0/candidate/lilibonk-pi-pane-0.2.0.tgz --access public
-```
-
-发布后核对公共 registry 的版本与 tarball integrity，再通过 `PI_M2_PUBLISHED_TARBALL` 完成公共 npm 安装验证；确认后将日常本地来源切换为 `npm:@lilibonk/pi-pane@0.2.0`。本次尚未执行 npm 发布或 Git 推送。
+发布后先观察到版本元数据可见、tarball 暂返 404，等待至 2026-10-10 09:40:31（Asia/Shanghai）下载就绪后完成完整性核对，没有重复发布。随后 `PI_M2_PUBLISHED_TARBALL` 公共安装 **5/5** 通过，涵盖打包内容、公开版本/integrity、干净 npm 安装、TUI 交接及网页对话/刷新、主题/CSS；证据见 `public-install/report.json`、`public-install.log` 与 `public-install-cleanup.json`。此结果独立于候选 125/125 矩阵和真实模型 5/5。日常来源已切换为 `npm:@lilibonk/pi-pane@0.2.0`，文件完整性和唯一注册来源已核对，记录见 `daily-public-install.json`。本次没有 Git 推送。
 
 工具列表/启停与 tree 导航仍等待 pi 公开 RPC 支持；任意扩展 custom TUI 与 Plan/Goal/Agent 等执行语义需另行设计。继续收集日常稳定性反馈，短试用不替代长期观察。

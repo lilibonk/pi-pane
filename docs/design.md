@@ -1,6 +1,6 @@
 # pi `/web`：交接工作台设计
 
-状态：M3 交接修订 v0.8，2026-10-10。源码版本 `0.2.0` 尚未发布，开发分支为 `main`；正式 npm 仍为 `@lilibonk/pi-pane@0.1.0`（MIT）。当前能力与测试基线为 pi / pi-ai 1.1.0，Node ≥22.19，macOS/Linux。本地候选安装与验收结果见 [M3 状态](m3-status.md)。
+状态：M3 交接修订 v0.8，2026-10-10。`@lilibonk/pi-pane@0.2.0` 已发布到 npm（MIT），开发分支为 `main`。当前能力与测试基线为 pi / pi-ai 1.1.0，Node ≥22.19，macOS/Linux。正式安装与验收结果见 [M3 状态](m3-status.md)。
 
 维护者的 [调整说明](m3-codex-adjustment.md) 取代 v0.6 的镜像、命令网关及后台 attach 方向。`spike/m3-handoff` 仅证明交接可行，依据与 8 项原型证据见 [交接 spike](m3-handoff-spike.md)；不能直接作为可发布实现。原工作台在 commit `6196c7b` 保存，旧证据与已发布 0.1.0 的 M0–M2 验收均为历史记录，不作为本修订的通过结论。
 
