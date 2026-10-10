@@ -1,0 +1,36 @@
+{
+  "commit": "abe508e1b89912adde45528136c3221eb69acdd7",
+  "source": "published npm 1.1.0 sourcemap sourcesContent compared to immutable upstream commit",
+  "files": [
+    {
+      "path": "packages/coding-agent/src/core/model-runtime.ts",
+      "same": true,
+      "sha256": "5f07a8c675f8ec6acffebf91fd0675910bdbd6348e6e100cf35ad4993fc84b30"
+    },
+    {
+      "path": "packages/coding-agent/src/core/auth-storage.ts",
+      "same": true,
+      "sha256": "32d36165760959766807b8797042e69b65a65c7aad7d1b79a2621c41fe29b48d"
+    },
+    {
+      "path": "packages/ai/src/auth/types.ts",
+      "same": true,
+      "sha256": "2d14d659f1c62f11cc942b1c2d681f2218c0b671cc37a1df59a5e1a1ee37aef5"
+    },
+    {
+      "path": "packages/ai/src/auth/oauth/kimi-coding.ts",
+      "same": true,
+      "sha256": "5461cc78e6bf118061b67ba2bb26109217863f332904f0601b6da85309ea3657"
+    },
+    {
+      "path": "packages/ai/src/auth/oauth/openai-codex.ts",
+      "same": true,
+      "sha256": "2b73b65d0a65b770708a4aead7d89c11f3656c4c2a1b055acd98a4186bab0865"
+    },
+    {
+      "path": "packages/ai/src/auth/oauth/openai-chatgpt.ts",
+      "same": true,
+      "sha256": "ad9dbdd7ffa52fcbaff1d1be2d0ba97b643476aaf8930e6dd67147bf35c837de"
+    }
+  ]
+}

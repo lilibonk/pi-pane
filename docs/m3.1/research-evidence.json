@@ -1,0 +1,74 @@
+{
+  "date": "2026-10-10",
+  "timezone": "Asia/Shanghai",
+  "status": "research-only, no M3.1 implementation acceptance",
+  "piPaneCommit": "c2c39e6f7a84c7e8490bbca587528cb195524e22",
+  "piVersion": "1.1.0",
+  "piCommit": "abe508e1b89912adde45528136c3221eb69acdd7",
+  "kimiVersion": "2.1.1",
+  "kimiCommit": "242ac230006447f8601e1678c49182bfbae89fe9",
+  "kimiEntrypointSha256": "2563a338c94868a34e1bfd2e5579067d5a472acf4cb0bf350a3bfe1092bbe59d",
+  "method": "Official npm CLI web entry, isolated HOME and KIMI_CODE_HOME, Chrome via CUA",
+  "modelPromptsSent": 0,
+  "dailyCredentialsRead": false,
+  "networkSilenceAudited": false,
+  "observations": [
+    {
+      "id": "K-01",
+      "result": "Host directory picker and absolute path entry visible"
+    },
+    {
+      "id": "K-02",
+      "result": "Added synthetic existing project outside startup cwd; empty workspace visible"
+    },
+    {
+      "id": "K-03",
+      "result": "Workspace still visible after browser reload; service restart not tested"
+    },
+    {
+      "id": "K-04",
+      "result": "General settings visible; changing/saving not tested"
+    },
+    {
+      "id": "K-05",
+      "result": "Account login entry visible; no login initiated"
+    },
+    {
+      "id": "K-06",
+      "result": "Custom provider form visible; cancelled without entering credentials or saving"
+    }
+  ],
+  "screenshots": [
+    {
+      "path": "../images/m3.1/kimi-account.png",
+      "sha256": "d37f7ef53d13137966a9c8c5fe1ca149f549db8593b1916de00cea83216c410b",
+      "bytes": 30744
+    },
+    {
+      "path": "../images/m3.1/kimi-general.png",
+      "sha256": "b10cce9a67fec77f828e7a2fbadcc66784dc2e3f2637ff79fb258e7231098a8a",
+      "bytes": 53030
+    },
+    {
+      "path": "../images/m3.1/kimi-project-added.png",
+      "sha256": "967f30a27442b31c00972c33599c307f3cd6d50c64e0e299f9ea78953e13b6ab",
+      "bytes": 24938
+    },
+    {
+      "path": "../images/m3.1/kimi-project-picker.png",
+      "sha256": "699cb84c3c5d21bd1ba7e14fe3ef596dc48ae23d97f3f428fc23ce06a996d4c6",
+      "bytes": 36389
+    },
+    {
+      "path": "../images/m3.1/kimi-provider-form.png",
+      "sha256": "f0b9cc548e58c4b525db44f677a73f6104044e1af2485dc70b824becf8fc30ae",
+      "bytes": 63314
+    }
+  ],
+  "cleanup": {
+    "childExited": true,
+    "temporaryRootRemoved": true,
+    "accessRemoved": true,
+    "realModelCalls": 0
+  }
+}

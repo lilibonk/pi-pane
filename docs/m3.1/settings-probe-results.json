@@ -1,0 +1,35 @@
+{
+  "date": "2026-10-10",
+  "pi": "1.1.0",
+  "method": "public SettingsManager.fromStorage with synthetic in-memory storage",
+  "dailyFilesRead": false,
+  "modelCalls": 0,
+  "scope": {
+    "effective": "light",
+    "global": {
+      "theme": "fixture-theme",
+      "unrelated": 7
+    },
+    "project": {
+      "theme": "light"
+    },
+    "errors": 0
+  },
+  "failure": {
+    "flushRejected": false,
+    "inMemory": "light",
+    "persisted": "dark",
+    "errors": 1
+  },
+  "merge": {
+    "persisted": {
+      "images": {
+        "autoResize": false,
+        "blockImages": true
+      },
+      "unrelated": 7,
+      "external": "kept"
+    },
+    "errors": 0
+  }
+}
