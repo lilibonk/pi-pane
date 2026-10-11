@@ -491,3 +491,73 @@ p.account-reason { margin: 6px 0 0; }
 @media (max-width: 760px) { .extension-statuses { padding: 7px 16px; } .extension-widgets { padding: 0 16px; } }
 
 .composer-inner > .extension-widgets { padding: 0; }
+/* Settings dialog. Colors come from the theme variables only. */
+.dialog.project-dialog:has(.settings-dialog) { width: min(760px, 100%); padding: 0; overflow: hidden; }
+.settings-dialog { display: grid; grid-template-columns: 148px minmax(0, 1fr); grid-template-rows: auto minmax(0, 1fr); height: min(78dvh, 680px); }
+.settings-head { grid-column: 1 / -1; display: flex; align-items: center; justify-content: space-between; padding: 14px 18px; border-bottom: 1px solid var(--border); }
+.dialog .settings-head h2 { margin: 0; }
+.settings-nav { display: flex; flex-direction: column; gap: 2px; padding: 10px 8px; border-right: 1px solid var(--border); overflow-y: auto; }
+.settings-nav button { text-align: left; border-color: transparent; color: var(--fg-muted); font-size: 13px; padding: 7px 10px; }
+.settings-nav button[aria-pressed="true"] { color: var(--fg); background: color-mix(in srgb, var(--fg) 7%, var(--bg)); }
+.settings-body { overflow-y: auto; overscroll-behavior: contain; padding: 14px 18px 18px; min-width: 0; }
+.settings-body .resource-item, .settings-body .resource-note, .settings-body .panel-message, .settings-body .panel-search { padding-left: 0; padding-right: 0; }
+.settings-body .account-banner, .settings-body .account-more { margin-left: 0; margin-right: 0; }
+.dialog .setting-intro { font-size: 12px; margin: 0 0 14px; }
+.setting-row { padding: 12px 0; border-top: 1px solid var(--border); }
+.setting-row:first-of-type { border-top: 0; }
+.setting-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.setting-head label, .setting-head strong { font-size: 13px; font-weight: 550; color: var(--fg); }
+.setting-head select, .theme-default-select select { max-width: 60%; min-width: 0; padding: 5px 8px; font-size: 12px; background: var(--bg); }
+.setting-head input[type="checkbox"], .setting-check input { width: 16px; height: 16px; accent-color: var(--accent); flex-shrink: 0; }
+.dialog .setting-note { font-size: 11px; line-height: 1.7; margin: 6px 0 0; color: var(--fg-muted); white-space: normal; overflow-wrap: anywhere; }
+.dialog .setting-warn { color: var(--err); }
+.dialog .setting-ok { color: var(--ok); }
+.setting-layers { margin: 8px 0 0; font-size: 11px; line-height: 1.7; }
+.setting-layers > div { display: flex; gap: 8px; }
+.setting-layers dt { flex: 0 0 92px; color: var(--fg-dim); }
+.setting-layers dd { margin: 0; color: var(--fg); overflow-wrap: anywhere; min-width: 0; }
+.setting-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 10px; }
+.setting-subhead { display: flex; align-items: center; justify-content: space-between; margin: 20px 0 8px; }
+.setting-subhead h3, .setting-group h3 { margin: 0; font-size: 12px; font-weight: 600; color: var(--fg); }
+.setting-subhead button { font-size: 11px; padding: 3px 8px; }
+.setting-check { display: flex; align-items: flex-start; gap: 8px; margin-top: 10px; font-size: 12px; line-height: 1.5; color: var(--fg); }
+.setting-preview { position: sticky; bottom: -18px; display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin: 12px -18px -18px; padding: 10px 18px; border-top: 1px solid var(--border); background: var(--surface); font-size: 12px; line-height: 1.5; }
+.setting-banner { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin: 0 0 12px; border: 1px solid var(--border); border-radius: 6px; padding: 8px 10px; font-size: 12px; line-height: 1.5; }
+.setting-preview span, .setting-banner span { flex: 1 1 200px; color: var(--fg); }
+.theme-options { display: grid; grid-template-columns: repeat(auto-fill, minmax(230px, 1fr)); gap: 8px; }
+.theme-option { display: flex; align-items: flex-start; gap: 10px; padding: 9px 10px; text-align: left; white-space: normal; }
+.theme-option.is-current { border-color: var(--accent); background: color-mix(in srgb, var(--accent) 8%, var(--bg)); }
+.theme-option-text { min-width: 0; }
+.theme-option-text strong { display: flex; flex-wrap: wrap; align-items: baseline; gap: 6px; font-size: 12px; font-weight: 550; overflow-wrap: anywhere; }
+.theme-option-text strong small { font-size: 10px; font-weight: 400; color: var(--accent); }
+.theme-option-text > span { display: block; margin-top: 3px; font-size: 11px; line-height: 1.6; color: var(--fg-muted); overflow-wrap: anywhere; }
+.theme-swatch { flex: 0 0 34px; height: 34px; display: inline-flex; align-items: center; justify-content: center; border: 2px solid var(--border); border-radius: 7px; font-size: 12px; font-weight: 600; background: var(--surface); color: var(--fg); }
+.theme-default-controls { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 10px; }
+.theme-default-select { display: flex; flex-direction: column; gap: 4px; font-size: 11px; color: var(--fg-muted); min-width: 0; }
+.theme-default-select select { max-width: 100%; }
+.setting-problems { margin-top: 10px; font-size: 11px; color: var(--fg-muted); }
+.setting-problems ul, .setting-readonly { margin: 6px 0 0; padding: 0; list-style: none; }
+.setting-problems li { line-height: 1.7; overflow-wrap: anywhere; }
+.setting-group { padding: 12px 0; border-top: 1px solid var(--border); }
+.setting-group h3 { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; }
+.setting-group h3 small { font-size: 10px; font-weight: 400; color: var(--fg-dim); white-space: nowrap; }
+.setting-readonly li { display: flex; justify-content: space-between; gap: 12px; padding: 3px 0; font-size: 11px; line-height: 1.6; }
+.setting-readonly code { font-family: var(--mono, ui-monospace, monospace); color: var(--fg); overflow-wrap: anywhere; }
+.setting-readonly span { color: var(--fg-muted); text-align: right; overflow-wrap: anywhere; min-width: 0; }
+/* This browser's choice to hide thinking: the block stays in the transcript, only its text is not shown. */
+.hide-thinking details.thinking > :not(summary) { display: none; }
+.hide-thinking details.thinking > summary { list-style: none; cursor: default; }
+.hide-thinking details.thinking > summary::-webkit-details-marker { display: none; }
+.hide-thinking details.thinking > summary::after { content: " · 内容已隐藏"; }
+@media (max-width: 650px) {
+  .dialog-backdrop:has(.settings-dialog) { padding: 0; align-items: stretch; background: var(--bg); }
+  .dialog.project-dialog:has(.settings-dialog) { width: 100%; height: 100%; max-height: none; border-radius: 0; border: 0; box-shadow: none; }
+  .settings-dialog { grid-template-columns: minmax(0, 1fr); grid-template-rows: auto auto minmax(0, 1fr); height: 100%; }
+  .settings-nav { flex-direction: row; border-right: 0; border-bottom: 1px solid var(--border); overflow-x: auto; padding: 6px 10px; }
+  .settings-nav button { flex-shrink: 0; }
+  .settings-body { padding: 12px 14px 16px; }
+  .setting-preview { margin: 12px -14px -16px; padding: 10px 14px; bottom: -16px; }
+  .setting-head select { max-width: 55%; }
+  .setting-layers dt { flex-basis: 84px; }
+}
+@media (pointer: coarse) { .settings-nav button, .theme-option, .setting-actions button, .setting-preview button, .setting-banner button { min-height: 40px; } .setting-head input[type="checkbox"], .setting-check input { width: 20px; height: 20px; } }

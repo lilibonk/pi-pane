@@ -22,7 +22,7 @@ class Scripted implements AuthRuntime {
 }
 function setup(script: Login, limitMs?: number) {
   const runtime = new Scripted(script); const changes: string[] = []; let published = 0;
-  const controller = new AuthController({ agentDir: "/unused", createRuntime: async () => runtime, publish: () => { published++; }, changed: (provider, change) => changes.push(`${change}:${provider}`), ...(limitMs ? { limitMs } : {}) });
+  const controller = new AuthController({ agentDir: "/unused", createRuntime: async () => runtime, publish: () => { published++; }, changed: (provider, change) => changes.push(`${change}:${provider}`), ...(limitMs ? { limitMs } : {}), webOAuth: new Set(["kimi-coding"]) });
   return { controller, runtime, changes, published: () => published };
 }
 const until = async <T>(read: () => T | undefined | null | false, label = "condition"): Promise<T> => {
@@ -212,7 +212,9 @@ test("pi's own runtime: listing never executes a stored key command, and a brows
     const providers = await controller.providers();
     assert.equal(providers.find(provider => provider.id === "openai")?.stored, "api_key"); assert.equal(providers.find(provider => provider.id === "kimi-coding")?.stored, "oauth");
     assert(providers.length > 20); assert(providers.find(provider => provider.id === "anthropic")!.methods.some(method => method.type === "api_key" && method.web));
-    assert.deepEqual(providers.find(provider => provider.id === "kimi-coding")!.methods.map(method => [method.type, method.web]), [["api_key", true], ["oauth", true]]);
+    // No OAuth login is offered from the browser by default: device-code flows are unverified, callback flows unsupported.
+    assert.deepEqual(providers.find(provider => provider.id === "kimi-coding")!.methods.map(method => [method.type, method.web, method.reason]), [["api_key", true, undefined], ["oauth", false, "unverified"]]);
+    await assert.rejects(controller.begin("page", "kimi-coding", "oauth"), { code: "unsupported_method" });
     assert.deepEqual(providers.find(provider => provider.id === "anthropic")!.methods.find(method => method.type === "oauth"), { type: "oauth", label: "Anthropic (Claude Pro/Max)", web: false, reason: "callback" });
     await assert.rejects(access(marker), "listing providers must not run a stored key command");
     // A real pi login of a built-in provider, with a key that would be a command if stored as typed.

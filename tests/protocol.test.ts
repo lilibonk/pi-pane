@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { applyDelta, applyProjectionEvent, commandArgs, diffMessage, mergeOlderPage, parseClientMessage, ProtocolError, type MessageView, type ProjectionState } from "../src/protocol/index.ts";
+import { applyDelta, applyProjectionEvent, commandArgs, hostCommandArgs, hostQueryArgs, diffMessage, mergeOlderPage, parseClientMessage, ProtocolError, type MessageView, type ProjectionState } from "../src/protocol/index.ts";
 
 test("wire validation rejects ambiguous identities and unsafe command counters", () => {
   const valid = { t: "command", clientId: "client", commandNo: 1, id: "client:1", epoch: "epoch", sessionId: "session", branchRevision: 0, command: "abort", args: {} };
@@ -77,4 +77,15 @@ test("thinking timing changes and removals survive the shared delta reducer", ()
     assert.deepEqual(applyDelta(before, ops), after);
     before = after;
   }
+});
+
+test("a setting change names one known setting, a new value and the value the page was showing", () => {
+  for (const args of [{ key: "theme", value: "light/dark", expected: null }, { key: "images.blockImages", value: true, expected: false }, { key: "defaultModel", value: "acme/fast", expected: "acme/slow" }])
+    assert.equal(hostCommandArgs("setting_set", args), args);
+  for (const args of [{ key: "theme", value: "dark" }, { key: "theme", value: null, expected: null }, { key: "httpProxy", value: "x", expected: null }, { key: "theme", value: "dark", expected: null, scope: "project" },
+    { key: "theme", value: { name: "dark" }, expected: null }, { key: "theme", value: "", expected: null }, { key: "theme", value: "a\nb", expected: null }, { key: "theme", value: "x".repeat(257), expected: null }, { key: "theme", value: 1, expected: null }])
+    assert.throws(() => hostCommandArgs("setting_set", args), { code: "invalid_args" }, JSON.stringify(args));
+  assert.deepEqual(hostQueryArgs("theme", { name: "mine" }), { name: "mine" }); assert.deepEqual(hostQueryArgs("themes", {}), {}); assert.deepEqual(hostQueryArgs("settings", {}), {});
+  for (const args of [{}, { name: "" }, { name: "x".repeat(65) }, { name: "mine", path: "/etc" }]) assert.throws(() => hostQueryArgs("theme", args), { code: "invalid_args" });
+  assert.throws(() => hostQueryArgs("settings", { raw: true }), { code: "invalid_args" });
 });

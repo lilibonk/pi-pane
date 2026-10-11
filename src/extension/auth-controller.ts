@@ -22,10 +22,14 @@ export interface AuthControllerOptions {
   createRuntime?: () => Promise<AuthRuntime>;
   /** Absolute lifetime of one operation, whatever the provider's own expiry. */
   limitMs?: number;
+  /** Providers whose OAuth login is offered from the browser. None by default: see `DEVICE_CODE_OAUTH`. */
+  webOAuth?: ReadonlySet<string>;
 }
 /**
  * OAuth logins that only show a code and poll: they work from any device and need no listener on the
- * host. Flows with a localhost callback are not offered from the browser until they are verified there.
+ * host. The browser flow for them is implemented but has not been completed with a real account, so
+ * none is offered until one has; `webOAuth` opens them for a verification run. Flows with a localhost
+ * callback are a separate, larger gap.
  */
 const DEVICE_CODE_OAUTH = new Set(["kimi-coding", "github-copilot", "xai", "meta"]);
 const LIMIT_MS = 15 * 60_000;
@@ -70,11 +74,13 @@ export class AuthController {
     return runtime.getProviders().map(provider => {
       const methods: AccountMethod[] = [];
       if (provider.auth?.apiKey) methods.push({ type: "api_key", label: clip(provider.auth.apiKey.name, 120), web: !!provider.auth.apiKey.login, ...(provider.auth.apiKey.login ? {} : { reason: "ambient" as const }) });
-      if (provider.auth?.oauth) methods.push({ type: "oauth", label: clip(provider.auth.oauth.name, 120), web: DEVICE_CODE_OAUTH.has(provider.id), ...(DEVICE_CODE_OAUTH.has(provider.id) ? {} : { reason: "callback" as const }) });
+      if (provider.auth?.oauth) methods.push({ type: "oauth", label: clip(provider.auth.oauth.name, 120), web: this.webOAuth(provider.id),
+        ...(this.webOAuth(provider.id) ? {} : { reason: DEVICE_CODE_OAUTH.has(provider.id) ? "unverified" as const : "callback" as const }) });
       const kind = stored.get(provider.id);
       return { id: provider.id, name: clip(provider.name, 120), methods, ...(kind ? { stored: kind } : {}), models: 0, knownModels: runtime.getModels(provider.id).length };
     });
   }
+  private webOAuth(providerId: string): boolean { return !!this.options.webOAuth?.has(providerId); }
   get busy(): boolean { return this.operation?.status === "running"; }
   /** What `leaseId` may know: everything for the owner, only that something is running for anyone else. */
   view(leaseId: string | undefined): AccountOperation | null {
@@ -92,7 +98,7 @@ export class AuthController {
     const runtime = await this.runtime();
     const provider = runtime.getProviders().find(item => item.id === providerId);
     if (!provider) throw new ProtocolError("unknown_provider", "This provider is not one of pi's built-in providers. Providers added by extensions sign in from the terminal.");
-    const supported = method === "api_key" ? !!provider.auth?.apiKey?.login : !!provider.auth?.oauth && DEVICE_CODE_OAUTH.has(providerId);
+    const supported = method === "api_key" ? !!provider.auth?.apiKey?.login : !!provider.auth?.oauth && this.webOAuth(providerId);
     if (!supported) throw new ProtocolError("unsupported_method", "This login method is not available from the browser. Use /login in a terminal.");
     if (this.busy) throw new ProtocolError("account_busy", "Another account operation is in progress. Finish or cancel it first.");
     const limit = this.options.limitMs ?? LIMIT_MS;

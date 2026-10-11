@@ -11,6 +11,7 @@ import { CommandMenu, Workbench, useWorkbenchQuery, type WorkbenchController } f
 import { resolveSlash } from "./commands.js";
 import { ProjectDialogs } from "./projects.js";
 import { AccountDialogs } from "./accounts.js";
+import { SettingsDialog } from "./settings.js";
 import { extensionText } from "./ui-state.js";
 import "./style.css";
 
@@ -286,21 +287,24 @@ function App() {
       element.removeEventListener("compositionend", onEnd);
     };
   }, []);
+  // This browser's chosen theme when it has one, else the theme pi would use in the current project.
+  const theme = state.themeVars ?? snapshot?.theme;
   useEffect(() => {
     const root = document.documentElement;
     for (const key of themeKeys.current) root.style.removeProperty(key);
     const keys: string[] = [];
-    for (const [key, value] of Object.entries(snapshot?.theme ?? {})) {
+    for (const [key, value] of Object.entries(theme ?? {})) {
       if (/^--[a-z][a-z0-9-]*$/.test(key) && typeof value === "string" && CSS.supports("color", value)) {
         root.style.setProperty(key, value); keys.push(key);
       }
     }
     themeKeys.current = keys;
-    const accentLuminance = hexLuminance(snapshot?.theme["--accent"] ?? "#a5c9a8");
+    const accentLuminance = hexLuminance(theme?.["--accent"] ?? "#a5c9a8");
     if (accentLuminance !== undefined) root.style.setProperty("--button-fg", accentLuminance > .179 ? "#000000" : "#ffffff");
-    const backgroundLuminance = hexLuminance(snapshot?.theme["--bg"] ?? "#171a1e");
+    const backgroundLuminance = hexLuminance(theme?.["--bg"] ?? "#171a1e");
     if (backgroundLuminance !== undefined) root.style.colorScheme = backgroundLuminance > .179 ? "light" : "dark";
-  }, [snapshot?.theme]);
+  }, [theme]);
+  useEffect(() => { document.documentElement.classList.toggle("hide-thinking", !!state.appearance.hideThinking); }, [state.appearance.hideThinking]);
   useEffect(() => {
     if (!feed.current || !pinned.current) return;
     feed.current.scrollTop = feed.current.scrollHeight;
@@ -416,7 +420,8 @@ function App() {
       </footer>
       </>}
       </Workbench>
-      {state.dialogs[0] ? <DialogView key={state.dialogs[0].id} dialog={state.dialogs[0]} online={online} /> : state.projectDialog ? <ProjectDialogs state={state} /> : <AccountDialogs state={state} />}
+      {state.dialogs[0] ? <DialogView key={state.dialogs[0].id} dialog={state.dialogs[0]} online={online} /> : state.projectDialog ? <ProjectDialogs state={state} />
+        : state.account?.owner && state.account.id !== state.accountDismissed ? <AccountDialogs state={state} /> : state.settings ? <SettingsDialog state={state} canConfigure={canConfigure} /> : null}
     </div>
   );
 }

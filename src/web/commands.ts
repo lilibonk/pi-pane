@@ -3,7 +3,7 @@ import type { WorkbenchCommand } from "../protocol/workbench.js";
 /** RPC does not parse pi's interactive builtins. Reserve them even while the catalog is unavailable. */
 const actions: Record<string, WorkbenchCommand["browserAction"]> = {
   new: "new", resume: "sessions", fork: "tree", model: "model", thinking: "thinking",
-  compact: "compact", settings: "resources", session: "status", name: "rename", clone: "clone",
+  compact: "compact", settings: "settings", session: "status", name: "rename", clone: "clone",
 };
 const unsupported = ["tree", "scoped-models", "export", "import", "share", "bug", "copy", "changelog", "hotkeys",
   "trust", "login", "logout", "reload", "quit", "debug", "arminsayshi", "dementedelves", "web"];

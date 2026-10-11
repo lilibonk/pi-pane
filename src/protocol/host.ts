@@ -1,5 +1,5 @@
 /** Host-level reads: about the machine's projects, not about the session that happens to be running. */
-export const HOST_QUERIES = ["projects", "directories", "project_inspect", "accounts"] as const;
+export const HOST_QUERIES = ["projects", "directories", "project_inspect", "accounts", "themes", "theme", "settings"] as const;
 export type HostQueryAction = (typeof HOST_QUERIES)[number];
 export interface HostQuery { t: "host_query"; reqId: string; action: HostQueryAction; args: Record<string, unknown> }
 export interface HostResult {
@@ -49,8 +49,11 @@ export interface DirectoriesView {
   refused?: ProjectRootRefusal;
 }
 export interface ProjectInspectView { path: string; name: string; current: boolean; registered: boolean; sessions: number; trust: ProjectTrustView }
-/** One way to authenticate a provider. `web: false` carries the reason it must be done elsewhere. */
-export interface AccountMethod { type: "api_key" | "oauth"; label: string; web: boolean; reason?: "ambient" | "callback" | "extension" }
+/**
+ * One way to authenticate a provider. `web: false` carries the reason it must be done elsewhere;
+ * `unverified` is a device-code login the browser could run but that has not been proven with a real account.
+ */
+export interface AccountMethod { type: "api_key" | "oauth"; label: string; web: boolean; reason?: "ambient" | "callback" | "unverified" | "extension" }
 /**
  * A model provider as pi's account list knows it. Nothing here is a secret or is derived by resolving one:
  * `stored` is the kind of credential in pi's auth file, `models` counts what the running session can use.
@@ -98,4 +101,94 @@ export interface AccountState { t: "account_state"; operation: AccountOperation 
 export interface AccountAnswerError { t: "account_error"; operationId: string; stepId: string; error: { code: string; message: string } }
 /** The answer to a login step. It is not a numbered command: nothing about it is kept in a receipt. */
 export interface AccountAnswer { t: "account_answer"; operationId: string; stepId: string; value: string }
-export interface HostQueryValues { projects: ProjectsView; directories: DirectoriesView; project_inspect: ProjectInspectView; accounts: AccountsView }
+/**
+ * Where a theme was found.
+ * - `builtin`: pi's own `dark` and `light`. `pi-pane`: shipped with this package.
+ * - `user`: pi's theme directory on this machine. `project`: the current project's, loaded only when it is trusted.
+ * - `handoff`: found by pi itself when `/web` was run (packages, configured paths, extensions); not rediscovered later.
+ */
+export type ThemeSource = "builtin" | "pi-pane" | "user" | "project" | "handoff";
+export interface ThemeItem {
+  name: string; source: ThemeSource; appearance: "light" | "dark";
+  /** Three colors for a swatch; the full set is read with the `theme` query. */
+  preview: { bg: string; fg: string; accent: string };
+  /** Whether pi can find this theme from any project, so it may be saved as pi's default. */
+  global: boolean;
+}
+/** A theme file that was found and not used. `file` is a file name, never a host path. */
+export interface ThemeProblem {
+  file: string; source: ThemeSource; name?: string;
+  code: "unreadable" | "too_large" | "invalid_json" | "invalid_theme" | "duplicate" | "reserved_name";
+  message: string;
+}
+/**
+ * The theme "follow pi" shows: what pi would use in the current project.
+ * - `setting`: pi's theme setting as stored (`name` or `light/dark`); absent means pi's default, `system`.
+ * - `origin: "handoff"`: the colors are the terminal theme captured when `/web` was run, because the
+ *   setting is `system` (generated from the terminal), names a theme that is not available, or is malformed.
+ */
+export interface PiThemeView {
+  setting?: string; source: "cli" | "project" | "global" | "default";
+  name: string; appearance: "light" | "dark";
+  origin: "catalog" | "handoff"; reason?: "system" | "missing" | "invalid";
+}
+export interface ThemesView {
+  themes: ThemeItem[]; problems: ThemeProblem[]; truncated: boolean;
+  pi: PiThemeView;
+  /** Whether the current project's own theme directory was read. */
+  projectThemes: "loaded" | "untrusted" | "none";
+}
+export interface ThemeView { name: string; appearance: "light" | "dark"; vars: Record<string, string> }
+export const SETTING_KEYS = ["theme", "defaultModel", "defaultThinkingLevel", "steeringMode", "followUpMode", "compaction.enabled", "retry.enabled", "images.blockImages", "hideThinkingBlock"] as const;
+export type SettingKey = (typeof SETTING_KEYS)[number];
+/** `null` is "not set": pi's built-in default applies. */
+export type SettingValue = string | boolean | null;
+/**
+ * One editable pi setting, with every layer that decides its value shown separately.
+ * - `global`: what pi's settings file under `agentDir` stores. This is the only layer the browser writes.
+ * - `project`: the current project's override, present only when the project is trusted and sets it.
+ * - `cli`: the argument pi was started with that overrides it for this run.
+ * - `effective`: what a runtime started in the current project reads from settings (project over global over default).
+ * - `runtime`: what the running session reports, for the settings pi's RPC state exposes.
+ * - `writes: "runtime"`: changed through pi's own RPC command, which applies it to the running session
+ *   and also saves it as the global default. `"global"`: written by the host to the global file.
+ * - `applies`: when a saved value reaches a session. `reload` needs the running session to reload its settings.
+ */
+export interface SettingItem {
+  key: SettingKey; kind: "theme" | "model" | "choice" | "toggle";
+  options?: string[];
+  effective: SettingValue; global: SettingValue; defaultValue: SettingValue;
+  project?: SettingValue; cli?: string; runtime?: SettingValue;
+  writes: "global" | "runtime"; applies: "new_runtimes" | "reload" | "now" | "terminal";
+  editable: boolean; reason?: "unreadable" | "no_runtime" | "no_models";
+}
+/** A pi setting the browser shows and does not edit. Values are sent only for plain flags, numbers and fixed choices. */
+export interface ReadonlySetting { key: string; where: ("global" | "project")[]; value?: string }
+export interface ReadonlySettingGroup {
+  id: string;
+  /** `terminal`: only meaningful in the TUI. `runtime`: read when pi starts. `later`: not editable from the browser yet. */
+  status: "terminal" | "runtime" | "later";
+  settings: ReadonlySetting[];
+}
+export interface SettingsView {
+  items: SettingItem[]; groups: ReadonlySettingGroup[];
+  /** pi's agent directory; its `settings.json` is what "global" means. */
+  agentDir: string;
+  project: { path: string; settings: "loaded" | "untrusted" | "none" };
+  /** Settings files that could not be read. A broken global file makes every item read-only; it is never overwritten. */
+  errors: { scope: "global" | "project"; message: string }[];
+  /** A saved setting is waiting for the running session to reload. Shared with credential changes. */
+  pendingApply: boolean; applyError?: string;
+}
+/**
+ * The outcome of `setting_set`, in two parts that can differ.
+ * - `saved: "unconfirmed"`: pi accepted the change for the running session, and the global file did
+ *   not show it within the wait. Nothing was rolled back.
+ * - `applied`: `now` the running session uses it; `overridden` it is saved and the project's own value
+ *   still decides; `pending` it waits for a reload; `later` it only concerns runtimes started afterwards.
+ */
+export interface SettingResult { key: SettingKey; saved: "confirmed" | "unconfirmed"; applied: "now" | "overridden" | "pending" | "later"; item: SettingItem }
+export interface HostQueryValues {
+  projects: ProjectsView; directories: DirectoriesView; project_inspect: ProjectInspectView; accounts: AccountsView;
+  themes: ThemesView; theme: ThemeView; settings: SettingsView;
+}

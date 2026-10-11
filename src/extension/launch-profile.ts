@@ -51,6 +51,12 @@ export class LaunchProfile {
     const value = (name: string) => this.options.filter((option): option is Extract<LaunchOption, { kind: "value" }> => option.kind === "value" && option.name === name).at(-1)?.value;
     return { ...(value("--provider") ? { provider: value("--provider") } : {}), ...(value("--model") ? { model: value("--model") } : {}), ...(value("--thinking") ? { thinking: value("--thinking") } : {}) };
   }
+  /** `--use-theme`: the theme the start TUI was told to use for this run. It never reaches settings. */
+  get startTheme(): string | undefined {
+    return this.options.filter((option): option is Extract<LaunchOption, { kind: "value" }> => option.kind === "value" && option.name === "--use-theme").at(-1)?.value;
+  }
+  /** `--no-themes`: pi was told not to discover themes for this run. Explicit `--theme` paths still load. */
+  get noThemes(): boolean { return this.options.some(option => option.kind === "boolean" && option.name === "--no-themes"); }
   /**
    * Arguments for an RPC child at `target`.
    * - A saved session restores its own model, so the start model is not replayed over it.

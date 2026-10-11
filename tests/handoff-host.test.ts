@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { mkdtemp, mkdir, rm, writeFile, appendFile, symlink, realpath, readFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, dirname, basename } from "node:path";
-import { SessionManager, type ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { SessionManager, SettingsManager, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { HandoffHost } from "../src/extension/handoff.js";
 import { SessionFileLock } from "../src/extension/session-lock.js";
 import type { Hub } from "../src/extension/hub.js";
@@ -22,6 +22,9 @@ class FakeChild implements RpcConnection {
   onUiResponse?: (id: string, response: Record<string, unknown>) => void;
   manager: SessionManager; entries: Record<string, unknown>[];
   model = { provider: "local", id: "fixture", name: "Fixture" }; level = "off";
+  /** Like pi: queue modes live in the session, and the RPC setters also save the global default. */
+  modes = { steeringMode: "one-at-a-time", followUpMode: "one-at-a-time", autoCompactionEnabled: true };
+  saveSettings = true;
   streaming = false; pending = 0; compacting = false;
   reportedPath?: string; emptyFork = false;
   disposition = "started"; cancelNext = false;
@@ -51,7 +54,7 @@ class FakeChild implements RpcConnection {
     this.calls.push({ type, payload }); const custom = await this.intercept?.(type, payload); if (custom?.intercepted) return custom.value as T;
     let value: unknown;
     if (type === "get_state") value = { model: this.model, thinkingLevel: this.level, isStreaming: this.streaming, isCompacting: this.compacting, pendingMessageCount: this.pending,
-      sessionFile: this.reportedPath ?? this.manager.getSessionFile(), sessionId: this.manager.getSessionId(), sessionName: this.manager.getSessionName() };
+      sessionFile: this.reportedPath ?? this.manager.getSessionFile(), sessionId: this.manager.getSessionId(), sessionName: this.manager.getSessionName(), ...this.modes };
     else if (type === "get_entries") {
       // Like pi, report the session's current entries, including ones appended after startup.
       const entries = this.manager.getEntries() as unknown as Record<string, unknown>[];
@@ -78,6 +81,14 @@ class FakeChild implements RpcConnection {
     else if (type === "set_thinking_level") { this.level = String(payload.level); value = undefined; }
     else if (type === "set_session_name") { this.manager.appendSessionInfo(String(payload.name)); value = undefined; }
     else if (type === "compact") value = { tokensBefore: 5 };
+    else if (["set_steering_mode", "set_follow_up_mode", "set_auto_compaction", "set_auto_retry"].includes(type)) {
+      const settings = SettingsManager.create(this.manager.getCwd(), join(this.root, "agent"), { projectTrusted: false });
+      if (type === "set_steering_mode") { this.modes.steeringMode = String(payload.mode); if (this.saveSettings) settings.setSteeringMode(payload.mode as never); }
+      else if (type === "set_follow_up_mode") { this.modes.followUpMode = String(payload.mode); if (this.saveSettings) settings.setFollowUpMode(payload.mode as never); }
+      else if (type === "set_auto_compaction") { this.modes.autoCompactionEnabled = !!payload.enabled; if (this.saveSettings) settings.setCompactionEnabled(!!payload.enabled); }
+      else if (this.saveSettings) settings.setRetryEnabled(!!payload.enabled);
+      await settings.flush(); value = undefined;
+    }
     else throw new Error(`Unexpected fake RPC command ${type}`);
     return value as T;
   }
@@ -131,7 +142,7 @@ async function withHost(run: (host: HandoffHost, child: FakeChild, fixture: Fixt
     }
     fixture.launches.push({ args, cwd: directory, child: next }); return next;
   };
-  const host = new HandoffHost(hub, { sessionFile: manager.getSessionFile()!, sessionDir: custom, cwd, argv, theme, themes: [] }, line => { fixture.logs.push(line); }, { createChild, plannedStopMs: 50, agentDir: join(root, "agent"), createAuthRuntime: async () => fixture.auth, accountLimitMs: 400,
+  const host = new HandoffHost(hub, { sessionFile: manager.getSessionFile()!, sessionDir: custom, cwd, argv, theme, themes: [] }, line => { fixture.logs.push(line); }, { createChild, plannedStopMs: 50, agentDir: join(root, "agent"), createAuthRuntime: async () => fixture.auth, accountLimitMs: 400, webOAuth: new Set(["kimi-coding"]),
     listAll: ((directory?: string) => child.catalogOverride ? Promise.resolve(child.catalogOverride) : directory ? SessionManager.listAll(directory) : Promise.resolve([])) as typeof SessionManager.listAll });
   try { await host.start(); await run(host, child, fixture); }
   finally { await host.stop(); await rm(root, { recursive: true, force: true }); }
@@ -528,7 +539,7 @@ test("an unknown project with trust-gated resources is asked about; the host nev
 test("credential directories are refused as project roots, for projects and for sessions that live there", async () => withHost(async (host, child, { root, launches }) => {
   const secret = join(root, ".ssh", "repo"); await mkdir(secret, { recursive: true });
   await assert.rejects(host.hostCommand("project_open", { path: secret }), { code: "project_root_refused" });
-  await assert.rejects(host.hostCommand("project_open", { path: join(root, "agent") }), { code: "not_found" });
+  // pi creates its agent directory as soon as the host reads the project's trust, so it always exists here.
   await mkdir(join(root, "agent"), { recursive: true }); await assert.rejects(host.hostCommand("project_open", { path: join(root, "agent") }), { code: "project_root_refused" });
   await assert.rejects(host.hostCommand("project_open", { path: join(root, "custom") }), { code: "project_root_refused" }); // the session directory
   const hidden = SessionManager.create(secret, join(root, "custom")); hidden.appendMessage({ role: "user", content: "in ssh", timestamp: 7 });
@@ -680,3 +691,98 @@ test("the built-in login and logout commands open the account page instead of be
   await assert.rejects(host.command("prompt", { text: "/login" }), { code: "picker_required" }); assert(!child.calls.some(call => call.type === "prompt"));
   assert.equal((await host.read("resources")).capabilities.find(capability => capability.name === "authentication")?.available, true);
 }));
+const themeFile = async (name: string, accent: string, appearance: "light" | "dark" = "dark") => {
+  const base = JSON.parse(await readFile(new URL("../themes/pi-pane-dark.json", import.meta.url), "utf8"));
+  return JSON.stringify({ ...base, name, appearance, colors: { ...base.colors, accent } });
+};
+const globalSettings = async (root: string) => JSON.parse(await readFile(join(root, "agent", "settings.json"), "utf8").catch(() => "{}"));
+test("follow pi is the theme pi would use in the current project; saving pi's default changes it for every viewer", async () => withHost(async (host, _child, { root, bridges }) => {
+  await mkdir(join(root, "agent", "themes"), { recursive: true }); await writeFile(join(root, "agent", "themes", "mine.json"), await themeFile("mine", "#123456"));
+  let themes = await host.hostQuery("themes");
+  // Nothing is configured: pi's default is its terminal theme, which only the handoff captured.
+  assert.deepEqual(themes.pi, { source: "default", name: "system", appearance: "dark", origin: "handoff", reason: "system" });
+  assert.deepEqual(themes.themes.map(item => [item.name, item.source, item.global]), [["pi-pane-dark", "pi-pane", false], ["pi-pane-light", "pi-pane", false], ["mine", "user", true]]);
+  assert.equal(themes.projectThemes, "none"); assert.deepEqual(themes.problems, []);
+  const mine = await host.hostQuery("theme", { name: "mine" }); assert.equal(mine.vars["--accent"], "#123456"); assert.equal(mine.appearance, "dark");
+  await assert.rejects(host.hostQuery("theme", { name: "gone" }), { code: "theme_missing" });
+  const before = bridges.at(-1)!.snapshot().theme["--accent"];
+  // A theme of this package that pi itself does not know (run from source) cannot become pi's default.
+  await assert.rejects(host.hostCommand("setting_set", { key: "theme", value: "pi-pane-dark", expected: null }), { code: "theme_not_global" });
+  const revision = host.hostState().revision;
+  const saved = await host.hostCommand("setting_set", { key: "theme", value: "mine", expected: null }) as { saved: string; applied: string; item: { global: unknown } };
+  assert.deepEqual([saved.saved, saved.applied, saved.item.global], ["confirmed", "later", "mine"]); assert.equal((await globalSettings(root)).theme, "mine");
+  assert(host.hostState().revision > revision, "every page re-reads settings and themes");
+  themes = await host.hostQuery("themes"); assert.deepEqual(themes.pi, { setting: "mine", source: "global", name: "mine", appearance: "dark", origin: "catalog" });
+  assert.equal(bridges.at(-1)!.snapshot().theme["--accent"], "#123456"); assert.notEqual(before, "#123456");
+  // A second page that still shows the old value is told so; the theme it did not see is not overwritten.
+  await assert.rejects(host.hostCommand("setting_set", { key: "theme", value: "system", expected: null }), { code: "stale_setting" });
+  // The file disappears: the colors stay those of the handoff, with the reason.
+  await rm(join(root, "agent", "themes", "mine.json"));
+  assert.deepEqual((await host.hostQuery("themes")).pi, { setting: "mine", source: "global", name: "system", appearance: "dark", origin: "handoff", reason: "missing" });
+}));
+test("a project's own themes and settings are read only when that project is trusted", async () => withHost(async (host, _child, { root, bridges }) => {
+  const gated = join(root, "gated"); await mkdir(join(gated, ".pi", "themes"), { recursive: true });
+  await writeFile(join(gated, ".pi", "themes", "theirs.json"), await themeFile("theirs", "#abcdef", "light"));
+  await writeFile(join(gated, ".pi", "settings.json"), JSON.stringify({ theme: "theirs", images: { blockImages: true } }));
+  await host.hostCommand("project_open", { path: gated, trust: "withhold" });
+  let themes = await host.hostQuery("themes"); assert.equal(themes.projectThemes, "untrusted"); assert.equal(themes.themes.some(item => item.name === "theirs"), false);
+  assert.equal(themes.pi.source, "default"); assert.notEqual(bridges.at(-1)!.snapshot().theme["--accent"], "#abcdef");
+  let settings = await host.hostQuery("settings"); assert.equal(settings.project.settings, "untrusted");
+  assert.equal(settings.items.find(item => item.key === "theme")!.project, undefined); assert.equal(settings.items.find(item => item.key === "images.blockImages")!.effective, false);
+  await assert.rejects(host.hostQuery("theme", { name: "theirs" }), { code: "theme_missing" });
+  await host.hostCommand("project_open", { path: gated, trust: "remember" });
+  themes = await host.hostQuery("themes"); assert.equal(themes.projectThemes, "loaded");
+  assert.deepEqual(themes.themes.find(item => item.name === "theirs"), { name: "theirs", source: "project", appearance: "light", global: false, preview: themes.themes.find(item => item.name === "theirs")!.preview });
+  assert.deepEqual(themes.pi, { setting: "theirs", source: "project", name: "theirs", appearance: "light", origin: "catalog" });
+  assert.equal(bridges.at(-1)!.snapshot().theme["--accent"], "#abcdef", "the snapshot of the new project carries its theme");
+  settings = await host.hostQuery("settings"); assert.equal(settings.project.settings, "loaded");
+  const theme = settings.items.find(item => item.key === "theme")!; assert.deepEqual([theme.global, theme.project, theme.effective], [null, "theirs", "theirs"]);
+  assert.equal(theme.options!.includes("theirs"), false, "a project's theme is not offered as pi's default");
+  await assert.rejects(host.hostCommand("setting_set", { key: "theme", value: "theirs", expected: null }), { code: "theme_not_global" });
+  // Back in the first project nothing of the other one remains.
+  await host.hostCommand("project_open", { path: join(root, "project") });
+  themes = await host.hostQuery("themes"); assert.equal(themes.themes.some(item => item.name === "theirs"), false); assert.equal(themes.pi.origin, "handoff");
+}));
+test("settings pi changes itself wait for an idle session; a setting the session reads once is applied by reloading it", async () => withHost(async (host, child, { root }) => {
+  let settings = await host.hostQuery("settings");
+  assert.deepEqual(settings.items.find(item => item.key === "steeringMode"), { key: "steeringMode", kind: "choice", options: ["one-at-a-time", "all"], effective: "one-at-a-time", global: null, defaultValue: "one-at-a-time", runtime: "one-at-a-time", writes: "runtime", applies: "now", editable: true });
+  assert.deepEqual(settings.items.find(item => item.key === "defaultModel")!.options, ["local/fixture"]); assert.equal(settings.pendingApply, false);
+  child.streaming = true; await assert.rejects(host.hostCommand("setting_set", { key: "steeringMode", value: "all", expected: null }), { code: "busy" });
+  assert.equal(child.calls.some(call => call.type === "set_steering_mode"), false);
+  // Saving a default is not a change to the running reply: it goes through while pi is busy, and waits to be applied.
+  const blocked = await host.hostCommand("setting_set", { key: "images.blockImages", value: true, expected: null }) as { saved: string; applied: string };
+  assert.deepEqual([blocked.saved, blocked.applied], ["confirmed", "pending"]); assert.equal((await globalSettings(root)).images.blockImages, true);
+  await new Promise(resolve => setTimeout(resolve, 30));
+  settings = await host.hostQuery("settings"); assert.equal(settings.pendingApply, true); assert.equal(child.calls.some(call => call.type === "switch_session"), false);
+  assert.equal((await host.hostQuery("accounts")).pendingApply, true, "one pending reload, whatever caused it");
+  child.streaming = false; await host.read("tree");
+  assert.deepEqual(await host.hostCommand("account_apply", {}), { pendingApply: false }); assert.equal(child.calls.filter(call => call.type === "switch_session").length, 1);
+  // Idle: pi's own command is used, the session state follows, and the default it saved is confirmed from disk.
+  const steering = await host.hostCommand("setting_set", { key: "steeringMode", value: "all", expected: null }) as { saved: string; applied: string; item: { runtime: unknown; global: unknown } };
+  assert.deepEqual([steering.saved, steering.applied, steering.item.runtime, steering.item.global], ["confirmed", "now", "all", "all"]);
+  assert.deepEqual(child.calls.find(call => call.type === "set_steering_mode")?.payload, { mode: "all" });
+  // pi accepted the command and did not save it: reported as it is.
+  child.saveSettings = false;
+  const retry = await host.hostCommand("setting_set", { key: "retry.enabled", value: false, expected: null }) as { saved: string; applied: string };
+  assert.deepEqual([retry.saved, retry.applied], ["unconfirmed", "now"]); child.saveSettings = true;
+  // A default saved while idle is applied at once, without a restart.
+  const unblocked = await host.hostCommand("setting_set", { key: "images.blockImages", value: false, expected: true }) as { applied: string };
+  assert.equal(unblocked.applied, "pending");
+  await waitFor(async () => (await host.hostQuery("settings")).pendingApply === false, "applied");
+  assert.equal(child.calls.filter(call => call.type === "switch_session").length, 2);
+  // Two pages changing the same setting from the same view: one wins, the other is told to look again.
+  const [first, second] = await Promise.allSettled([host.hostCommand("setting_set", { key: "defaultThinkingLevel", value: "high", expected: null }), host.hostCommand("setting_set", { key: "defaultThinkingLevel", value: "low", expected: null })]);
+  assert.equal(first.status, "fulfilled"); assert.equal((second as PromiseRejectedResult).reason.code, "stale_setting"); assert.equal((await globalSettings(root)).defaultThinkingLevel, "high");
+  assert.equal((await host.hostCommand("setting_set", { key: "defaultModel", value: "local/fixture", expected: null }) as { saved: string }).saved, "confirmed");
+  assert.deepEqual([(await globalSettings(root)).defaultProvider, (await globalSettings(root)).defaultModel], ["local", "fixture"]);
+  await assert.rejects(host.hostCommand("setting_set", { key: "defaultModel", value: "other/model", expected: "local/fixture" }), { code: "invalid_setting" });
+}));
+test("start arguments are shown as overrides of the defaults, and /settings opens the settings page", async () => withHost(async (host, child) => {
+  const settings = await host.hostQuery("settings");
+  assert.equal(settings.items.find(item => item.key === "defaultModel")!.cli, "acme/fast"); assert.equal(settings.items.find(item => item.key === "defaultThinkingLevel")!.cli, "high");
+  assert.equal(settings.items.find(item => item.key === "theme")!.cli, "light");
+  assert.deepEqual((await host.hostQuery("themes")).pi, { setting: "light", source: "cli", name: "system", appearance: "dark", origin: "handoff", reason: "missing" });
+  const command = (await host.read("commands")).commands.find(item => item.name === "settings")!; assert.equal(command.browserAction, "settings"); assert.equal(command.available, true);
+  await assert.rejects(host.command("prompt", { text: "/settings" }), { code: "picker_required" }); assert(!child.calls.some(call => call.type === "prompt"));
+  assert.equal((await host.read("resources")).capabilities.find(capability => capability.name === "settings")?.available, true);
+}, undefined, ["--provider", "acme", "--model", "fast", "--thinking", "high", "--use-theme", "light"]));

@@ -87,7 +87,9 @@ export class ThemeMapper {
     } finally { if (fd !== undefined) closeSync(fd); }
   }
 
-  map(theme: PaneTheme, available?: ThemePaths): Record<string, string> {
+  map(theme: PaneTheme, available?: ThemePaths): Record<string, string> { return this.vars(theme, this.background(theme, available)); }
+  /** The page's CSS variables for a theme whose export background, if it has one, is already known. */
+  vars(theme: PaneTheme, pageBg?: string): Record<string, string> {
     const light = theme.appearance === "light";
     const vars: Record<string, string> = {};
     const colors = theme.colors;
@@ -98,7 +100,7 @@ export class ThemeMapper {
       } catch { /* A malformed optional token must not interrupt session updates. */ }
     }
     const color = (key: string, fallback: string): string => vars[tokenName(key)] ?? fallback;
-    const bg = this.background(theme, available) ?? (light ? "#f5f5f4" : "#111315");
+    const bg = pageBg ?? (light ? "#f5f5f4" : "#111315");
     const fg = color("text", light ? "#252525" : "#eeeeee");
     const accent = color("accent", light ? "#445b9f" : "#a6b9ef");
     const mix = (first: string, second: string, amount: number): string => colorToHex(mixColors(parseColor(first), parseColor(second), amount, "oklch"));

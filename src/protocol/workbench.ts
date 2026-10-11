@@ -27,7 +27,7 @@ export interface WorkbenchCommand {
   name: string; description: string; source: "builtin" | "extension" | "skill" | "prompt";
   available: boolean; terminalOnly?: boolean; reason?: string;
   /** A workbench picker can present these builtins without sending a plain slash to the model. */
-  browserAction?: "new" | "sessions" | "tree" | "model" | "thinking" | "compact" | "resources" | "status" | "rename" | "clone" | "accounts";
+  browserAction?: "new" | "sessions" | "tree" | "model" | "thinking" | "compact" | "resources" | "status" | "rename" | "clone" | "accounts" | "settings";
 }
 export interface CommandsView { commands: WorkbenchCommand[] }
 export interface ResourceTool { name: string; description: string; active: boolean; source?: string; exposure?: string }

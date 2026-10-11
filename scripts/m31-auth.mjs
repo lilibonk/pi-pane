@@ -77,7 +77,8 @@ try {
     assert.ok(view.providers.length > 20); assert.equal(view.pendingApply, false); assert.equal(view.storeError, undefined);
     const openai = view.providers.find(item => item.id === "openai"); assert.equal(openai.stored, undefined); assert.equal(openai.models, 0); assert.ok(openai.knownModels > 0);
     assert.deepEqual(openai.methods.map(method => [method.type, method.web]), [["api_key", true], ["oauth", false]]);
-    assert.deepEqual(view.providers.find(item => item.id === "kimi-coding").methods.map(method => [method.type, method.web]), [["api_key", true], ["oauth", true]]);
+    assert.deepEqual(view.providers.find(item => item.id === "kimi-coding").methods.map(method => [method.type, method.web, method.reason]), [["api_key", true, undefined], ["oauth", false, "unverified"]]);
+    await rejects(hostCommand(client, "account_begin", { provider: "kimi-coding", method: "oauth" }), "unsupported_method");
     const fixtureProvider = view.providers.find(item => item.id === "pi-pane-m0"); assert.ok(fixtureProvider.models > 0); assert.equal(fixtureProvider.methods[0].reason, "extension");
     assert.equal(view.providers[0].id, "pi-pane-m0", "usable providers come first");
     await rejects(hostCommand(client, "account_begin", { provider: "pi-pane-m0", method: "api_key" }), "unknown_provider");

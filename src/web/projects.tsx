@@ -132,7 +132,7 @@ export function Modal({ titleId, onClose, wide, children }: { titleId: string; o
     const background = [...(shell?.children ?? [])].filter(child => child !== element.parentElement) as HTMLElement[];
     const inertStates = background.map(child => child.inert);
     for (const child of background) child.inert = true;
-    const controls = () => [...element.querySelectorAll<HTMLElement>('button:not(:disabled), input:not(:disabled), a[href]')].filter(control => control.getClientRects().length);
+    const controls = () => [...element.querySelectorAll<HTMLElement>('button:not(:disabled), input:not(:disabled), select:not(:disabled), textarea:not(:disabled), a[href]')].filter(control => control.getClientRects().length);
     (element.querySelector<HTMLElement>("[data-autofocus]") || controls()[0] || element).focus();
     const keys = (event: KeyboardEvent) => {
       if (event.key === "Escape") { event.preventDefault(); close.current(); return; }

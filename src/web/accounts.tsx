@@ -39,6 +39,7 @@ function status(provider: AccountProvider, pendingApply: boolean): string {
 const methodReason: Record<NonNullable<AccountMethod["reason"]>, string> = {
   ambient: "由本机环境配置（如命令行工具的登录状态），在终端设置。",
   callback: "需要本机回调，尚未在网页开放，请在终端运行 /login。",
+  unverified: "网页登录尚未用真实账户验证，暂不开放，请在终端运行 /login。",
   extension: "由扩展或 models.json 提供，在终端配置。",
 };
 

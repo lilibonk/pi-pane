@@ -22,7 +22,7 @@ class Wire implements RpcConnection {
 }
 async function fixture(run: (wire: Wire, mirror: RpcSessionMirror, bridge: Bridge, setNow: (now: number) => void) => Promise<void>) {
   const wire = new Wire(); const theme = { appearance: "dark", colors: {} } as unknown as ExtensionContext["ui"]["theme"];
-  const mirror = new RpcSessionMirror(wire, "/fixture", theme, () => [], () => {}); await mirror.load(); let now = 0;
+  const mirror = new RpcSessionMirror(wire, "/fixture", () => theme, () => [], () => {}); await mirror.load(); let now = 0;
   const bridge = new Bridge({ pi: mirror.api(), ctx: mirror.context(), generation: 1, pollMs: 60_000, now: () => now }); mirror.attach(bridge);
   try { await run(wire, mirror, bridge, value => { now = value; }); } finally { mirror.dispose(); bridge.dispose(); }
 }

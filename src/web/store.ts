@@ -2,6 +2,7 @@ import { createStore } from "zustand/vanilla";
 import type { AccountOperation, CommandName, ExtensionUiState, HostCommandName, HostQueryAction, HostQueryValues, HostState, ProjectInspectView, ImageType, MessageView, PromptImage, Snapshot } from "../protocol/index.js";
 import { IMAGE_TYPES, LIMITS, applyProjectionEvent, boundedTools, decodeBase64, encodedSize, inspectImage, isTextContent, mergeOlderPage } from "../protocol/index.js";
 import type { WorkbenchAction, WorkbenchValues } from "../protocol/workbench.js";
+import { loadAppearance, safeVars, saveAppearance, wantedTheme, type Appearance, type ThemeVars } from "./appearance.js";
 import { ForkDraftRecovery } from "./draft-recovery.js";
 import { ProjectDrafts } from "./project-drafts.js";
 import { EditorChangeGuard, extensionText } from "./ui-state.js";
@@ -65,7 +66,28 @@ export interface WebState {
   accountError: string;
   /** The finished or running operation whose dialog this page closed. */
   accountDismissed: string;
+  /** How this browser has chosen to look. Stored in this browser; never a pi setting. */
+  appearance: Appearance;
+  /** A look being tried in the settings dialog. Not stored; dropped when the dialog closes. */
+  appearancePreview: Appearance | null;
+  /** The named theme the active look asks for, or "" when it follows pi. */
+  themeName: string;
+  /** That theme's colors. Null means the session snapshot's theme applies. */
+  themeVars: ThemeVars | null;
+  /** `missing`: the chosen theme is not available here; the last colors known for it stay. */
+  themeProblem: "" | "missing";
+  /** Whether this browser could store the last committed choice. */
+  appearanceStored: boolean;
+  /** The open settings dialog and its section. */
+  settings: SettingsSection | null;
 }
+export type SettingsSection = "appearance" | "defaults" | "behavior" | "accounts" | "other";
+
+function prefersDark(): boolean { try { return matchMedia("(prefers-color-scheme: dark)").matches; } catch { return false; } }
+const storedAppearance = loadAppearance();
+let themeCache: Record<string, ThemeVars> = storedAppearance.cache;
+let themeRequest = 0;
+let themeKey = "";
 
 export const webStore = createStore<WebState>(() => ({
   connection: "connecting",
@@ -94,6 +116,13 @@ export const webStore = createStore<WebState>(() => ({
   account: null,
   accountError: "",
   accountDismissed: "",
+  appearance: storedAppearance.appearance,
+  appearancePreview: null,
+  themeName: wantedTheme(storedAppearance.appearance, prefersDark()) ?? "",
+  themeVars: storedAppearance.cache[wantedTheme(storedAppearance.appearance, prefersDark()) ?? ""] ?? null,
+  themeProblem: "",
+  appearanceStored: true,
+  settings: null,
 }));
 
 const TOKEN_KEY = "pi-pane.token";
@@ -770,6 +799,71 @@ export function answerAccount(operationId: string, stepId: string, value: string
   webStore.setState({ accountError: "" });
   return send({ t: "account_answer", operationId, stepId, value });
 }
+/**
+ * Brings the page's colors in line with the active look: the one being previewed, else the stored one.
+ * A named theme is read from the host again whenever the host's state changes (another project,
+ * a theme file edited and refreshed); until it answers, and when it no longer has the theme, the
+ * colors last known for that name stay.
+ */
+export function syncTheme(force = false) {
+  const state = webStore.getState();
+  const wanted = wantedTheme(state.appearancePreview ?? state.appearance, prefersDark());
+  if (!wanted) {
+    themeRequest++; themeKey = "";
+    if (state.themeName || state.themeVars || state.themeProblem) webStore.setState({ themeName: "", themeVars: null, themeProblem: "" });
+    return;
+  }
+  if (state.themeName !== wanted) webStore.setState({ themeName: wanted, themeVars: themeCache[wanted] ?? null, themeProblem: "" });
+  const reachable = !!state.clientId && state.connection !== "disconnected" && state.connection !== "fatal" && state.connection !== "login" && state.connection !== "connecting";
+  const key = `${wanted}\0${state.clientId}\0${state.host?.revision}`;
+  if (!reachable || (key === themeKey && !force)) return;
+  themeKey = key;
+  const request = ++themeRequest;
+  queryHost("theme", { name: wanted }).then(view => {
+    if (request !== themeRequest) return;
+    const vars = safeVars(view.vars);
+    if (!vars) { webStore.setState({ themeProblem: "missing" }); return; }
+    themeCache = { ...themeCache, [wanted]: vars };
+    webStore.setState({ themeVars: vars, themeProblem: "" });
+    const current = webStore.getState();
+    if (!current.appearancePreview) saveAppearance(current.appearance, themeCache);
+  }, (error: HostError) => {
+    if (request !== themeRequest) return;
+    if (error.code === "theme_missing") webStore.setState({ themeProblem: "missing" });
+    else themeKey = ""; // not an answer about the theme: ask again on the next change
+  });
+}
+/** Tries a look without storing it. `null` returns to the stored one. */
+export function previewAppearance(appearance: Appearance | null) {
+  const hideThinking = webStore.getState().appearance.hideThinking;
+  webStore.setState({ appearancePreview: appearance && { ...appearance, ...(hideThinking ? { hideThinking } : {}) } });
+  syncTheme();
+}
+/** Makes the previewed look this browser's choice. */
+export function commitAppearance() {
+  const preview = webStore.getState().appearancePreview;
+  if (!preview) return;
+  webStore.setState({ appearance: preview, appearancePreview: null, appearanceStored: saveAppearance(preview, themeCache) });
+  syncTheme();
+}
+/** Forgets this browser's choice of look: it follows pi again. The thinking preference is a separate choice and stays. */
+export function clearAppearance() {
+  const hideThinking = webStore.getState().appearance.hideThinking;
+  const appearance: Appearance = { mode: "pi", ...(hideThinking ? { hideThinking } : {}) };
+  webStore.setState({ appearance, appearancePreview: null, appearanceStored: saveAppearance(appearance, themeCache) });
+  syncTheme();
+}
+export function setHideThinking(hide: boolean) {
+  const { hideThinking: _old, ...rest } = webStore.getState().appearance;
+  const appearance: Appearance = { ...rest, ...(hide ? { hideThinking: true } : {}) };
+  webStore.setState({ appearance, appearanceStored: saveAppearance(appearance, themeCache) });
+}
+export function openSettings(section: SettingsSection = "appearance") { webStore.setState({ settings: section }); }
+export function closeSettings() { webStore.setState({ settings: null, appearancePreview: null }); syncTheme(); }
+webStore.subscribe((state, previous) => {
+  if (state.clientId !== previous.clientId || state.host?.revision !== previous.host?.revision || state.connection !== previous.connection) syncTheme();
+});
+try { matchMedia("(prefers-color-scheme: dark)").addEventListener("change", () => syncTheme()); } catch { /* no media queries: the system look stays as first read */ }
 export function dismissAccount(operationId: string) { webStore.setState({ accountDismissed: operationId, accountError: "" }); }
 export function setProjectDialog(dialog: WebState["projectDialog"]) { webStore.setState({ projectDialog: dialog }); }
 export function issueCommand(command: CommandName, args: Record<string, unknown> = {}, text?: string, mode?: "followUp" | "steer") {

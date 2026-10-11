@@ -1,6 +1,6 @@
 /** Wire contract. Only broadcast events consume sequence numbers. */
 import { WORKBENCH_ACTIONS, type WorkbenchQuery, type WorkbenchResult } from "./workbench.js";
-import { HOST_QUERIES, type AccountAnswer, type AccountAnswerError, type AccountState, type HostQuery, type HostQueryAction, type HostResult } from "./host.js";
+import { HOST_QUERIES, SETTING_KEYS, type SettingKey, type AccountAnswer, type AccountAnswerError, type AccountState, type HostQuery, type HostQueryAction, type HostResult } from "./host.js";
 export * from "./workbench.js";
 export * from "./host.js";
 export const PROTOCOL = "pi-pane.v1";
@@ -58,7 +58,7 @@ export const COMMANDS = ["prompt", "abort", "set_model", "set_thinking", "compac
 export type CommandName = (typeof COMMANDS)[number];
 /** Commands about the host itself. They need no live session: a failed runtime replacement is recovered through them. */
 export const HOST_COMMANDS = ["recover_retry", "recover_restore", "host_stop", "project_open", "project_create", "project_remove", "project_relocate",
-  "account_begin", "account_cancel", "account_logout", "account_apply"] as const;
+  "account_begin", "account_cancel", "account_logout", "account_apply", "setting_set"] as const;
 export type HostCommandName = (typeof HOST_COMMANDS)[number];
 
 /** `total` is present when `text` is a prefix of a longer block readable through content_page. */
@@ -403,6 +403,11 @@ export function hostCommandArgs(command: HostCommandName, value: unknown): Recor
     if (!exactKeys(value, ["operationId"]) || !shortString(value.operationId, 64)) throw new ProtocolError("invalid_args", "Provide the operation to cancel.");
   } else if (command === "account_logout") {
     if (!exactKeys(value, ["provider"]) || !shortString(value.provider, 128)) throw new ProtocolError("invalid_args", "Provide the provider to sign out of.");
+  } else if (command === "setting_set") {
+    // `expected` is the global value the page was showing; a different one on disk means someone else changed it.
+    const scalar = (item: unknown) => item === null || typeof item === "boolean" || (typeof item === "string" && item.length > 0 && item.length <= 256 && !/[\0-\x1f]/.test(item));
+    if (!exactKeys(value, ["key", "value", "expected"]) || !SETTING_KEYS.includes(value.key as SettingKey) || value.value === null || !scalar(value.value) || !scalar(value.expected))
+      throw new ProtocolError("invalid_args", "Provide one known setting, its new value and the value the page was showing.");
   } else if (command === "project_relocate") {
     if (!exactKeys(value, ["from", "to"]) || !hostPath(value.from) || !hostPath(value.to)) throw new ProtocolError("invalid_args", "Provide the listed project path and its new directory.");
   } else if (Object.keys(value).length) throw new ProtocolError("invalid_args", "This host command takes no arguments.");
@@ -414,6 +419,8 @@ export function hostQueryArgs(action: HostQueryAction, value: unknown): Record<s
     if (!exactKeys(value, ["path"]) || (value.path !== undefined && !hostPath(value.path))) throw new ProtocolError("invalid_args", "Provide an absolute directory path.");
   } else if (action === "project_inspect") {
     if (!exactKeys(value, ["path"]) || !hostPath(value.path)) throw new ProtocolError("invalid_args", "Provide an absolute directory path.");
+  } else if (action === "theme") {
+    if (!exactKeys(value, ["name"]) || !shortString(value.name, 64)) throw new ProtocolError("invalid_args", "Provide one theme name.");
   } else if (Object.keys(value).length) throw new ProtocolError("invalid_args", "This query takes no arguments.");
   return value;
 }

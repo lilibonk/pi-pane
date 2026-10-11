@@ -2,7 +2,8 @@ import { SessionManager, getAgentDir, type ExtensionContext } from "@earendil-wo
 import { existsSync } from "node:fs";
 import { open, realpath, stat } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
-import { ProtocolError, isRecord, isCommandInvocationName, workbenchArgs, type AccountState, type AccountsView, type HostCommandName, type HostQueryAction, type HostQueryValues, type HostState, type ProjectItem, type ProjectInspectView, type ProjectsView, type ProjectTrustView, type WorkbenchAction, type WorkbenchValues, type WorkbenchCommand, type SessionCatalogItem } from "../protocol/index.js";
+import { fileURLToPath } from "node:url";
+import { ProtocolError, isRecord, isCommandInvocationName, workbenchArgs, type AccountState, type AccountsView, type HostCommandName, type PiThemeView, type SettingKey, type SettingResult, type SettingValue, type SettingsView, type ThemeView, type ThemesView, type HostQueryAction, type HostQueryValues, type HostState, type ProjectItem, type ProjectInspectView, type ProjectsView, type ProjectTrustView, type WorkbenchAction, type WorkbenchValues, type WorkbenchCommand, type SessionCatalogItem } from "../protocol/index.js";
 import { Bridge } from "./bridge.js";
 import type { Hub, HostHandler } from "./hub.js";
 import { LaunchProfile, type LaunchTarget } from "./launch-profile.js";
@@ -13,6 +14,9 @@ import { WorkspaceService } from "./workspace.js";
 import { ProjectRegistry, ProjectRegistryError, type ProjectView } from "./project-registry.js";
 import { ProjectService } from "./projects.js";
 import { AuthController, type AuthRuntime } from "./auth-controller.js";
+import { ThemeCatalog, type Catalog } from "./theme-catalog.js";
+import { SettingsController, type SettingChoices, type SettingsScope } from "./settings-controller.js";
+import type { PaneTheme } from "./theme.js";
 export { childArgs } from "./child-args.js";
 export { LaunchProfile } from "./launch-profile.js";
 export { SessionFileLock } from "./session-lock.js";
@@ -60,6 +64,11 @@ interface HandoffDependencies {
   /** pi's public auth runtime for the host-side login; tests script it. */
   createAuthRuntime?: () => Promise<AuthRuntime>;
   accountLimitMs?: number;
+  webOAuth?: ReadonlySet<string>;
+  /** The `themes` directory shipped with this package. */
+  bundledThemes?: string;
+  /** How long a setting changed through pi's RPC may take to show in the global file. */
+  settingConfirmMs?: number;
 }
 /** A planned replacement waits for slow shutdown handlers; an emergency stop (Ctrl+C) does not. */
 const PLANNED_STOP_MS = 20_000;
@@ -69,7 +78,7 @@ async function samePath(a: string, b: string): Promise<boolean> { return await c
 const BUILTINS: WorkbenchCommand[] = [
   ["new", "新建会话", "new"], ["resume", "查找并恢复会话", "sessions"], ["fork", "从用户消息之前分叉", "tree"],
   ["model", "选择模型", "model"], ["thinking", "调整思考强度", "thinking"], ["compact", "压缩会话", "compact"],
-  ["settings", "查看资源", "resources"], ["session", "会话信息", "status"], ["name", "重命名会话", "rename"], ["clone", "克隆当前分支", "clone"],
+  ["settings", "打开设置", "settings"], ["session", "会话信息", "status"], ["name", "重命名会话", "rename"], ["clone", "克隆当前分支", "clone"],
 ].map(([name, description, action]) => ({ name: name!, description: description!, source: "builtin", available: true, browserAction: action as WorkbenchCommand["browserAction"] }));
 BUILTINS.push({ name: "tree", description: "切换历史分支", source: "builtin", available: false, reason: "需要 pi 上游提供 RPC tree 导航；当前只能从用户消息分叉。", browserAction: "tree" });
 for (const [name, description] of [["login", "登录模型服务商"], ["logout", "退出模型服务商"]])
@@ -142,7 +151,12 @@ export class HandoffHost implements HostHandler {
   private readonly registry: ProjectRegistry;
   private readonly projects: ProjectService;
   private readonly accounts: AuthController;
-  /** pi's auth file changed and the running session has not reloaded it. */
+  private readonly themes: ThemeCatalog;
+  private readonly settings: SettingsController;
+  /** What "follow pi" shows in the current project. The handoff theme until a project's own is resolved. */
+  private piTheme: PaneTheme;
+  private piThemeView?: PiThemeView;
+  /** pi's auth file or a setting the session reads once changed, and the running session has not reloaded. */
   private pendingApply = false;
   private applyError?: string;
   constructor(private readonly hub: Hub, private readonly target: HandoffTarget, private readonly log: (line: string) => void,
@@ -153,7 +167,13 @@ export class HandoffHost implements HostHandler {
     this.registry = new ProjectRegistry(agentDir);
     this.projects = new ProjectService({ agentDir, protectedDirectories: () => [agentDir, ...this.directories] });
     this.accounts = new AuthController({ agentDir, publish: () => this.hub.publishAccountState(), changed: () => this.credentialsChanged(),
-      ...(dependencies.createAuthRuntime ? { createRuntime: dependencies.createAuthRuntime } : {}), ...(dependencies.accountLimitMs ? { limitMs: dependencies.accountLimitMs } : {}) });
+      ...(dependencies.createAuthRuntime ? { createRuntime: dependencies.createAuthRuntime } : {}), ...(dependencies.accountLimitMs ? { limitMs: dependencies.accountLimitMs } : {}),
+      ...(dependencies.webOAuth ? { webOAuth: dependencies.webOAuth } : {}) });
+    this.piTheme = target.theme;
+    this.themes = new ThemeCatalog({ agentDir, handoff: target.themes, handoffTheme: target.theme, startCwd: this.profile.startCwd, discover: !this.profile.noThemes,
+      bundledDir: dependencies.bundledThemes ?? resolve(dirname(fileURLToPath(import.meta.url)), "../../themes") });
+    const start = this.profile.startModel, startTheme = this.profile.startTheme;
+    this.settings = new SettingsController({ agentDir, cli: { ...start, ...(startTheme ? { theme: startTheme } : {}) }, ...(dependencies.settingConfirmMs ? { confirmMs: dependencies.settingConfirmMs } : {}) });
     this.rememberDirectory(target.sessionDir ?? dirname(target.sessionFile));
   }
   get sessionFile(): string { return this.lastSessionFile; }
@@ -175,6 +195,8 @@ export class HandoffHost implements HostHandler {
     if (name === "account_cancel") return Promise.resolve().then(() => { this.accounts.cancel(String(args.operationId)); return {}; });
     if (name === "account_logout") return this.accounts.logout(String(args.provider)).then(() => ({ pendingApply: this.pendingApply }));
     if (name === "account_apply") return this.applyCredentials(true).then(() => ({ pendingApply: this.pendingApply }));
+    // A setting is checked against the value the page was showing, not against the host revision.
+    if (name === "setting_set") return this.setSetting(args.key as SettingKey, args.value as SettingValue, args.expected as SettingValue);
     if (revision !== this.hostRevision) return Promise.reject(new ProtocolError("stale_host", "The host state changed; check the page before trying again."));
     if (name === "recover_retry" || name === "recover_restore" || name === "host_stop")
       return this.recover(name === "recover_retry" ? "retry" : name === "recover_restore" ? "restore" : "stop").then(() => ({ phase: this.hostState().phase }));
@@ -225,7 +247,7 @@ export class HandoffHost implements HostHandler {
       if (!this.pendingApply) return;
       this.assertLive();
       const outcome = await this.reloadRuntime();
-      if (outcome.cancelled) { this.applyError = "An extension declined to reload the session. The credential is saved; try again later."; throw new ProtocolError("apply_cancelled", this.applyError); }
+      if (outcome.cancelled) { this.applyError = "An extension declined to reload the session. The change is saved; try again later."; throw new ProtocolError("apply_cancelled", this.applyError); }
       this.pendingApply = false; this.applyError = undefined;
     }).catch(error => {
       if ((error as { code?: string }).code !== "apply_cancelled") this.applyError = clip(error instanceof Error ? error.message : String(error), 400);
@@ -261,7 +283,7 @@ export class HandoffHost implements HostHandler {
         await this.lock.acceptChanges(); await this.drop(previousLock);
       }
       await this.rebind("reload");
-      await this.reportModelChange(before, "before the account change", "账户变更前");
+      await this.reportModelChange(before, "before the reload", "重新加载前");
       return { cancelled: false };
     } catch (error) {
       const state = await child.request<{ sessionFile?: string; sessionId?: string }>("get_state").catch(() => undefined);
@@ -271,10 +293,91 @@ export class HandoffHost implements HostHandler {
       throw error;
     } finally { this.sessionChangePending = false; await this.drop(nextLock); }
   }
+  /**
+   * The project whose settings and themes apply, with the trust pi's child would use for it: nothing
+   * project-scoped is read for a project the user has not trusted or chose to open without its configuration.
+   */
+  private async settingsScope(): Promise<SettingsScope> {
+    const root = this.runtimeCwd, view = this.projects.trust(root);
+    const override = this.profile.startTrust && await samePath(root, this.profile.startCwd) ? this.profile.startTrust : undefined;
+    const trusted = !view.required || (!this.withholdTrust && (override ? override === "approve" : view.choice === "trusted" || (view.choice === "unknown" && view.policy === "always")));
+    return { cwd: root, projectTrusted: trusted };
+  }
+  /** Resolves the theme pi would use here and makes it what the session snapshot carries. Never fails the caller. */
+  private async refreshPiTheme(fresh = true): Promise<{ catalog: Catalog; pi: PiThemeView } | undefined> {
+    try {
+      const scope = await this.settingsScope();
+      const catalog = await this.themes.load(scope.cwd, scope.projectTrusted, fresh);
+      const { setting, source } = this.settings.themeSetting(scope);
+      const resolved = this.themes.resolvePi(catalog, setting, source);
+      this.piTheme = resolved.theme; this.piThemeView = resolved.view;
+      return { catalog, pi: resolved.view };
+    } catch (error) {
+      this.log(`Themes could not be read: ${error instanceof Error ? error.message : String(error)}`);
+      return undefined;
+    }
+  }
+  private async themesView(): Promise<ThemesView> {
+    const loaded = await this.refreshPiTheme();
+    if (!loaded) throw new ProtocolError("themes_unavailable", "The theme list could not be read.");
+    return { themes: this.themes.items(loaded.catalog), problems: loaded.catalog.problems, truncated: loaded.catalog.truncated, pi: loaded.pi, projectThemes: loaded.catalog.projectThemes };
+  }
+  private async themeView(name: string): Promise<ThemeView> {
+    const scope = await this.settingsScope();
+    const entry = (await this.themes.load(scope.cwd, scope.projectTrusted, false)).entries.get(name);
+    if (!entry) throw new ProtocolError("theme_missing", "This theme is not available in the current project.");
+    return { name: entry.name, appearance: entry.theme.appearance, vars: entry.vars };
+  }
+  /** The lists a setting is chosen from, and what the running session reports. Read fresh for every view and save. */
+  private async settingChoices(scope: SettingsScope): Promise<{ choices: SettingChoices; live: boolean }> {
+    const live = this.phase === "ready" && !!this.child?.running && !this.stopping;
+    const [models, state, catalog] = await Promise.all([
+      live ? this.child!.request<{ models: Array<{ provider: string; id: string }> }>("get_available_models").then(result => result.models.map(model => `${model.provider}/${model.id}`), () => undefined) : undefined,
+      live ? this.child!.request<SettingChoices["runtime"]>("get_state").catch(() => undefined) : undefined,
+      this.themes.load(scope.cwd, scope.projectTrusted, false).catch(() => undefined),
+    ]);
+    const themes = catalog ? ["system", ...this.themes.items(catalog).filter(item => item.global).map(item => item.name)] : ["system"];
+    return { live, choices: { themes, ...(models ? { models } : {}), ...(state ? { runtime: { steeringMode: state.steeringMode, followUpMode: state.followUpMode, autoCompactionEnabled: state.autoCompactionEnabled } } : {}) } };
+  }
+  private async settingsView(): Promise<SettingsView> {
+    const scope = await this.settingsScope(), { choices, live } = await this.settingChoices(scope);
+    return { ...this.settings.view(scope, choices, live), pendingApply: this.pendingApply, ...(this.applyError ? { applyError: this.applyError } : {}) };
+  }
+  /**
+   * Saves one setting. Serialized with every other host write, so two pages changing the same
+   * setting are decided one after the other: the second is told the value it saw is stale.
+   * Settings pi changes through RPC also change the running session, so they wait for it to be idle.
+   */
+  private setSetting(key: SettingKey, value: SettingValue, expected: SettingValue): Promise<SettingResult> {
+    if (this.queuedWrites >= 32) return Promise.reject(new ProtocolError("busy", "Too many host commands are waiting; let them settle before retrying."));
+    this.queuedWrites++;
+    const result = this.writes.then(async () => {
+      if (this.control) await this.control;
+      if (this.stopping) throw new ProtocolError("host_stopped", "The service is stopping.");
+      const scope = await this.settingsScope(), { choices, live } = await this.settingChoices(scope);
+      const viaRuntime = this.settings.viaRuntime(key);
+      if (viaRuntime) {
+        this.assertLive(); await this.mirror!.synchronize();
+        if (this.dialogs.size || !this.mirror!.idle) throw new ProtocolError("busy", "Wait until replies, queued messages and dialogs have settled.");
+      }
+      const outcome = await this.settings.set(scope, key, value, expected, choices, live ? this.child : undefined);
+      if (viaRuntime) { await this.mirror?.synchronize().catch(() => undefined); this.bridge?.refreshState(); }
+      if (key === "theme") await this.refreshPiTheme();
+      if (outcome.applied === "pending" && live) { this.pendingApply = true; this.applyError = undefined; }
+      return outcome;
+    }).finally(() => { this.queuedWrites--; this.touch(); });
+    this.writes = result.catch(() => undefined);
+    // Outside the queue: applying takes its own turn in it.
+    void result.then(outcome => { if (outcome.applied === "pending") void this.applyCredentials(false).catch(() => undefined); }, () => undefined);
+    return result;
+  }
   async hostQuery<A extends HostQueryAction>(action: A, args: Record<string, unknown> = {}, _leaseId = ""): Promise<HostQueryValues[A]> {
     if (this.stopping) throw new ProtocolError("host_stopped", "The service is stopping.");
     let value: HostQueryValues[HostQueryAction];
     if (action === "accounts") value = await this.accountsView();
+    else if (action === "themes") value = await this.themesView();
+    else if (action === "theme") value = await this.themeView(String(args.name));
+    else if (action === "settings") value = await this.settingsView();
     else if (action === "directories") value = await this.projects.directories(typeof args.path === "string" ? args.path : this.runtimeCwd);
     else if (action === "project_inspect") value = await this.inspectProject(await this.projects.root(String(args.path)));
     else value = await this.projectsView();
@@ -555,7 +658,9 @@ export class HandoffHost implements HostHandler {
     if (!(await samePath(cwd, this.runtimeCwd))) throw new ProtocolError("project_mismatch",
       `The RPC child moved to a session of another project (${cwd}) while running in ${this.runtimeCwd}. Its tools, trust and project resources still belong to the old project.`);
     if (state.sessionFile) this.rememberDirectory(dirname(state.sessionFile));
-    const mirror = new RpcSessionMirror(this.child!, this.activeCwd, this.target.theme, () => this.target.themes, () => {}, () => this.verifyOwnedChanges());
+    // The snapshot carries the theme pi would use in this project; the handoff theme stands in when that cannot be resolved.
+    await this.refreshPiTheme();
+    const mirror = new RpcSessionMirror(this.child!, this.activeCwd, () => this.piTheme as ExtensionContext["ui"]["theme"], () => this.target.themes, () => {}, () => this.verifyOwnedChanges());
     try { await mirror.load(); } catch (error) { mirror.dispose(); throw error; }
     if (this.stopping) { mirror.dispose(); throw new Error("The handoff host stopped during startup."); }
     const bridge = new Bridge({ pi: mirror.api(), ctx: mirror.context(), generation, isCurrent: () => this.generation === generation && !this.stopping });
@@ -604,7 +709,8 @@ export class HandoffHost implements HostHandler {
         capabilities: [{ name: "session", available: true, detail: "RPC 新建、恢复、用户消息分叉、克隆与重命名。" }, { name: "workspace", available: true, detail: "文件和 Git 查询跟随当前会话 cwd。" },
           { name: "dialogs", available: true, detail: "RPC 扩展对话框在网页处理。" }, { name: "tools", available: false, detail: "需要 pi 上游提供 RPC 工具列表与启停。" },
           { name: "tree-navigation", available: false, detail: "需要 pi 上游提供 RPC tree 导航；可读取历史并从用户消息分叉。" },
-          { name: "authentication", available: true, detail: "在“账户”里登录或退出 pi 内置的模型服务商；需要本机回调的登录方式仍在终端完成。" }, { name: "resource-management", available: false, detail: "安装和配置扩展仍在终端完成。" }] };
+          { name: "authentication", available: true, detail: "在“账户”里登录或退出 pi 内置的模型服务商；需要本机回调的登录方式仍在终端完成。" }, { name: "settings", available: true, detail: "在“设置”里选择网页外观、保存 pi 的默认主题与默认模型、调整会话行为；其余设置只读并说明原因。" },
+          { name: "resource-management", available: false, detail: "安装和配置扩展仍在终端完成。" }] };
     } else if (action === "tree") {
       await this.mirror!.synchronize(); const entries = this.mirror!.getEntries().filter(entry => !isRecord(entry.message) || entry.message.role !== "system" || visibleText(entry.message.content).trim()); const retained = entries.slice(-2000);
       value = { entries: retained.map(entry => { const message = isRecord(entry.message) ? entry.message : undefined;

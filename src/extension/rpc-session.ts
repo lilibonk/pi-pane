@@ -47,7 +47,7 @@ export class RpcSessionMirror {
   private disposed = false;
   private unsubscribe: () => void;
 
-  constructor(private readonly child: RpcConnection, private readonly cwd: string, private readonly theme: ExtensionContext["ui"]["theme"],
+  constructor(private readonly child: RpcConnection, private readonly cwd: string, private readonly theme: () => ExtensionContext["ui"]["theme"],
     private readonly themes: () => ReturnType<ExtensionContext["ui"]["getAllThemes"]>, private readonly onUiRequest: (record: RpcRecord) => void,
     private readonly onPersisted?: () => Promise<void>) {
     this.unsubscribe = child.onRecord((record) => this.receive(record));
@@ -291,7 +291,8 @@ export class RpcSessionMirror {
         getAvailable: () => this.models.map((model) => ({ ...model, name: model.name ?? model.id })),
         find: (provider: string, id: string) => this.modelOf(provider, id),
       },
-      ui: { theme: this.theme, getAllThemes: this.themes, setStatus: () => {}, notify: () => {} },
+      // Read on every use: the theme "follow pi" shows changes with the project and with pi's saved default.
+      ui: { get theme() { return mirror.theme(); }, getAllThemes: this.themes, setStatus: () => {}, notify: () => {} },
     } as unknown as ExtensionContext;
   }
   /** Projection only. Every write is serialized by HandoffHost, never dispatched by this mirror. */
