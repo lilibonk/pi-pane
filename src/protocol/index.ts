@@ -3,6 +3,7 @@ import { WORKBENCH_ACTIONS, type WorkbenchQuery, type WorkbenchResult } from "./
 import { HOST_QUERIES, SETTING_KEYS, type SettingKey, type AccountAnswer, type AccountAnswerError, type AccountState, type HostQuery, type HostQueryAction, type HostResult } from "./host.js";
 export * from "./workbench.js";
 export * from "./host.js";
+export * from "./providers.js";
 export const PROTOCOL = "pi-pane.v1";
 export const WS_PATH = "/ws";
 
@@ -58,7 +59,7 @@ export const COMMANDS = ["prompt", "abort", "set_model", "set_thinking", "compac
 export type CommandName = (typeof COMMANDS)[number];
 /** Commands about the host itself. They need no live session: a failed runtime replacement is recovered through them. */
 export const HOST_COMMANDS = ["recover_retry", "recover_restore", "host_stop", "project_open", "project_create", "project_remove", "project_relocate",
-  "account_begin", "account_cancel", "account_logout", "account_apply", "setting_set"] as const;
+  "account_begin", "account_cancel", "account_logout", "account_apply", "setting_set", "provider_save", "provider_remove", "session_delete", "session_export"] as const;
 export type HostCommandName = (typeof HOST_COMMANDS)[number];
 
 /** `total` is present when `text` is a prefix of a longer block readable through content_page. */
@@ -173,7 +174,7 @@ export type ProjectionEvent =
   | { type: "agent_state"; state: StateView }  // `tools` is always empty; see applyProjectionEvent
   | { type: "session_meta"; name?: string }
   | { type: "theme"; theme: Record<string, string> };
-export interface WireError { code: string; message: string }
+export interface WireError { code: string; message: string; field?: string }
 export interface CommandEnvelope {
   t: "command";
   clientId: string;
@@ -316,7 +317,8 @@ export type ChunkFrame =
   | { t: "frame_end"; id: string };
 
 export class ProtocolError extends Error {
-  constructor(public readonly code: string, message: string) { super(message); this.name = "ProtocolError"; }
+  /** `field`: the input a refusal is about, where the page can point at it. */
+  constructor(public readonly code: string, message: string, public readonly field?: string) { super(message); this.name = "ProtocolError"; }
 }
 export function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -408,6 +410,18 @@ export function hostCommandArgs(command: HostCommandName, value: unknown): Recor
     const scalar = (item: unknown) => item === null || typeof item === "boolean" || (typeof item === "string" && item.length > 0 && item.length <= 256 && !/[\0-\x1f]/.test(item));
     if (!exactKeys(value, ["key", "value", "expected"]) || !SETTING_KEYS.includes(value.key as SettingKey) || value.value === null || !scalar(value.value) || !scalar(value.expected))
       throw new ProtocolError("invalid_args", "Provide one known setting, its new value and the value the page was showing.");
+  } else if (command === "provider_save") {
+    // Structure only. What the values may be (names, addresses, limits) is decided by the host, with an error naming the field.
+    const model = (item: unknown) => isRecord(item) && exactKeys(item, ["id", "name", "contextWindow"]) && typeof item.id === "string" && item.id.length <= 256 &&
+      (item.name === undefined || (typeof item.name === "string" && item.name.length <= 256)) && (item.contextWindow === undefined || typeof item.contextWindow === "number");
+    if (!exactKeys(value, ["id", "api", "baseUrl", "models", "revision", "create"]) || typeof value.id !== "string" || value.id.length > 128 || typeof value.api !== "string" || value.api.length > 64 ||
+        typeof value.baseUrl !== "string" || value.baseUrl.length > 2048 || !Array.isArray(value.models) || value.models.length > 128 || !value.models.every(model) ||
+        !shortString(value.revision, 80) || typeof value.create !== "boolean")
+      throw new ProtocolError("invalid_args", "Provide the provider's name, API, address and models, and the revision of the list it was edited from.");
+  } else if (command === "provider_remove") {
+    if (!exactKeys(value, ["id", "revision"]) || !shortString(value.id, 128) || !shortString(value.revision, 80)) throw new ProtocolError("invalid_args", "Provide the provider to remove and the revision of the list.");
+  } else if (command === "session_delete") {
+    if (!exactKeys(value, ["sessionId"]) || !shortString(value.sessionId, 128)) throw new ProtocolError("invalid_args", "Provide the session to delete.");
   } else if (command === "project_relocate") {
     if (!exactKeys(value, ["from", "to"]) || !hostPath(value.from) || !hostPath(value.to)) throw new ProtocolError("invalid_args", "Provide the listed project path and its new directory.");
   } else if (Object.keys(value).length) throw new ProtocolError("invalid_args", "This host command takes no arguments.");
@@ -419,6 +433,10 @@ export function hostQueryArgs(action: HostQueryAction, value: unknown): Record<s
     if (!exactKeys(value, ["path"]) || (value.path !== undefined && !hostPath(value.path))) throw new ProtocolError("invalid_args", "Provide an absolute directory path.");
   } else if (action === "project_inspect") {
     if (!exactKeys(value, ["path"]) || !hostPath(value.path)) throw new ProtocolError("invalid_args", "Provide an absolute directory path.");
+  } else if (action === "session_inspect") {
+    if (!exactKeys(value, ["sessionId"]) || !shortString(value.sessionId, 128)) throw new ProtocolError("invalid_args", "Provide one listed session.");
+  } else if (action === "export_page") {
+    if (!exactKeys(value, ["exportId", "offset"]) || !shortString(value.exportId, 64) || !nonNegativeInt(value.offset)) throw new ProtocolError("invalid_args", "Provide the export and an offset.");
   } else if (action === "theme") {
     if (!exactKeys(value, ["name"]) || !shortString(value.name, 64)) throw new ProtocolError("invalid_args", "Provide one theme name.");
   } else if (Object.keys(value).length) throw new ProtocolError("invalid_args", "This query takes no arguments.");
@@ -433,6 +451,8 @@ export function workbenchArgs(action: WorkbenchQuery["action"], value: unknown):
   } else if (action === "files") {
     if (!exactKeys(value, ["query"]) || (value.query !== undefined && (typeof value.query !== "string" || value.query.length > 256)))
       throw new ProtocolError("invalid_args", "File search is limited to 256 characters.");
+  } else if (action === "assistant_text") {
+    if (!exactKeys(value, ["entryId"]) || (value.entryId !== undefined && !shortString(value.entryId, 128))) throw new ProtocolError("invalid_args", "Provide one message of the current session, or none for the last reply.");
   } else if (action === "file" || action === "git_diff") {
     if (!exactKeys(value, ["path"]) || !shortString(value.path, 4096))
       throw new ProtocolError("invalid_args", "Provide one workspace-relative file path.");
@@ -590,7 +610,7 @@ export function validateImages(value: unknown): PromptImage[] {
 
 export function toWireError(error: unknown): WireError {
   return error instanceof ProtocolError
-    ? { code: error.code, message: error.message }
+    ? { code: error.code, message: error.message, ...(error.field ? { field: error.field } : {}) }
     : { code: "operation_failed", message: error instanceof Error ? error.message : "Operation failed." };
 }
 

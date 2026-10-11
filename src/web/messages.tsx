@@ -4,7 +4,7 @@ import type { ContentView, MessageView, ToolView } from "../protocol/index.js";
 import { highlight, languageForPath } from "./highlight.js";
 import { parseDiff } from "./diff.js";
 import { renderMarkdown } from "./markdown.js";
-import { collapseContent, expandContent, requestImage, retryImage, webStore, type Expansion, type LoadedImage } from "./store.js";
+import { collapseContent, copyReply, expandContent, requestImage, retryImage, webStore, type Expansion, type LoadedImage } from "./store.js";
 
 export type Expansions = Record<string, Expansion>;
 type ToolCall = Extract<ContentView, { type: "toolCall" }>;
@@ -232,7 +232,9 @@ function MessageView_({ message, tools, expansions }: { message: MessageView; to
   const plain = message.role !== "assistant";
   return (
     <article class={`message message-${message.role} ${message.isError ? "message-error" : ""}`} data-message-id={message.id}>
-      <div class="message-meta"><span class="role">{role}</span>{message.status === "streaming" && <span class="streaming">正在生成</span>}</div>
+      <div class="message-meta"><span class="role">{role}</span>{message.status === "streaming" && <span class="streaming">正在生成</span>}
+        {message.role === "assistant" && final && message.entryId && message.content.some(block => block.type === "text") &&
+          <button type="button" class="message-copy" title="复制这条回复的文字（不含思考与工具调用）" onClick={() => { void copyReply(message.entryId); }}>复制</button>}</div>
       <div class="message-body">
         {message.content.map((content, index) => {
           if (content.type === "toolCall")

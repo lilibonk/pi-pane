@@ -59,7 +59,7 @@ async function freePort() {
 }
 
 export async function startFixture({ autoWeb = true, extraExtensions = [], settings = {}, envOverrides = {}, disablePane = false,
-  provider = "pi-pane-m0", model = "deterministic", packaged = false, loadThemes = false, loadSkills = false, loadPromptTemplates = false, prepareAgentDir, cli: selectedCli, controllingTty = true, webArgs = [], extraArgs = [], seedSession = true, webConfigFlags = true, online = false } = {}) {
+  provider = "pi-pane-m0", model = "deterministic", packaged = false, loadThemes = false, loadSkills = false, loadPromptTemplates = false, prepareAgentDir, cli: selectedCli, controllingTty = true, webArgs = [], extraArgs = [], seedSession = true, webConfigFlags = true, online = false, prependPath } = {}) {
   if (process.platform === "win32") throw new Error("The M0 real-TUI harness requires a POSIX PTY (macOS or Linux).");
   for (const key of Object.keys(envOverrides)) if (!key.startsWith("PI_M0_") && !key.startsWith("PI_M31_") && key !== "PI_PANE_PASSWORD") throw new Error(`Fixture env override is not allowed: ${key}`);
   const host = await readPiHost(selectedCli);
@@ -93,6 +93,8 @@ export async function startFixture({ autoWeb = true, extraExtensions = [], setti
   const port = await freePort();
   // An allowlist avoids inheriting real provider/API credentials into the fixture.
   const env = Object.fromEntries(["PATH", "TMPDIR", "LANG", "LC_ALL", "SYSTEMROOT"].filter((key) => process.env[key]).map((key) => [key, process.env[key]]));
+  // `prependPath`: a directory of stand-in commands (such as a `trash` that stays inside the fixture) found before the system's.
+  if (prependPath) env.PATH = `${typeof prependPath === "function" ? await prependPath(directory) : prependPath}:${env.PATH ?? ""}`;
   // `online`: an explicitly authorized real-provider trial. Everything else stays offline.
   Object.assign(env, { HOME: directory, TERM: "xterm-256color", COLORTERM: "truecolor", ...(online ? {} : { PI_OFFLINE: "1" }), NO_COLOR: "1",
     PI_CODING_AGENT_DIR: agentDir, PI_CODING_AGENT_SESSION_DIR: join(agentDir, "sessions"), PI_M0_EVENTS_PATH: eventPath, ...envOverrides });

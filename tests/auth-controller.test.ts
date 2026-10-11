@@ -232,3 +232,39 @@ test("pi's own runtime: listing never executes a stored key command, and a brows
     await controller.logout("anthropic"); assert.equal(JSON.parse(await readFile(authPath, "utf8")).anthropic, undefined); assert.equal(JSON.parse(await readFile(authPath, "utf8")).openai.key, `!touch ${marker}`);
   } finally { await rm(root, { recursive: true, force: true }); }
 });
+test("pi's own runtime: a models.json provider gets its key through pi's login, stored literally in the auth file, and nothing in models.json is run", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-pane-auth-custom-")); const marker = join(root, "EXECUTED"); const authPath = join(root, "auth.json"), modelsPath = join(root, "models.json");
+  try {
+    await writeFile(authPath, "{}", { mode: 0o600 });
+    const models = JSON.stringify({ providers: { local: { baseUrl: "http://127.0.0.1:9/v1", api: "openai-completions", models: [{ id: "m" }] },
+      scripted: { baseUrl: "http://127.0.0.1:9/v1", api: "openai-completions", apiKey: `!touch ${marker}`, headers: { x: `!touch ${marker}` }, models: [{ id: "s" }] } } });
+    await writeFile(modelsPath, models);
+    const changes: string[] = [];
+    const controller = new AuthController({ agentDir: root, publish: () => {}, changed: (provider, change) => changes.push(`${change}:${provider}`), customProviders: async () => new Set(["local", "scripted"]) });
+    // pi's built-in list is unchanged by the file; the stored map covers providers pi does not know.
+    assert.equal((await controller.providers()).some(provider => provider.id === "local"), false);
+    assert.deepEqual([...(await controller.stored())], []);
+    await assert.rejects(controller.begin("owner", "not-in-file", "api_key"), { code: "unknown_provider" });
+    await assert.rejects(controller.begin("owner", "local", "oauth"), { code: "unknown_provider" });
+    const typed = `!touch ${join(root, "FROM_BROWSER")} $HOME`;
+    const { operationId } = await controller.begin("owner", "local", "api_key");
+    const step = await until(() => controller.view("owner")?.step, "pi's key prompt"); assert.equal(step.kind, "secret");
+    controller.answer("owner", operationId, step.id, typed);
+    await until(() => controller.view("owner")?.status === "saved", "saved");
+    const stored = JSON.parse(await readFile(authPath, "utf8"));
+    assert.deepEqual(Object.keys(stored), ["local"]); assert.equal(stored.local.type, "api_key"); assert.equal(configValueKind(stored.local.key), "literal");
+    assert.equal((await stat(authPath)).mode & 0o777, 0o600); assert.deepEqual(changes, ["login:local"]);
+    assert.deepEqual([...(await controller.stored())], [["local", "api_key"]]);
+    assert.equal(await readFile(modelsPath, "utf8"), models, "models.json is not written by a login");
+    // A provider whose file entry carries a command as its key: storing a key for it runs nothing either.
+    const second = await controller.begin("owner", "scripted", "api_key");
+    const next = await until(() => controller.view("owner")?.step, "second prompt"); controller.answer("owner", second.operationId, next.id, "sk-plain");
+    await until(() => controller.view("owner")?.status === "saved", "second saved");
+    await controller.logout("local"); assert.deepEqual([...(await controller.stored())], [["scripted", "api_key"]]);
+    await assert.rejects(controller.logout("local"), { code: "not_stored" });
+    await assert.rejects(access(marker)); await assert.rejects(access(join(root, "FROM_BROWSER")));
+    // A models.json that cannot be parsed does not break the account list or the stored map.
+    await writeFile(modelsPath, "{ broken");
+    assert((await controller.providers()).length > 20); assert.deepEqual([...(await controller.stored())], [["scripted", "api_key"]]);
+  } finally { await rm(root, { recursive: true, force: true }); }
+});

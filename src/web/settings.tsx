@@ -3,10 +3,11 @@ import type { ComponentChildren } from "preact";
 import type { PiThemeView, ReadonlySettingGroup, SettingItem, SettingKey, SettingResult, SettingValue, SettingsView, ThemeItem, ThemeProblem, ThemesView } from "../protocol/index.js";
 import { DARK_THEME, LIGHT_THEME, type Appearance } from "./appearance.js";
 import { AccountsPanel } from "./accounts.js";
+import { ProvidersSection } from "./providers.js";
 import { Modal, useHostQuery } from "./projects.js";
 import { HostError, clearAppearance, closeSettings, commitAppearance, openSettings, previewAppearance, runHostCommand, setHideThinking, type SettingsSection, type WebState } from "./store.js";
 
-const SECTIONS: [SettingsSection, string][] = [["appearance", "外观"], ["defaults", "模型默认"], ["behavior", "会话行为"], ["accounts", "账户"], ["other", "其他设置"]];
+const SECTIONS: [SettingsSection, string][] = [["appearance", "外观"], ["defaults", "模型默认"], ["behavior", "会话行为"], ["accounts", "账户"], ["providers", "自定义供应商"], ["other", "其他设置"]];
 const ERRORS: Record<string, string> = {
   stale_setting: "这个设置刚被其他页面或另一个 pi 改过。现在显示的是已保存的值，需要的话请重新选择。",
   busy: "pi 正在回复、有待发消息或有待回答的对话框，结束后再改。",
@@ -218,7 +219,8 @@ function OtherSection({ groups }: { groups: ReadonlySettingGroup[] }) {
 /** Settings: this browser's look, pi's own defaults, and everything else read-only with its reason. */
 export function SettingsDialog({ state, canConfigure }: { state: WebState; canConfigure: boolean }) {
   const section = state.settings ?? "appearance";
-  const settings = useHostQuery(state, "settings", {}, section !== "accounts");
+  const own = section === "accounts" || section === "providers"; // sections that read their own data
+  const settings = useHostQuery(state, "settings", {}, !own);
   const themes = useHostQuery(state, "themes", {}, section === "appearance");
   const [error, setError] = useState("");
   const view = settings.value;
@@ -229,17 +231,18 @@ export function SettingsDialog({ state, canConfigure }: { state: WebState; canCo
       <div class="settings-head"><h2 id="settings-title">设置</h2><button type="button" class="quiet" data-autofocus onClick={closeSettings}>关闭</button></div>
       <div class="settings-nav" role="group" aria-label="设置分类">{SECTIONS.map(([name, label]) => <button type="button" key={name} aria-pressed={section === name} onClick={() => openSettings(name)}>{label}</button>)}</div>
       <div class="settings-body" key={section}>
-        {section !== "accounts" && view?.errors.map(item => <p class="setting-note setting-warn" role="alert" key={item.scope}>{item.scope === "global" ? "pi 的全局设置文件无法解析，所有设置暂时只读，文件没有被改动。" : "当前项目的设置文件无法解析，已忽略。"}{item.message}</p>)}
-        {section !== "accounts" && view?.pendingApply && <div class="setting-banner" role="status"><span>有已保存的更改在等待当前会话重新加载。{view.applyError ? ERRORS.busy : ""}</span><button type="button" disabled={!canConfigure || !!state.hostAction} onClick={apply}>立即应用</button></div>}
+        {!own && view?.errors.map(item => <p class="setting-note setting-warn" role="alert" key={item.scope}>{item.scope === "global" ? "pi 的全局设置文件无法解析，所有设置暂时只读，文件没有被改动。" : "当前项目的设置文件无法解析，已忽略。"}{item.message}</p>)}
+        {!own && view?.pendingApply && <div class="setting-banner" role="status"><span>有已保存的更改在等待当前会话重新加载。{view.applyError ? ERRORS.busy : ""}</span><button type="button" disabled={!canConfigure || !!state.hostAction} onClick={apply}>立即应用</button></div>}
         {error && <p class="setting-note setting-warn" role="alert">{error}</p>}
-        {section !== "accounts" && settings.error && !view && <div class="setting-note setting-warn" role="alert"><p>{settings.error}</p><button type="button" onClick={settings.reload}>重新加载</button></div>}
+        {!own && settings.error && !view && <div class="setting-note setting-warn" role="alert"><p>{settings.error}</p><button type="button" onClick={settings.reload}>重新加载</button></div>}
         {section === "appearance" && <AppearanceSection state={state} themes={themes.value} settings={view} reload={themes.reload} />}
         {section === "appearance" && themes.error && !themes.value && <p class="setting-note setting-warn" role="alert">{themes.error}</p>}
         {section === "defaults" && <><p class="setting-intro">这些是 pi 的全局默认值，保存在 {view?.agentDir ?? "pi 的数据目录"} 的 settings.json 里，对这台电脑上的所有项目生效。要换当前会话的模型，请用输入框旁的模型选择。</p>{rows(["defaultModel", "defaultThinkingLevel"])}</>}
         {section === "behavior" && <><p class="setting-intro">当前会话的行为。前四项由 pi 自己的命令修改，会同时保存为全局默认。{view?.project.settings === "loaded" ? "当前项目有自己的设置文件，它设置的项目会覆盖全局默认。" : view?.project.settings === "untrusted" ? "当前项目有自己的设置文件；项目未被信任，没有读取。" : ""}</p>{rows(["steeringMode", "followUpMode", "compaction.enabled", "retry.enabled", "images.blockImages"])}</>}
         {section === "accounts" && <AccountsPanel state={state} canConfigure={canConfigure} />}
+        {section === "providers" && <ProvidersSection state={state} canConfigure={canConfigure} />}
         {section === "other" && view && <OtherSection groups={view.groups} />}
-        {section !== "accounts" && section !== "appearance" && !view && settings.loading && <p class="setting-note" role="status">正在读取设置…</p>}
+        {!own && section !== "appearance" && !view && settings.loading && <p class="setting-note" role="status">正在读取设置…</p>}
       </div>
     </div>
   </Modal>;

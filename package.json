@@ -49,6 +49,8 @@
     "m31:auth": "node --import tsx scripts/m31-auth.mjs",
     "m31:auth-real": "node --import tsx scripts/m31-auth-real.mjs",
     "m31:settings": "node --import tsx scripts/m31-settings.mjs",
+    "m31:providers": "node --import tsx scripts/m31-providers.mjs",
+    "m31:ui": "node --import tsx scripts/m31-ui.mjs",
     "m31:gates": "node --import tsx scripts/m31-g1.mjs && node --import tsx scripts/m31-g2.mjs && node --import tsx scripts/m31-g3.mjs && node --import tsx scripts/m31-g4g5.mjs"
   },
   "peerDependencies": {

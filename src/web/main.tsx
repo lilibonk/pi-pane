@@ -12,6 +12,7 @@ import { resolveSlash } from "./commands.js";
 import { ProjectDialogs } from "./projects.js";
 import { AccountDialogs } from "./accounts.js";
 import { SettingsDialog } from "./settings.js";
+import { ContextMeter, SessionDialogs } from "./sessions.js";
 import { extensionText } from "./ui-state.js";
 import "./style.css";
 
@@ -398,6 +399,7 @@ function App() {
             <label><span>模型</span><select aria-label="模型" value={host?.model ? JSON.stringify({ provider: host.model.provider, id: host.model.id }) : ""} disabled={!canConfigure || !snapshot?.caps.commands.includes("set_model")} onChange={event => { const model = event.currentTarget.value; if (model) issueCommand("set_model", JSON.parse(model)); }}>{!resources.value?.models.some(model => model.provider === host?.model?.provider && model.id === host?.model?.id) && <option value="">{host?.model?.name || "未设置"}</option>}{resources.value?.models.map(model => <option key={`${model.provider}:${model.id}`} value={JSON.stringify({ provider: model.provider, id: model.id })}>{model.name || model.id}</option>)}</select></label>
             <label><span>thinking</span><select aria-label="thinking 等级" value={host?.thinking ?? "off"} disabled={!canConfigure || !snapshot?.caps.commands.includes("set_thinking") || !resources.value?.thinkingLevels?.length} onChange={event => issueCommand("set_thinking", { level: event.currentTarget.value })}>{(resources.value?.thinkingLevels ?? [host?.thinking || "off"]).map(level => <option value={level} key={level}>{level}</option>)}</select></label>
             <button type="button" class="compact-button" disabled={!canConfigure || !!host?.hasPendingMessages || !snapshot?.caps.commands.includes("compact")} onClick={() => issueCommand("compact")}>压缩上下文</button>
+            <ContextMeter state={state} />
           </div>
           <div class="composer-wrap">
           {snapshot?.caps.workbench && <CommandMenu commands={commandCatalog.value?.commands ?? []} draft={state.draft} onChoose={command => { setDraft(`/${command.name} `); textarea.current?.focus(); }} />}
@@ -421,7 +423,7 @@ function App() {
       </>}
       </Workbench>
       {state.dialogs[0] ? <DialogView key={state.dialogs[0].id} dialog={state.dialogs[0]} online={online} /> : state.projectDialog ? <ProjectDialogs state={state} />
-        : state.account?.owner && state.account.id !== state.accountDismissed ? <AccountDialogs state={state} /> : state.settings ? <SettingsDialog state={state} canConfigure={canConfigure} /> : null}
+        : state.account?.owner && state.account.id !== state.accountDismissed ? <AccountDialogs state={state} /> : state.sessionDialog ? <SessionDialogs state={state} /> : state.settings ? <SettingsDialog state={state} canConfigure={canConfigure} /> : null}
     </div>
   );
 }

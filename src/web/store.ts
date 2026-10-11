@@ -80,8 +80,12 @@ export interface WebState {
   appearanceStored: boolean;
   /** The open settings dialog and its section. */
   settings: SettingsSection | null;
+  /** A dialog about sessions: the question before a deletion, the session's numbers, an export, or text that could not be copied. */
+  sessionDialog: { mode: "delete"; sessionId: string } | { mode: "info" } | { mode: "export" } | { mode: "text"; text: string } | null;
+  /** Counts successful session deletions, so listings read again. */
+  sessionsChanged: number;
 }
-export type SettingsSection = "appearance" | "defaults" | "behavior" | "accounts" | "other";
+export type SettingsSection = "appearance" | "defaults" | "behavior" | "accounts" | "providers" | "other";
 
 function prefersDark(): boolean { try { return matchMedia("(prefers-color-scheme: dark)").matches; } catch { return false; } }
 const storedAppearance = loadAppearance();
@@ -123,6 +127,8 @@ export const webStore = createStore<WebState>(() => ({
   themeProblem: "",
   appearanceStored: true,
   settings: null,
+  sessionDialog: null,
+  sessionsChanged: 0,
 }));
 
 const TOKEN_KEY = "pi-pane.token";
@@ -288,7 +294,7 @@ function cancelWorkbenchReads() {
 }
 /** A failure reported by the host, with its code so the page can explain it in its own words. */
 export class HostError extends Error {
-  constructor(readonly code: string, message: string) { super(message); this.name = "HostError"; }
+  constructor(readonly code: string, message: string, readonly field?: string) { super(message); this.name = "HostError"; }
 }
 const hostRequests = new Map<string, { action: string; resolve: (value: any) => void; reject: (error: Error) => void; dispose: () => void }>();
 const hostCommands = new Map<string, { resolve: (value: any) => void; reject: (error: Error) => void }>();
@@ -504,7 +510,7 @@ function handleFrame(raw: unknown) {
         if (frame.status !== "dispatched") {
           webStore.setState({ hostAction: null });
           const waiter = hostCommands.get(frame.id); hostCommands.delete(frame.id);
-          waiter?.reject(new HostError(String(frame.error?.code ?? "rejected"), frame.error?.message ?? "操作未被接受。"));
+          waiter?.reject(new HostError(String(frame.error?.code ?? "rejected"), frame.error?.message ?? "操作未被接受。", typeof frame.error?.field === "string" ? frame.error.field : undefined));
         }
         break;
       }
@@ -520,7 +526,7 @@ function handleFrame(raw: unknown) {
         webStore.setState({ hostAction: null });
         const waiter = hostCommands.get(frame.id); hostCommands.delete(frame.id);
         if (frame.status === "completed") waiter?.resolve(frame.value);
-        else waiter?.reject(new HostError(String(frame.error?.code ?? "failed"), frame.error?.message ?? "操作失败。"));
+        else waiter?.reject(new HostError(String(frame.error?.code ?? "failed"), frame.error?.message ?? "操作失败。", typeof frame.error?.field === "string" ? frame.error.field : undefined));
         break;
       }
       const submission = current.submissions.find(item => item.id === frame.id);
@@ -857,6 +863,27 @@ export function setHideThinking(hide: boolean) {
   const { hideThinking: _old, ...rest } = webStore.getState().appearance;
   const appearance: Appearance = { ...rest, ...(hide ? { hideThinking: true } : {}) };
   webStore.setState({ appearance, appearanceStored: saveAppearance(appearance, themeCache) });
+}
+export function setSessionDialog(dialog: WebState["sessionDialog"]) { webStore.setState({ sessionDialog: dialog }); }
+export function sessionDeleted() { webStore.setState(state => ({ sessionsChanged: state.sessionsChanged + 1 })); }
+/** Writes to the clipboard and says whether it did. A browser may refuse: no permission, no secure context, no focus. */
+export async function copyText(text: string): Promise<boolean> {
+  try { await navigator.clipboard.writeText(text); return true; } catch { return false; }
+}
+/**
+ * Copies one assistant reply, or the last one, as pi's `/copy` gives it. When the clipboard refuses,
+ * the text is shown to be selected by hand; "copied" is only said when it was.
+ */
+export async function copyReply(entryId?: string): Promise<void> {
+  let text: string;
+  try {
+    const reply = await queryWorkbench("assistant_text", entryId ? { entryId } : {});
+    text = reply.text;
+    if (reply.truncated) { webStore.setState({ sessionDialog: { mode: "text", text }, notice: "这条回复很长，只取到前 4 MiB。" }); return; }
+  } catch (error) { webStore.setState({ notice: error instanceof Error ? error.message : "读取回复失败。" }); return; }
+  if (!text) { webStore.setState({ notice: "没有可复制的回复文字。" }); return; }
+  if (await copyText(text)) webStore.setState({ notice: "已复制回复。" });
+  else webStore.setState({ sessionDialog: { mode: "text", text }, notice: "" });
 }
 export function openSettings(section: SettingsSection = "appearance") { webStore.setState({ settings: section }); }
 export function closeSettings() { webStore.setState({ settings: null, appearancePreview: null }); syncTheme(); }

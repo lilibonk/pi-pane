@@ -63,7 +63,7 @@ export function AccountsPanel({ state, canConfigure }: { state: WebState; canCon
   const configured = (view?.providers ?? []).filter(provider => (provider.stored || provider.models) && matches(provider));
   const others = (view?.providers ?? []).filter(provider => !provider.stored && !provider.models && matches(provider));
   const row = (provider: AccountProvider) => <div class="resource-item account-item" key={provider.id}>
-    <strong>{provider.name}<span class={`resource-status ${provider.stored || provider.models ? "active" : ""}`}>{provider.stored ? "已保存" : provider.models ? "可用" : "未配置"}</span></strong>
+    <strong>{provider.name}{provider.custom && <span class="source-chip">自定义</span>}<span class={`resource-status ${provider.stored || provider.models ? "active" : ""}`}>{provider.stored ? "已保存" : provider.models ? "可用" : "未配置"}</span></strong>
     <p>{status(provider, !!view?.pendingApply)}</p>
     <div class="account-actions">
       {provider.methods.map(method => method.web

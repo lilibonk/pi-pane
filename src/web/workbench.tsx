@@ -3,7 +3,7 @@ import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "preact/ho
 import type { WorkbenchAction, WorkbenchCommand, WorkbenchValues, WorkspaceFileView } from "../protocol/workbench.js";
 import { Diff } from "./messages.js";
 import { highlight, languageForPath } from "./highlight.js";
-import { issueCommand, openSettings, queryWorkbench, setDraft, webStore, type WebState } from "./store.js";
+import { copyReply, issueCommand, openSettings, queryWorkbench, setDraft, setSessionDialog, webStore, type WebState } from "./store.js";
 import { LIMITS } from "../protocol/index.js";
 import { ProjectSection } from "./projects.js";
 
@@ -37,7 +37,7 @@ export function useWorkbenchQuery<A extends WorkbenchAction>(state: WebState, ac
   return { value, loading, error, reload: () => refresh(value => value + 1) };
 }
 
-function Icon({ name }: { name: "menu" | "panel" | "plus" | "search" | "settings" | "refresh" | "close" | "branch" | "file" | "arrow" }) {
+function Icon({ name }: { name: "menu" | "panel" | "plus" | "search" | "settings" | "refresh" | "close" | "branch" | "file" | "arrow" | "trash" }) {
   const paths = {
     menu: <><path d="M4 5h16M4 12h16M4 19h16" /></>,
     panel: <><rect x="3" y="4" width="18" height="16" rx="2" /><path d="M15 4v16" /></>,
@@ -49,6 +49,7 @@ function Icon({ name }: { name: "menu" | "panel" | "plus" | "search" | "settings
     branch: <><circle cx="6" cy="5" r="2" /><circle cx="18" cy="6" r="2" /><circle cx="6" cy="19" r="2" /><path d="M6 7v10M18 8v2c0 4-12 1-12 5" /></>,
     file: <><path d="M14 3H5v18h14V8zM14 3v5h5" /></>,
     arrow: <path d="M5 12h14m-6-6 6 6-6 6" />,
+    trash: <><path d="M4 7h16M9 7V4h6v3M6 7l1 13h10l1-13M10 11v6M14 11v6" /></>,
   };
   return <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">{paths[name]}</svg>;
 }
@@ -156,6 +157,7 @@ export function Workbench({ state, canConfigure, commands, controller, onFocusCo
   const settledFileSearch = useDebounced(fileSearch);
   // The sidebar lists the current project's sessions; a search looks through every project.
   const sessions = useWorkbenchQuery(state, "sessions", { scope: settledSessionSearch ? "all" : "workspace", query: settledSessionSearch });
+  useEffect(() => { if (state.sessionsChanged) sessions.reload(); }, [state.sessionsChanged]);
   const tree = useWorkbenchQuery(state, "tree", {}, leftMode === "tree");
   const status = useWorkbenchQuery(state, "git_status", {}, rightOpen && tab === "changes");
   const files = useWorkbenchQuery(state, "files", { query: settledFileSearch }, rightOpen && tab === "files");
@@ -240,7 +242,9 @@ export function Workbench({ state, canConfigure, commands, controller, onFocusCo
       case "accounts": setLeftOpen(false); if (overlayInspector) setRightOpen(false); openSettings("accounts"); break;
       case "settings": setLeftOpen(false); if (overlayInspector) setRightOpen(false); openSettings(); break;
       case "resources": setTab("resources"); setResourceTab("commands"); setLeftOpen(false); setRightOpen(true); focusInspector(); break;
-      case "status": setTab("resources"); setResourceTab("capabilities"); setLeftOpen(false); setRightOpen(true); focusInspector(); break;
+      case "status": setLeftOpen(false); if (overlayInspector) setRightOpen(false); setSessionDialog({ mode: "info" }); break;
+      case "export": setLeftOpen(false); if (overlayInspector) setRightOpen(false); setSessionDialog({ mode: "export" }); break;
+      case "copy": void copyReply(); break;
       case "new": if (!canNavigate) return false; issueCommand("session_new"); break;
       case "compact": if (!canNavigate) return false; issueCommand("compact"); break;
       case "clone": if (!canNavigate) return false; issueCommand("session_clone"); break;
@@ -301,7 +305,7 @@ export function Workbench({ state, canConfigure, commands, controller, onFocusCo
       <div class="sidebar-scroll">
         {leftMode === "sessions" ? <ReadState read={sessionsRead}>
           {!catalog.length && <p class="panel-message">{sessionSearch ? "没有匹配的会话。" : "这个项目尚无会话。发送第一条消息后会出现在这里。"}</p>}
-          {catalog.map(([cwd, items]) => <section class="workspace-group" key={cwd}><h2 title={cwd}><span class="folder-mark">▱</span>{workspaceName(cwd)}<span>{items.length}</span></h2>{items.map(item => <button type="button" class={`session-item ${item.current ? "is-current" : ""}`} aria-current={item.current ? "page" : undefined} key={item.id} title={item.name || item.firstMessage || "未命名会话"} disabled={!item.current && !canNavigate} onClick={() => { if (!item.current) issueCommand("session_switch", { sessionId: item.id }); setLeftOpen(false); focusComposer(); }}><span class="session-item-title">{item.name || item.firstMessage || "未命名会话"}</span><span class="session-item-meta">{item.current ? "当前会话" : `${item.messageCount} 条消息`}<time>{timeLabel(item.modified)}</time></span></button>)}</section>)}
+          {catalog.map(([cwd, items]) => <section class="workspace-group" key={cwd}><h2 title={cwd}><span class="folder-mark">▱</span>{workspaceName(cwd)}<span>{items.length}</span></h2>{items.map(item => <div class="session-row" key={item.id}><button type="button" class={`session-item ${item.current ? "is-current" : ""}`} aria-current={item.current ? "page" : undefined} title={item.name || item.firstMessage || "未命名会话"} disabled={!item.current && !canNavigate} onClick={() => { if (!item.current) issueCommand("session_switch", { sessionId: item.id }); setLeftOpen(false); focusComposer(); }}><span class="session-item-title">{item.name || item.firstMessage || "未命名会话"}</span><span class="session-item-meta">{item.current ? "当前会话" : `${item.messageCount} 条消息`}<time>{timeLabel(item.modified)}</time></span></button>{!item.current && <button type="button" class="icon-button session-delete" aria-label={`删除会话：${item.name || item.firstMessage || "未命名会话"}`} title="删除这个会话" disabled={!online} onClick={() => setSessionDialog({ mode: "delete", sessionId: item.id })}><Icon name="trash" /></button>}</div>)}</section>)}
           {sessions.value?.truncated && <p class="panel-message">仅显示最近的部分会话。</p>}
         </ReadState> : <ReadState read={tree}>
           <p class="reference-note">分支树为只读。pi RPC 暂不支持 tree 导航；可从用户消息之前创建新分叉。</p>

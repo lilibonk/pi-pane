@@ -1,9 +1,11 @@
 import { SessionManager, getAgentDir, type ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { existsSync } from "node:fs";
-import { open, realpath, stat } from "node:fs/promises";
-import { dirname, resolve } from "node:path";
+import { execFile } from "node:child_process";
+import { randomUUID } from "node:crypto";
+import { constants, existsSync } from "node:fs";
+import { access, lstat, mkdir, open, readdir, realpath, stat, unlink } from "node:fs/promises";
+import { delimiter, dirname, join, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
-import { ProtocolError, isRecord, isCommandInvocationName, workbenchArgs, type AccountState, type AccountsView, type HostCommandName, type PiThemeView, type SettingKey, type SettingResult, type SettingValue, type SettingsView, type ThemeView, type ThemesView, type HostQueryAction, type HostQueryValues, type HostState, type ProjectItem, type ProjectInspectView, type ProjectsView, type ProjectTrustView, type WorkbenchAction, type WorkbenchValues, type WorkbenchCommand, type SessionCatalogItem } from "../protocol/index.js";
+import { ProtocolError, isRecord, isCommandInvocationName, workbenchArgs, type AccountState, type AccountsView, type HostCommandName, type PiThemeView, type CustomModel, type CustomProviderResult, type CustomProvidersView, type ExportPage, type SessionDeleteResult, type SessionExportResult, type SessionInspectView, type SettingKey, type SettingResult, type SettingValue, type SettingsView, type ThemeView, type ThemesView, type HostQueryAction, type HostQueryValues, type HostState, type ProjectItem, type ProjectInspectView, type ProjectsView, type ProjectTrustView, type WorkbenchAction, type WorkbenchValues, type WorkbenchCommand, type SessionCatalogItem, type SessionStatsView } from "../protocol/index.js";
 import { Bridge } from "./bridge.js";
 import type { Hub, HostHandler } from "./hub.js";
 import { LaunchProfile, type LaunchTarget } from "./launch-profile.js";
@@ -17,6 +19,7 @@ import { AuthController, type AuthRuntime } from "./auth-controller.js";
 import { ThemeCatalog, type Catalog } from "./theme-catalog.js";
 import { SettingsController, type SettingChoices, type SettingsScope } from "./settings-controller.js";
 import type { PaneTheme } from "./theme.js";
+import { ProviderConfig } from "./provider-config.js";
 export { childArgs } from "./child-args.js";
 export { LaunchProfile } from "./launch-profile.js";
 export { SessionFileLock } from "./session-lock.js";
@@ -62,14 +65,33 @@ interface HandoffDependencies {
   /** pi's agent directory: the project list, the trust store and global settings live under it. */
   agentDir?: string;
   /** pi's public auth runtime for the host-side login; tests script it. */
-  createAuthRuntime?: () => Promise<AuthRuntime>;
+  createAuthRuntime?: (custom?: boolean) => Promise<AuthRuntime>;
   accountLimitMs?: number;
   webOAuth?: ReadonlySet<string>;
   /** The `themes` directory shipped with this package. */
   bundledThemes?: string;
   /** How long a setting changed through pi's RPC may take to show in the global file. */
   settingConfirmMs?: number;
+  /** Moves a file to the system trash and says whether it did. Absent: the `trash` command, as pi's own session picker uses it. */
+  trash?: (path: string) => Promise<boolean>;
 }
+/** Largest export sent to a browser; a larger one stays on the host and only its path is reported. */
+const EXPORT_DOWNLOAD_BYTES = 32 * 1024 * 1024;
+const EXPORT_PAGE_BYTES = 384 * 1024;
+const EXPORTS_KEPT = 20;
+/** Whether a command of this name is on PATH. Nothing is run to find out. */
+async function onPath(name: string): Promise<boolean> {
+  for (const directory of (process.env.PATH ?? "").split(delimiter).filter(Boolean))
+    if (await access(join(directory, name), constants.X_OK).then(() => true, () => false)) return true;
+  return false;
+}
+/** pi's own way of deleting a session: the `trash` command with the path as an argument, never through a shell. */
+function systemTrash(path: string): Promise<boolean> {
+  return new Promise(done => {
+    execFile("trash", path.startsWith("-") ? ["--", path] : [path], { timeout: 10_000 }, error => done(!error || !existsSync(path)));
+  });
+}
+const within = (path: string, directory: string): boolean => path.startsWith(directory.endsWith(sep) ? directory : directory + sep);
 /** A planned replacement waits for slow shutdown handlers; an emergency stop (Ctrl+C) does not. */
 const PLANNED_STOP_MS = 20_000;
 const DIALOG_METHODS = ["select", "confirm", "input", "editor"];
@@ -78,12 +100,12 @@ async function samePath(a: string, b: string): Promise<boolean> { return await c
 const BUILTINS: WorkbenchCommand[] = [
   ["new", "新建会话", "new"], ["resume", "查找并恢复会话", "sessions"], ["fork", "从用户消息之前分叉", "tree"],
   ["model", "选择模型", "model"], ["thinking", "调整思考强度", "thinking"], ["compact", "压缩会话", "compact"],
-  ["settings", "打开设置", "settings"], ["session", "会话信息", "status"], ["name", "重命名会话", "rename"], ["clone", "克隆当前分支", "clone"],
+  ["settings", "打开设置", "settings"], ["session", "会话信息与用量", "status"], ["export", "导出会话为 HTML", "export"], ["copy", "复制最后一条回复", "copy"], ["name", "重命名会话", "rename"], ["clone", "克隆当前分支", "clone"],
 ].map(([name, description, action]) => ({ name: name!, description: description!, source: "builtin", available: true, browserAction: action as WorkbenchCommand["browserAction"] }));
 BUILTINS.push({ name: "tree", description: "切换历史分支", source: "builtin", available: false, reason: "需要 pi 上游提供 RPC tree 导航；当前只能从用户消息分叉。", browserAction: "tree" });
 for (const [name, description] of [["login", "登录模型服务商"], ["logout", "退出模型服务商"]])
   BUILTINS.push({ name: name!, description: description!, source: "builtin", available: true, browserAction: "accounts" });
-for (const name of ["web", "scoped-models", "export", "import", "share", "bug", "copy", "changelog", "hotkeys", "trust", "reload", "quit", "debug", "arminsayshi", "dementedelves"])
+for (const name of ["web", "scoped-models", "import", "share", "bug", "changelog", "hotkeys", "trust", "reload", "quit", "debug", "arminsayshi", "dementedelves"])
   BUILTINS.push({ name, description: "pi 内置终端命令", source: "builtin", available: false, terminalOnly: true, reason: "交接模式不支持此终端命令；Ctrl+C 后在终端执行。" });
 const BUILTIN_NAMES = new Set(BUILTINS.map(command => command.name));
 const SESSION_WRITES = new Set(["session_new", "session_switch", "session_fork", "session_clone"]);
@@ -110,6 +132,11 @@ export class HandoffHost implements HostHandler {
   private workspace?: WorkspaceService;
   private generation = 0;
   private paths = new Map<string, string>();
+  /** What the last listings said about each saved session, for the question asked before one is deleted. */
+  private listed = new Map<string, { cwd: string; name?: string; messageCount: number; modified: string }>();
+  private exports = new Map<string, { path: string; bytes: number; name: string }>();
+  private readonly providerConfig: ProviderConfig;
+  private builtinProviders?: Promise<Set<string>>;
   private directories: string[] = [];
   private dialogs = new Map<string, Dialog>();
   private dialogTimers = new Map<string, ReturnType<typeof setTimeout>>();
@@ -148,6 +175,7 @@ export class HandoffHost implements HostHandler {
   private end!: (value: HostEnd) => void;
   /** Settles once: the ready child exited on its own, the host failed closed, or the user stopped a failed replacement. */
   readonly finished = new Promise<HostEnd>(resolve => { this.end = resolve; });
+  private readonly agentDir: string;
   private readonly registry: ProjectRegistry;
   private readonly projects: ProjectService;
   private readonly accounts: AuthController;
@@ -166,7 +194,8 @@ export class HandoffHost implements HostHandler {
     const agentDir = dependencies.agentDir ?? getAgentDir();
     this.registry = new ProjectRegistry(agentDir);
     this.projects = new ProjectService({ agentDir, protectedDirectories: () => [agentDir, ...this.directories] });
-    this.accounts = new AuthController({ agentDir, publish: () => this.hub.publishAccountState(), changed: () => this.credentialsChanged(),
+    this.agentDir = agentDir; this.providerConfig = new ProviderConfig(agentDir);
+    this.accounts = new AuthController({ agentDir, publish: () => this.hub.publishAccountState(), changed: () => this.credentialsChanged(), customProviders: () => this.customProviderIds(),
       ...(dependencies.createAuthRuntime ? { createRuntime: dependencies.createAuthRuntime } : {}), ...(dependencies.accountLimitMs ? { limitMs: dependencies.accountLimitMs } : {}),
       ...(dependencies.webOAuth ? { webOAuth: dependencies.webOAuth } : {}) });
     this.piTheme = target.theme;
@@ -195,6 +224,9 @@ export class HandoffHost implements HostHandler {
     if (name === "account_cancel") return Promise.resolve().then(() => { this.accounts.cancel(String(args.operationId)); return {}; });
     if (name === "account_logout") return this.accounts.logout(String(args.provider)).then(() => ({ pendingApply: this.pendingApply }));
     if (name === "account_apply") return this.applyCredentials(true).then(() => ({ pendingApply: this.pendingApply }));
+    if (name === "provider_save" || name === "provider_remove") return this.changeProvider(name, args);
+    if (name === "session_delete") return this.deleteSession(String(args.sessionId));
+    if (name === "session_export") return this.exportSession();
     // A setting is checked against the value the page was showing, not against the host revision.
     if (name === "setting_set") return this.setSetting(args.key as SettingKey, args.value as SettingValue, args.expected as SettingValue);
     if (revision !== this.hostRevision) return Promise.reject(new ProtocolError("stale_host", "The host state changed; check the page before trying again."));
@@ -217,11 +249,191 @@ export class HandoffHost implements HostHandler {
     const counts = new Map<string, number>();
     for (const model of available) counts.set(model.provider, (counts.get(model.provider) ?? 0) + 1);
     for (const provider of providers) { provider.models = counts.get(provider.id) ?? 0; counts.delete(provider.id); }
-    // Providers the session has but pi's built-in list does not: registered by an extension or models.json.
+    // Providers pi's built-in list does not have: those of models.json, whose key is set like any other, and those an extension registers.
+    const [file, stored] = await Promise.all([this.providerConfig.read(), this.accounts.stored().catch(() => new Map<string, "api_key" | "oauth">())]);
+    const known = new Set(providers.map(provider => provider.id));
+    for (const custom of file.providers) {
+      if (known.has(custom.id)) continue;
+      const kind = stored.get(custom.id);
+      providers.push({ id: custom.id, name: custom.id, methods: [{ type: "api_key", label: "API key", web: true }], ...(kind ? { stored: kind } : {}), models: counts.get(custom.id) ?? 0, knownModels: custom.models.length, custom: true });
+      counts.delete(custom.id);
+    }
     for (const [id, models] of counts) providers.push({ id: clip(id, 128), name: clip(id, 128), methods: [{ type: "api_key", label: "", web: false, reason: "extension" }], models, knownModels: models });
     const rank = (provider: AccountsView["providers"][number]) => provider.stored ? 0 : provider.models ? 1 : 2;
     providers.sort((a, b) => rank(a) - rank(b) || a.name.localeCompare(b.name));
     return { providers, pendingApply: this.pendingApply, ...(this.applyError ? { applyError: this.applyError } : {}), ...(storeError ? { storeError } : {}) };
+  }
+  /** Names of pi's own providers. They do not change while pi runs. */
+  private builtinIds(): Promise<Set<string>> {
+    this.builtinProviders ??= this.accounts.providers().then(providers => new Set(providers.map(provider => provider.id)));
+    this.builtinProviders.catch(() => { this.builtinProviders = undefined; });
+    return this.builtinProviders;
+  }
+  /** Providers that exist only because models.json defines them. */
+  private async customProviderIds(): Promise<Set<string>> {
+    const [ids, builtin] = await Promise.all([this.providerConfig.ids(), this.builtinIds()]);
+    return new Set([...ids].filter(id => !builtin.has(id)));
+  }
+  private async sessionModels(): Promise<{ counts: Map<string, number>; current?: string }> {
+    const live = this.phase === "ready" && !!this.child?.running && !this.stopping;
+    const [models, state] = live ? await Promise.all([
+      this.child!.request<{ models: Array<{ provider: string }> }>("get_available_models").then(result => result.models, () => []),
+      this.child!.request<{ model?: { provider?: string } }>("get_state").catch(() => undefined)]) : [[], undefined];
+    const counts = new Map<string, number>();
+    for (const model of models) counts.set(model.provider, (counts.get(model.provider) ?? 0) + 1);
+    return { counts, ...(state?.model?.provider ? { current: state.model.provider } : {}) };
+  }
+  private async providersView(): Promise<CustomProvidersView> {
+    const [file, stored, builtin, session] = await Promise.all([this.providerConfig.read(), this.accounts.stored().catch(() => new Map<string, "api_key" | "oauth">()), this.builtinIds(), this.sessionModels()]);
+    return {
+      providers: file.providers.map(provider => ({ ...provider, key: stored.has(provider.id) ? "stored" as const : file.fileKeys.get(provider.id) ?? "none" as const,
+        overlay: builtin.has(provider.id), inUse: session.current === provider.id, available: session.counts.get(provider.id) ?? 0 })),
+      revision: file.revision, ...(file.error ? { error: file.error } : {}), pendingApply: this.pendingApply, ...(this.applyError ? { applyError: this.applyError } : {}),
+    };
+  }
+  /**
+   * Adds, changes or removes one provider of models.json. A new name must not be one pi already
+   * gives a meaning to: its own providers, and those the running session has from an extension.
+   * The running session reloads when it is idle, like after a credential change.
+   */
+  private changeProvider(name: "provider_save" | "provider_remove", args: Record<string, unknown>): Promise<CustomProviderResult> {
+    if (this.queuedWrites >= 32) return Promise.reject(new ProtocolError("busy", "Too many host commands are waiting; let them settle before retrying."));
+    this.queuedWrites++;
+    const result = this.writes.then(async (): Promise<CustomProviderResult> => {
+      if (this.control) await this.control;
+      if (this.stopping) throw new ProtocolError("host_stopped", "The service is stopping.");
+      const id = String(args.id).trim(), revision = String(args.revision);
+      const [builtin, fileIds, session] = await Promise.all([this.builtinIds(), this.providerConfig.ids(), this.sessionModels()]);
+      let outcome: CustomProviderResult;
+      if (name === "provider_save") {
+        const reserved = new Set(builtin);
+        if (args.create === true) for (const provider of session.counts.keys()) if (!fileIds.has(provider)) reserved.add(provider);
+        const saved = await this.providerConfig.save({ id, api: String(args.api), baseUrl: String(args.baseUrl), models: args.models as CustomModel[] }, revision, args.create === true, reserved);
+        outcome = { id: saved.id, revision: saved.revision, ...(saved.insecure ? { insecure: true } : {}) };
+      } else {
+        if (this.accounts.busy) throw new ProtocolError("account_busy", "An account operation is in progress. Finish or cancel it first.");
+        const removed = await this.providerConfig.remove(id, revision, builtin);
+        // The key pi stored for it would otherwise stay in the auth file with no provider to show it under.
+        const credentialRemoved = await this.accounts.logout(id).then(() => true, () => false);
+        outcome = { id, revision: removed.revision, ...(credentialRemoved ? { credentialRemoved } : {}) };
+      }
+      if (this.phase === "ready" && this.child?.running) { this.pendingApply = true; this.applyError = undefined; }
+      return outcome;
+    }).finally(() => { this.queuedWrites--; this.touch(); });
+    this.writes = result.catch(() => undefined);
+    void result.then(() => void this.applyCredentials(false).catch(() => undefined), () => undefined);
+    return result;
+  }
+  /** Directories saved sessions may live in: pi's own session directory and every one this host has used. */
+  private sessionRoots(): Promise<string[]> {
+    return Promise.all([join(this.agentDir, "sessions"), ...(process.env.PI_CODING_AGENT_SESSION_DIR ? [process.env.PI_CODING_AGENT_SESSION_DIR] : []), ...this.directories].map(canonical));
+  }
+  /**
+   * The file a listed session ID stands for, checked again at the moment of use: a regular `.jsonl`
+   * inside a session directory, whose header still carries that ID.
+   */
+  private async listedSession(sessionId: string): Promise<{ path: string; cwd: string }> {
+    const listedPath = this.paths.get(sessionId);
+    if (!listedPath) throw new ProtocolError("unknown_session", "Session was not exposed by the catalog.");
+    const info = await lstat(listedPath).catch(() => undefined);
+    if (!info) throw new ProtocolError("session_missing", "This session file no longer exists.");
+    const path = await canonical(listedPath), roots = await this.sessionRoots();
+    if (!info.isFile() || !path.endsWith(".jsonl") || !roots.some(root => within(path, root))) throw new ProtocolError("session_refused", "This is not a session file inside a session directory.");
+    let header: unknown;
+    const file = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW);
+    try { const bytes = Buffer.alloc(64 * 1024); const read = await file.read(bytes, 0, bytes.length, 0); header = JSON.parse(bytes.subarray(0, read.bytesRead).toString("utf8").split("\n", 1)[0]!); }
+    catch { header = undefined; } finally { await file.close(); }
+    if (!isRecord(header) || header.type !== "session" || header.id !== sessionId) throw new ProtocolError("session_refused", "The file no longer holds the session that was listed.");
+    return { path, cwd: typeof header.cwd === "string" ? header.cwd : "" };
+  }
+  private async isCurrentSession(sessionId: string, path: string): Promise<boolean> {
+    const held = [this.lastSessionFile, this.recovery?.target.sessionFile, this.recovery?.previous.sessionFile].filter((file): file is string => !!file);
+    return sessionId === this.mirror?.sessionId || (await Promise.all(held.map(file => samePath(file, path)))).some(Boolean);
+  }
+  private async inspectSession(sessionId: string): Promise<SessionInspectView> {
+    const { path, cwd } = await this.listedSession(sessionId);
+    const listed = this.listed.get(sessionId);
+    const [current, owner, trash] = await Promise.all([this.isCurrentSession(sessionId, path), SessionFileLock.inspect(path).catch(() => undefined), this.dependencies.trash ? true : onPath("trash")]);
+    return { id: sessionId, ...(listed?.name ? { name: listed.name } : {}), cwd: clip(listed?.cwd ?? cwd, 4096), path, messageCount: listed?.messageCount ?? 0, modified: listed?.modified ?? "", current, locked: !!owner && !current, trash };
+  }
+  /**
+   * Deletes one saved session the user picked from a listing. Never the current one, never one another
+   * `/web` service holds. The host takes the session's lock for the deletion, so no service can open it
+   * meanwhile; a terminal pi that has it open cannot be detected, which the page says before asking.
+   * Like pi's own session picker: the system trash when there is one, otherwise permanent removal.
+   */
+  private deleteSession(sessionId: string): Promise<SessionDeleteResult> {
+    if (this.queuedWrites >= 32) return Promise.reject(new ProtocolError("busy", "Too many host commands are waiting; let them settle before retrying."));
+    this.queuedWrites++;
+    const result = this.writes.then(async (): Promise<SessionDeleteResult> => {
+      if (this.control) await this.control;
+      if (this.stopping) throw new ProtocolError("host_stopped", "The service is stopping.");
+      const { path } = await this.listedSession(sessionId);
+      if (await this.isCurrentSession(sessionId, path)) throw new ProtocolError("session_current", "The session that is open cannot be deleted. Switch to another one first.");
+      const lock = await this.hold(path); // refuses a session another /web service owns
+      let method: SessionDeleteResult["method"];
+      try {
+        const trashed = await (this.dependencies.trash ?? systemTrash)(path).catch(() => false);
+        if (trashed && !existsSync(path)) method = "trash";
+        else {
+          try { await unlink(path); } catch (error) { throw new ProtocolError("delete_failed", `The session file could not be deleted: ${clip(error instanceof Error ? error.message : String(error), 200)}`); }
+          method = "deleted";
+        }
+      } finally { await this.drop(lock).catch(() => undefined); }
+      this.paths.delete(sessionId); this.listed.delete(sessionId);
+      // A project that remembered this file as its last session must not offer to resume it.
+      await this.registry.forgetSession(path).catch(() => undefined);
+      this.log(`Session ${sessionId} ${method === "trash" ? "moved to the trash" : "deleted"}: ${path}`);
+      return { id: sessionId, method };
+    }).finally(() => { this.queuedWrites--; });
+    this.writes = result.catch(() => undefined);
+    return result;
+  }
+  /**
+   * Has pi write an HTML copy of the current session into pi-pane's export directory. The browser
+   * never chooses the path: without one pi would write into the project directory.
+   */
+  private exportSession(): Promise<SessionExportResult> {
+    if (this.queuedWrites >= 32) return Promise.reject(new ProtocolError("busy", "Too many host commands are waiting; let them settle before retrying."));
+    this.queuedWrites++;
+    const result = this.writes.then(async (): Promise<SessionExportResult> => {
+      if (this.control) await this.control;
+      this.assertLive();
+      if (this.sessionChangePending) throw new ProtocolError("busy", "A session change is in progress; export after it.");
+      if (!existsSync(this.lastSessionFile)) throw new ProtocolError("session_unsaved", "This session has nothing saved yet. Send a message first.");
+      const directory = join(this.agentDir, "pi-pane", "exports");
+      await mkdir(directory, { recursive: true, mode: 0o700 });
+      const stamp = new Date().toISOString().replace(/[-:]/g, "").replace(/\..*$/, "").replace("T", "-");
+      const name = `session-${this.mirror!.sessionId.replace(/[^A-Za-z0-9]/g, "").slice(0, 8) || "export"}-${stamp}-${randomUUID().slice(0, 4)}.html`;
+      const target = join(await canonical(directory), name);
+      const reply = await this.child!.request<{ path?: string }>("export_html", { outputPath: target }, 60_000);
+      if (!reply.path || !(await samePath(reply.path, target))) throw new ProtocolError("export_failed", "pi did not write the export where it was asked to.");
+      const info = await stat(target);
+      const exportId = randomUUID();
+      this.exports.set(exportId, { path: target, bytes: info.size, name });
+      while (this.exports.size > 8) this.exports.delete(this.exports.keys().next().value!);
+      // Exports hold whole conversations: only the most recent ones are kept.
+      const old = (await readdir(directory).catch(() => [])).filter(file => /^session-.*\.html$/.test(file)).sort().slice(0, -EXPORTS_KEPT);
+      for (const file of old) await unlink(join(directory, file)).catch(() => undefined);
+      return { exportId, path: target, name, bytes: info.size, downloadable: info.size <= EXPORT_DOWNLOAD_BYTES };
+    }).finally(() => { this.queuedWrites--; });
+    this.writes = result.catch(() => undefined);
+    return result;
+  }
+  /** One part of an export this host made, for the browser to save. Only files this host wrote, by the ID it gave. */
+  private async exportPage(exportId: string, offset: number): Promise<ExportPage> {
+    const item = this.exports.get(exportId);
+    if (!item) throw new ProtocolError("export_missing", "This export is no longer available for download; export again.");
+    if (item.bytes > EXPORT_DOWNLOAD_BYTES) throw new ProtocolError("export_too_large", "This export is too large to download here; it is on the computer running pi.");
+    const file = await open(item.path, constants.O_RDONLY | constants.O_NOFOLLOW).catch(() => undefined);
+    if (!file) throw new ProtocolError("export_missing", "The exported file is gone; export again.");
+    try {
+      if ((await file.stat()).size !== item.bytes || offset > item.bytes) throw new ProtocolError("export_missing", "The exported file changed; export again.");
+      const bytes = Buffer.alloc(Math.min(EXPORT_PAGE_BYTES, item.bytes - offset));
+      const read = await file.read(bytes, 0, bytes.length, offset);
+      const next = offset + read.bytesRead;
+      return { exportId, offset, data: bytes.subarray(0, read.bytesRead).toString("base64"), total: item.bytes, ...(next < item.bytes ? { next } : {}) };
+    } finally { await file.close(); }
   }
   /** Saving or removing a credential does not reach a running session by itself. Apply at once when nothing is in progress. */
   private credentialsChanged(): void {
@@ -378,6 +590,9 @@ export class HandoffHost implements HostHandler {
     else if (action === "themes") value = await this.themesView();
     else if (action === "theme") value = await this.themeView(String(args.name));
     else if (action === "settings") value = await this.settingsView();
+    else if (action === "providers") value = await this.providersView();
+    else if (action === "session_inspect") value = await this.inspectSession(String(args.sessionId));
+    else if (action === "export_page") value = await this.exportPage(String(args.exportId), Number(args.offset));
     else if (action === "directories") value = await this.projects.directories(typeof args.path === "string" ? args.path : this.runtimeCwd);
     else if (action === "project_inspect") value = await this.inspectProject(await this.projects.root(String(args.path)));
     else value = await this.projectsView();
@@ -691,8 +906,12 @@ export class HandoffHost implements HostHandler {
       const query = typeof args.query === "string" ? args.query.trim().toLocaleLowerCase() : "";
       const filtered = found.filter(session => !query || [session.name, session.cwd, session.firstMessage, session.allMessagesText].some(text => text?.toLocaleLowerCase().includes(query)))
         .sort((a, b) => b.modified.getTime() - a.modified.getTime());
-      const retained = filtered.slice(0, 200); for (const session of retained) this.paths.set(session.id, session.path);
-      while (this.paths.size > 1000) this.paths.delete(this.paths.keys().next().value!);
+      const retained = filtered.slice(0, 200);
+      for (const session of retained) {
+        this.paths.set(session.id, session.path);
+        this.listed.set(session.id, { cwd: session.cwd, ...(session.name ? { name: clip(session.name, 256) } : {}), messageCount: session.messageCount, modified: session.modified.toISOString() });
+      }
+      while (this.paths.size > 1000) { const oldest = this.paths.keys().next().value!; this.paths.delete(oldest); this.listed.delete(oldest); }
       const sessions: SessionCatalogItem[] = retained.map(session => ({ id: session.id, cwd: session.cwd, ...(session.name ? { name: clip(session.name, 256) } : {}),
         created: session.created.toISOString(), modified: session.modified.toISOString(), messageCount: session.messageCount, firstMessage: clip(session.firstMessage, 256), current: session.id === this.mirror!.sessionId }));
       let truncated = filtered.length > retained.length;
@@ -709,7 +928,7 @@ export class HandoffHost implements HostHandler {
         capabilities: [{ name: "session", available: true, detail: "RPC 新建、恢复、用户消息分叉、克隆与重命名。" }, { name: "workspace", available: true, detail: "文件和 Git 查询跟随当前会话 cwd。" },
           { name: "dialogs", available: true, detail: "RPC 扩展对话框在网页处理。" }, { name: "tools", available: false, detail: "需要 pi 上游提供 RPC 工具列表与启停。" },
           { name: "tree-navigation", available: false, detail: "需要 pi 上游提供 RPC tree 导航；可读取历史并从用户消息分叉。" },
-          { name: "authentication", available: true, detail: "在“账户”里登录或退出 pi 内置的模型服务商；需要本机回调的登录方式仍在终端完成。" }, { name: "settings", available: true, detail: "在“设置”里选择网页外观、保存 pi 的默认主题与默认模型、调整会话行为；其余设置只读并说明原因。" },
+          { name: "authentication", available: true, detail: "在“设置”的“账户”里用 API key 登录或退出，在“自定义供应商”里接入兼容接口的服务；订阅登录仍在终端完成。" }, { name: "settings", available: true, detail: "在“设置”里选择网页外观、保存 pi 的默认主题与默认模型、调整会话行为；其余设置只读并说明原因。" },
           { name: "resource-management", available: false, detail: "安装和配置扩展仍在终端完成。" }] };
     } else if (action === "tree") {
       await this.mirror!.synchronize(); const entries = this.mirror!.getEntries().filter(entry => !isRecord(entry.message) || entry.message.role !== "system" || visibleText(entry.message.content).trim()); const retained = entries.slice(-2000);
@@ -720,6 +939,28 @@ export class HandoffHost implements HostHandler {
     } else if (action === "files") value = await this.workspace!.files(args.query as string | undefined);
     else if (action === "file") value = await this.workspace!.file(args.path as string);
     else if (action === "git_status") value = await this.workspace!.gitStatus();
+    else if (action === "session_stats") {
+      const stats = await this.child!.request<{ sessionId: string; sessionFile?: string; userMessages: number; assistantMessages: number; toolCalls: number; toolResults: number; totalMessages: number;
+        tokens: SessionStatsView["tokens"]; cost: number; contextUsage?: { tokens: number | null; contextWindow: number; percent: number | null } }>("get_session_stats");
+      const count = (number: unknown): number => typeof number === "number" && Number.isFinite(number) ? number : 0;
+      value = { sessionId: this.mirror!.sessionId, ...(stats.sessionFile ? { sessionFile: clip(stats.sessionFile, 4096) } : {}), ...(this.mirror!.sessionName ? { name: clip(this.mirror!.sessionName, 256) } : {}), cwd: this.cwd,
+        userMessages: count(stats.userMessages), assistantMessages: count(stats.assistantMessages), toolCalls: count(stats.toolCalls), toolResults: count(stats.toolResults), totalMessages: count(stats.totalMessages),
+        tokens: { input: count(stats.tokens?.input), output: count(stats.tokens?.output), cacheRead: count(stats.tokens?.cacheRead), cacheWrite: count(stats.tokens?.cacheWrite), total: count(stats.tokens?.total) }, cost: count(stats.cost),
+        ...(stats.contextUsage && count(stats.contextUsage.contextWindow) > 0 ? { context: { tokens: typeof stats.contextUsage.tokens === "number" ? stats.contextUsage.tokens : null, window: stats.contextUsage.contextWindow,
+          percent: typeof stats.contextUsage.percent === "number" ? stats.contextUsage.percent : null } } : {}) };
+    } else if (action === "assistant_text") {
+      let text: string;
+      if (typeof args.entryId !== "string") text = (await this.child!.request<{ text?: string }>("get_last_assistant_text")).text ?? "";
+      else {
+        await this.mirror!.synchronize();
+        const message = this.mirror!.getEntries().find(entry => entry.id === args.entryId)?.message;
+        if (!isRecord(message) || message.role !== "assistant") throw new ProtocolError("unknown_message", "This is not an assistant reply of the current session.");
+        // The same text pi's /copy gives: the reply's text blocks, without thinking or tool calls.
+        text = (Array.isArray(message.content) ? message.content.filter(isRecord).map(block => block.type === "text" && typeof block.text === "string" ? block.text : "").join("") : typeof message.content === "string" ? message.content : "").trim();
+      }
+      const limit = 4 * 1024 * 1024;
+      value = { text: text.length > limit ? text.slice(0, limit) : text, truncated: text.length > limit };
+    }
     else value = await this.workspace!.gitDiff(args.path as string);
     if (this.sessionChangePending || generation !== this.generation || revision !== undefined && revision !== this.bridge!.branchRevision) throw new ProtocolError("stale_session", "The session changed during this read.");
     return value as WorkbenchValues[A];

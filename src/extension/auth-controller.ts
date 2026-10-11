@@ -19,7 +19,10 @@ export interface AuthControllerOptions {
   publish: () => void;
   /** pi's auth file changed. The running session has not seen it yet. */
   changed: (providerId: string, change: "login" | "logout") => void;
-  createRuntime?: () => Promise<AuthRuntime>;
+  /** `custom`: a runtime that also knows the providers of pi's `models.json`. */
+  createRuntime?: (custom?: boolean) => Promise<AuthRuntime>;
+  /** Names of the providers defined only in `models.json`. Their key is set through pi's login like any other. */
+  customProviders?: () => Promise<ReadonlySet<string>>;
   /** Absolute lifetime of one operation, whatever the provider's own expiry. */
   limitMs?: number;
   /** Providers whose OAuth login is offered from the browser. None by default: see `DEVICE_CODE_OAUTH`. */
@@ -64,8 +67,13 @@ export class AuthController {
    * what keeps this read-only: an availability refresh would resolve stored keys, and a stored key may
    * be a command.
    */
-  private runtime(): Promise<AuthRuntime> {
-    return this.options.createRuntime?.() ?? (ModelRuntime.create({ authPath: join(this.options.agentDir, "auth.json"), modelsPath: null, allowModelNetwork: false, refreshOnCreate: false }) as unknown as Promise<AuthRuntime>);
+  private runtime(custom = false): Promise<AuthRuntime> {
+    return this.options.createRuntime?.(custom) ?? (ModelRuntime.create({ authPath: join(this.options.agentDir, "auth.json"), modelsPath: custom ? join(this.options.agentDir, "models.json") : null,
+      allowModelNetwork: false, refreshOnCreate: false }) as unknown as Promise<AuthRuntime>);
+  }
+  /** What pi's auth file stores, by provider, whether or not pi knows the provider. No secret is read. */
+  async stored(): Promise<Map<string, "api_key" | "oauth">> {
+    return new Map((await (await this.runtime(true)).listCredentials()).map(item => [item.providerId, item.type]));
   }
   /** Built-in providers with their login methods and the kind of credential stored for each. No secret is read. */
   async providers(): Promise<AccountProvider[]> {
@@ -95,10 +103,13 @@ export class AuthController {
   async begin(leaseId: string, providerId: string, method: "api_key" | "oauth"): Promise<{ operationId: string }> {
     if (this.disposed) throw new ProtocolError("host_stopped", "The service is stopping.");
     if (this.busy) throw new ProtocolError("account_busy", "Another account operation is in progress. Finish or cancel it first.");
-    const runtime = await this.runtime();
-    const provider = runtime.getProviders().find(item => item.id === providerId);
+    let runtime = await this.runtime();
+    let provider = runtime.getProviders().find(item => item.id === providerId);
+    // A provider of models.json is not one of pi's own: only the runtime that reads that file can store its key.
+    const custom = !provider && method === "api_key" && !!(await this.options.customProviders?.())?.has(providerId);
+    if (custom) { runtime = await this.runtime(true); provider = runtime.getProviders().find(item => item.id === providerId); }
     if (!provider) throw new ProtocolError("unknown_provider", "This provider is not one of pi's built-in providers. Providers added by extensions sign in from the terminal.");
-    const supported = method === "api_key" ? !!provider.auth?.apiKey?.login : !!provider.auth?.oauth && this.webOAuth(providerId);
+    const supported = method === "api_key" ? custom || !!provider.auth?.apiKey?.login : !!provider.auth?.oauth && this.webOAuth(providerId);
     if (!supported) throw new ProtocolError("unsupported_method", "This login method is not available from the browser. Use /login in a terminal.");
     if (this.busy) throw new ProtocolError("account_busy", "Another account operation is in progress. Finish or cancel it first.");
     const limit = this.options.limitMs ?? LIMIT_MS;
@@ -208,7 +219,7 @@ export class AuthController {
   /** Removes the stored credential only. It does not revoke anything at the provider, nor an environment variable or start argument. */
   async logout(providerId: string): Promise<void> {
     if (this.busy) throw new ProtocolError("account_busy", "Another account operation is in progress. Finish or cancel it first.");
-    const runtime = await this.runtime();
+    const runtime = await this.runtime(true);
     if (!(await runtime.listCredentials()).some(item => item.providerId === providerId)) throw new ProtocolError("not_stored", "pi has no stored credential for this provider. One provided by the environment or a start argument cannot be removed here.");
     try { await runtime.logout(providerId); }
     catch (error) { if (!(error instanceof CredentialSynchronizationError)) throw error; }

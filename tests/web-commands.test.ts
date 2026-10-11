@@ -4,11 +4,11 @@ import { builtinCommand, resolveSlash } from "../src/web/commands.js";
 import type { WorkbenchCommand } from "../src/protocol/workbench.js";
 
 test("pi interactive builtin input cannot reach the model even without a command catalog", () => {
-  for (const name of ["new", "resume", "model", "thinking", "fork", "compact", "name", "clone", "settings", "session"]) {
+  for (const name of ["new", "resume", "model", "thinking", "fork", "compact", "name", "clone", "settings", "session", "export", "copy"]) {
     assert.equal(resolveSlash(`/${name}`, [])?.command?.source, "builtin");
     assert.equal(resolveSlash(`/${name}`, [])?.command?.available, true);
   }
-  for (const name of ["tree", "login", "logout", "reload", "quit", "debug", "export", "import", "web", "arminsayshi", "dementedelves"]) {
+  for (const name of ["tree", "login", "logout", "reload", "quit", "debug", "import", "web", "arminsayshi", "dementedelves"]) {
     const resolved = resolveSlash(`/${name} extra`, []);
     assert.equal(resolved?.command?.available, false);
     assert.ok(resolved?.command?.reason);

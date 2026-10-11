@@ -1,5 +1,5 @@
 /** Host-level reads: about the machine's projects, not about the session that happens to be running. */
-export const HOST_QUERIES = ["projects", "directories", "project_inspect", "accounts", "themes", "theme", "settings"] as const;
+export const HOST_QUERIES = ["projects", "directories", "project_inspect", "accounts", "themes", "theme", "settings", "providers", "session_inspect", "export_page"] as const;
 export type HostQueryAction = (typeof HOST_QUERIES)[number];
 export interface HostQuery { t: "host_query"; reqId: string; action: HostQueryAction; args: Record<string, unknown> }
 export interface HostResult {
@@ -63,6 +63,8 @@ export interface AccountProvider {
   id: string; name: string; methods: AccountMethod[];
   stored?: "api_key" | "oauth";
   models: number; knownModels: number;
+  /** Defined in pi's `models.json` and managed under custom providers. */
+  custom?: boolean;
 }
 export interface AccountsView {
   providers: AccountProvider[];
@@ -188,7 +190,59 @@ export interface SettingsView {
  *   still decides; `pending` it waits for a reload; `later` it only concerns runtimes started afterwards.
  */
 export interface SettingResult { key: SettingKey; saved: "confirmed" | "unconfirmed"; applied: "now" | "overridden" | "pending" | "later"; item: SettingItem }
+/** API protocols a custom provider can be created with from the browser. An existing entry may use another one. */
+export const CUSTOM_PROVIDER_APIS = ["openai-completions", "openai-responses", "anthropic-messages", "google-generative-ai"] as const;
+export interface CustomModel { id: string; name?: string; contextWindow?: number }
+/**
+ * One provider of pi's `models.json`, as the form sees it.
+ * - `key`: where its API key comes from. `stored` is pi's auth file, the only place the browser writes
+ *   a key. The `file_*` kinds are an `apiKey` already in `models.json`: a literal, an environment
+ *   reference or a command. They are reported by kind only, never shown, resolved or run.
+ * - `extra`: fields of the entry the form does not edit. They are kept as they are on every save.
+ * - `overlay`: the name is also one of pi's own providers, so this entry changes that provider
+ *   instead of adding one. Such an entry is shown and cannot be edited here.
+ * - `available`: how many of its models the running session offers. Zero until a key is known and applied.
+ */
+export interface CustomProvider {
+  id: string; api: string; baseUrl: string; models: CustomModel[];
+  key: "none" | "stored" | "file_literal" | "file_env" | "file_command";
+  extra: string[]; modelExtras: number;
+  overlay: boolean; inUse: boolean; available: number;
+  /** The address is plain http to a machine other than this one: requests and the key travel unencrypted. */
+  insecure: boolean;
+}
+export interface CustomProvidersView {
+  providers: CustomProvider[];
+  /** Identifies the file content this view was read from. A save names it; a different file means someone else changed it. */
+  revision: string;
+  /** `models.json` could not be parsed. Nothing can be saved until it is repaired; it is never overwritten. */
+  error?: string;
+  pendingApply: boolean; applyError?: string;
+}
+/**
+ * What `provider_save` and `provider_remove` report: the file was changed. Whether the running session
+ * has it yet is `pendingApply` of the view. `credentialRemoved`: the key pi had stored for it was removed too.
+ */
+export interface CustomProviderResult { id: string; revision: string; insecure?: boolean; credentialRemoved?: boolean }
+/** A saved session, for the question asked before it is deleted. */
+export interface SessionInspectView {
+  id: string; name?: string; cwd: string; path: string; messageCount: number; modified: string;
+  current: boolean;
+  /** Another `/web` service on this machine holds it. A terminal pi that has it open cannot be detected. */
+  locked: boolean;
+  /** Whether deleting moves the file to the system trash; otherwise it is removed permanently. */
+  trash: boolean;
+}
+export interface SessionDeleteResult { id: string; method: "trash" | "deleted" }
+/**
+ * An exported HTML copy of the current session, written by pi itself into pi-pane's export directory.
+ * `downloadable` is false when the file is too large to be sent to the browser; it is still at `path`.
+ */
+export interface SessionExportResult { exportId: string; path: string; name: string; bytes: number; downloadable: boolean }
+/** One part of an exported file, base64. `next` is the offset to ask for, absent after the last part. */
+export interface ExportPage { exportId: string; offset: number; data: string; total: number; next?: number }
 export interface HostQueryValues {
+  providers: CustomProvidersView; session_inspect: SessionInspectView; export_page: ExportPage;
   projects: ProjectsView; directories: DirectoriesView; project_inspect: ProjectInspectView; accounts: AccountsView;
   themes: ThemesView; theme: ThemeView; settings: SettingsView;
 }

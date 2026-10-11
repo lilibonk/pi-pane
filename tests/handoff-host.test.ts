@@ -1,14 +1,16 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtemp, mkdir, rm, writeFile, appendFile, symlink, realpath, readFile } from "node:fs/promises";
+import { existsSync, readFileSync } from "node:fs";
+import { mkdtemp, mkdir, rm, writeFile, appendFile, symlink, realpath, readFile, rename, readdir } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, dirname, basename } from "node:path";
 import { SessionManager, SettingsManager, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { HandoffHost } from "../src/extension/handoff.js";
 import { SessionFileLock } from "../src/extension/session-lock.js";
+import { ProjectRegistry } from "../src/extension/project-registry.js";
 import type { Hub } from "../src/extension/hub.js";
 import type { Bridge } from "../src/extension/bridge.js";
-import type { HostState } from "../src/protocol/index.js";
+import type { ExportPage, HostState } from "../src/protocol/index.js";
 import type { AuthInteraction } from "@earendil-works/pi-ai";
 import type { AuthRuntime } from "../src/extension/auth-controller.js";
 import { RpcReadTimeoutError, type RpcConnection, type RpcRecord } from "../src/extension/rpc-child.js";
@@ -25,6 +27,8 @@ class FakeChild implements RpcConnection {
   /** Like pi: queue modes live in the session, and the RPC setters also save the global default. */
   modes = { steeringMode: "one-at-a-time", followUpMode: "one-at-a-time", autoCompactionEnabled: true };
   saveSettings = true;
+  context: { tokens: number | null; contextWindow: number; percent: number | null } | undefined = { tokens: 1200, contextWindow: 16000, percent: 7.5 };
+  lastText: string | undefined = "first answer"; exportBody = "<html>exported</html>"; exportTo?: string;
   streaming = false; pending = 0; compacting = false;
   reportedPath?: string; emptyFork = false;
   disposition = "started"; cancelNext = false;
@@ -81,6 +85,10 @@ class FakeChild implements RpcConnection {
     else if (type === "set_thinking_level") { this.level = String(payload.level); value = undefined; }
     else if (type === "set_session_name") { this.manager.appendSessionInfo(String(payload.name)); value = undefined; }
     else if (type === "compact") value = { tokensBefore: 5 };
+    else if (type === "get_session_stats") value = { sessionFile: this.manager.getSessionFile(), sessionId: this.manager.getSessionId(), userMessages: 2, assistantMessages: 1, toolCalls: 0, toolResults: 0, totalMessages: 3,
+      tokens: { input: 10, output: 20, cacheRead: 0, cacheWrite: 0, total: 30 }, cost: 0.0125, ...(this.context ? { contextUsage: this.context } : {}) };
+    else if (type === "get_last_assistant_text") value = { text: this.lastText };
+    else if (type === "export_html") { const target = this.exportTo ?? String(payload.outputPath); await writeFile(target, this.exportBody); value = { path: target }; }
     else if (["set_steering_mode", "set_follow_up_mode", "set_auto_compaction", "set_auto_retry"].includes(type)) {
       const settings = SettingsManager.create(this.manager.getCwd(), join(this.root, "agent"), { projectTrusted: false });
       if (type === "set_steering_mode") { this.modes.steeringMode = String(payload.mode); if (this.saveSettings) settings.setSteeringMode(payload.mode as never); }
@@ -99,6 +107,14 @@ class FakeAuth implements AuthRuntime {
   script: (provider: string, type: "api_key" | "oauth", interaction: AuthInteraction) => Promise<{ type: "api_key" | "oauth"; key?: string }> =
     async (_provider, type, interaction) => ({ type, key: await interaction.prompt({ type: "secret", message: "Enter API key" }) });
   logins = 0;
+  /** Like pi's runtime with a models.json path: it also knows the providers of that file. */
+  customFile?: string;
+  withCustom(): AuthRuntime {
+    const base = this, file = this.customFile;
+    const custom = () => { try { return Object.keys(JSON.parse(readFileSync(file!, "utf8")).providers ?? {}); } catch { return []; } };
+    return { getProviders: () => [...base.getProviders(), ...custom().filter(id => !base.getProviders().some(provider => provider.id === id)).map(id => ({ id, name: id, auth: { apiKey: { name: "API key" } } }))],
+      getModels: id => base.getModels(id), listCredentials: () => base.listCredentials(), login: (provider, type, interaction) => base.login(provider, type, interaction), logout: provider => base.logout(provider) };
+  }
   getProviders() { return [{ id: "acme", name: "Acme AI", auth: { apiKey: { name: "Acme API key", login: true }, oauth: { name: "Acme subscription" } } },
     { id: "kimi-coding", name: "Kimi For Coding", auth: { apiKey: { name: "Kimi API key", login: true }, oauth: { name: "Kimi Code (subscription)" } } },
     { id: "cloud", name: "Cloud Ambient", auth: { apiKey: { name: "Cloud credentials" } } }]; }
@@ -116,6 +132,8 @@ interface Fixture {
   auth: FakeAuth;
   /** Adjusts a replacement child before the host starts it. */
   prepare?: (child: FakeChild, cwd: string) => void;
+  /** Stand-in for the system trash: moves the file aside and records it, or declines. */
+  trash: (path: string) => Promise<boolean>; trashed: string[]; trashWorks: boolean;
 }
 async function withHost(run: (host: HandoffHost, child: FakeChild, fixture: Fixture) => Promise<void>, beforeStart?: (child: FakeChild) => void, argv: string[] = []) {
   const root = await mkdtemp(join(tmpdir(), "pi-pane-host-")); const cwd = join(root, "project"); const other = join(root, "other"); const custom = join(root, "custom");
@@ -128,7 +146,9 @@ async function withHost(run: (host: HandoffHost, child: FakeChild, fixture: Fixt
   const child = new FakeChild(manager, root); const bridges: Bridge[] = []; const notices: unknown[] = [];
   child.credentials = () => [...fixture.auth.stored.keys()];
   beforeStart?.(child);
-  const fixture: Fixture = { root, foreign, bridges, notices, launches: [], suspended: [], logs: [], hostStates: [], accountStates: 0, auth: new FakeAuth() };
+  const fixture: Fixture = { root, foreign, bridges, notices, launches: [], suspended: [], logs: [], hostStates: [], accountStates: 0, auth: new FakeAuth(), trashed: [], trashWorks: true,
+    trash: async path => { if (!fixture.trashWorks) return false; await rename(path, `${path}.trashed`); fixture.trashed.push(path); return true; } };
+  fixture.auth.customFile = join(root, "agent", "models.json");
   const hub = { setHostHandler() {}, bindBridge(bridge: Bridge) { bridges.push(bridge); }, notifyAll(record: unknown) { notices.push(record); }, suspendBridge(reason: string) { fixture.suspended.push(reason); }, publishHostState() { fixture.hostStates.push(host.hostState()); }, publishAccountState() { fixture.accountStates++; } } as unknown as Hub;
   const theme = { appearance: "dark", colors: {} } as unknown as ExtensionContext["ui"]["theme"];
   // Like pi: `--session` opens that transcript; without it the child creates a session in its directory.
@@ -142,7 +162,7 @@ async function withHost(run: (host: HandoffHost, child: FakeChild, fixture: Fixt
     }
     fixture.launches.push({ args, cwd: directory, child: next }); return next;
   };
-  const host = new HandoffHost(hub, { sessionFile: manager.getSessionFile()!, sessionDir: custom, cwd, argv, theme, themes: [] }, line => { fixture.logs.push(line); }, { createChild, plannedStopMs: 50, agentDir: join(root, "agent"), createAuthRuntime: async () => fixture.auth, accountLimitMs: 400, webOAuth: new Set(["kimi-coding"]),
+  const host = new HandoffHost(hub, { sessionFile: manager.getSessionFile()!, sessionDir: custom, cwd, argv, theme, themes: [] }, line => { fixture.logs.push(line); }, { createChild, plannedStopMs: 50, agentDir: join(root, "agent"), createAuthRuntime: async custom => custom ? fixture.auth.withCustom() : fixture.auth, accountLimitMs: 400, trash: path => fixture.trash(path), webOAuth: new Set(["kimi-coding"]),
     listAll: ((directory?: string) => child.catalogOverride ? Promise.resolve(child.catalogOverride) : directory ? SessionManager.listAll(directory) : Promise.resolve([])) as typeof SessionManager.listAll });
   try { await host.start(); await run(host, child, fixture); }
   finally { await host.stop(); await rm(root, { recursive: true, force: true }); }
@@ -786,3 +806,151 @@ test("start arguments are shown as overrides of the defaults, and /settings open
   await assert.rejects(host.command("prompt", { text: "/settings" }), { code: "picker_required" }); assert(!child.calls.some(call => call.type === "prompt"));
   assert.equal((await host.read("resources")).capabilities.find(capability => capability.name === "settings")?.available, true);
 }, undefined, ["--provider", "acme", "--model", "fast", "--thinking", "high", "--use-theme", "light"]));
+const modelsFile = (root: string) => join(root, "agent", "models.json");
+const providerArgs = (extra: Record<string, unknown> = {}) => ({ id: "mine", api: "openai-completions", baseUrl: "https://mine.example/v1", models: [{ id: "m1", contextWindow: 32000 }], create: true, ...extra });
+test("a custom provider is saved to models.json without a key, gets its key through pi's login, and reaches the session by a reload", async () => withHost(async (host, child, { root, auth }) => {
+  let view = await host.hostQuery("providers"); assert.deepEqual([view.providers, view.revision, view.error, view.pendingApply], [[], "absent", undefined, false]);
+  // Names pi already uses are refused: its own providers, and one the running session has from an extension.
+  await assert.rejects(host.hostCommand("provider_save", providerArgs({ id: "acme", revision: view.revision })), { code: "provider_name_taken", field: "id" });
+  await assert.rejects(host.hostCommand("provider_save", providerArgs({ id: "local", revision: view.revision })), { code: "provider_name_taken", field: "id" });
+  await assert.rejects(host.hostCommand("provider_save", providerArgs({ baseUrl: "ftp://mine.example", revision: view.revision })), { code: "invalid_provider", field: "baseUrl" });
+  assert.equal(existsSync(modelsFile(root)), false);
+  const saved = await host.hostCommand("provider_save", providerArgs({ baseUrl: "http://10.0.0.5:8000/v1", revision: view.revision })) as { id: string; revision: string; insecure?: boolean };
+  assert.deepEqual([saved.id, saved.insecure], ["mine", true]);
+  assert.deepEqual(JSON.parse(await readFile(modelsFile(root), "utf8")), { providers: { mine: { baseUrl: "http://10.0.0.5:8000/v1", api: "openai-completions", models: [{ id: "m1", contextWindow: 32000 }] } } });
+  await waitFor(async () => !(await host.hostQuery("providers")).pendingApply, "applied"); assert.equal(child.calls.filter(call => call.type === "switch_session").length, 1);
+  view = await host.hostQuery("providers");
+  assert.deepEqual(view.providers, [{ id: "mine", api: "openai-completions", baseUrl: "http://10.0.0.5:8000/v1", models: [{ id: "m1", contextWindow: 32000 }], extra: [], modelExtras: 0, insecure: true, key: "none", overlay: false, inUse: false, available: 0 }]);
+  assert.equal(view.revision, saved.revision);
+  // It is listed under accounts as a provider whose key can be set from the browser.
+  const account = (await host.hostQuery("accounts")).providers.find(provider => provider.id === "mine");
+  assert.deepEqual(account, { id: "mine", name: "mine", methods: [{ type: "api_key", label: "API key", web: true }], models: 0, knownModels: 1, custom: true });
+  await signIn(host, "lease-1", "mine", "!not-a-command $HOME");
+  assert.equal(auth.stored.get("mine")!.key, "$!not-a-command $$HOME", "escaped so that pi reads it back as typed");
+  assert.equal((await readFile(modelsFile(root), "utf8")).includes("not-a-command"), false, "the key is not in models.json");
+  await waitFor(async () => (await host.hostQuery("providers")).providers[0]!.available === 1, "model available");
+  view = await host.hostQuery("providers"); assert.equal(view.providers[0]!.key, "stored"); assert.equal(JSON.stringify(view).includes("not-a-command"), false);
+  // Editing from a stale view is refused; from the current one it keeps what the form does not show.
+  await writeFile(modelsFile(root), JSON.stringify({ providers: { mine: { baseUrl: "http://10.0.0.5:8000/v1", api: "openai-completions", headers: { "x-org": "team" }, models: [{ id: "m1", contextWindow: 32000, input: ["text", "image"] }] } }, other: 1 }));
+  await assert.rejects(host.hostCommand("provider_save", providerArgs({ create: false, revision: view.revision })), { code: "stale_providers" });
+  view = await host.hostQuery("providers"); assert.deepEqual([view.providers[0]!.extra, view.providers[0]!.modelExtras], [["headers"], 1]);
+  await host.hostCommand("provider_save", providerArgs({ create: false, baseUrl: "https://mine.example/v1", models: [{ id: "m1" }, { id: "m2", name: "Second" }], revision: view.revision }));
+  assert.deepEqual(JSON.parse(await readFile(modelsFile(root), "utf8")), { providers: { mine: { baseUrl: "https://mine.example/v1", api: "openai-completions", headers: { "x-org": "team" }, models: [{ id: "m1", input: ["text", "image"] }, { id: "m2", name: "Second" }] } }, other: 1 });
+}));
+test("a provider saved while pi is replying waits to be applied; removing one also removes the key pi stored for it", async () => withHost(async (host, child, { root, auth }) => {
+  let view = await host.hostQuery("providers");
+  child.streaming = true;
+  const saved = await host.hostCommand("provider_save", providerArgs({ revision: view.revision })) as { revision: string };
+  await new Promise(resolve => setTimeout(resolve, 30));
+  view = await host.hostQuery("providers"); assert.equal(view.pendingApply, true); assert.equal(child.calls.some(call => call.type === "switch_session"), false);
+  assert.equal((await host.hostQuery("accounts")).pendingApply, true);
+  child.streaming = false; await host.read("tree");
+  // An extension declines the reload: the file stays changed, the session is as it was, and it can be applied later.
+  child.cancelNext = true;
+  await assert.rejects(host.hostCommand("account_apply", {}), { code: "apply_cancelled" });
+  assert.equal((await host.hostQuery("providers")).pendingApply, true); assert.equal(child.running, true);
+  assert.deepEqual(await host.hostCommand("account_apply", {}), { pendingApply: false });
+  await signIn(host, "lease-1", "mine", "sk-mine"); await waitFor(async () => (await host.hostQuery("providers")).providers[0]?.available === 1, "available");
+  // The session is using its model when it is removed.
+  child.model = { provider: "mine", id: "mine-model", name: "mine" };
+  view = await host.hostQuery("providers"); assert.deepEqual([view.providers[0]!.inUse, view.providers[0]!.key], [true, "stored"]); assert(view.providers[0]!.available >= 1);
+  await assert.rejects(host.hostCommand("provider_remove", { id: "mine", revision: saved.revision.replace(/.$/, "0") }), { code: "stale_providers" });
+  const removed = await host.hostCommand("provider_remove", { id: "mine", revision: view.revision }) as { credentialRemoved?: boolean };
+  assert.equal(removed.credentialRemoved, true); assert.equal(auth.stored.has("mine"), false);
+  assert.deepEqual(JSON.parse(await readFile(modelsFile(root), "utf8")), { providers: {} });
+  await waitFor(async () => !(await host.hostQuery("providers")).pendingApply, "removal applied");
+  child.model = { provider: "local", id: "fixture", name: "Fixture" }; // like pi: the reloaded session no longer has the removed provider's model
+  assert.deepEqual((await host.hostQuery("providers")).providers, []); assert.equal((await host.hostQuery("accounts")).providers.some(provider => provider.id === "mine"), false);
+  await assert.rejects(host.hostCommand("account_begin", { provider: "mine", method: "api_key" }, 0, "lease-1"), { code: "unknown_provider" });
+}));
+test("an entry named like one of pi's providers is shown as changing that provider and cannot be edited; a broken file blocks every change", async () => withHost(async (host, _child, { root }) => {
+  await writeFile(modelsFile(root), JSON.stringify({ providers: { acme: { baseUrl: "https://gateway.example/v1", api: "openai-completions", apiKey: "!op read key", models: [{ id: "extra" }] } } }));
+  let view = await host.hostQuery("providers");
+  assert.deepEqual([view.providers[0]!.id, view.providers[0]!.overlay, view.providers[0]!.key], ["acme", true, "file_command"]); assert.equal(JSON.stringify(view).includes("op read"), false);
+  await assert.rejects(host.hostCommand("provider_save", providerArgs({ id: "acme", create: false, revision: view.revision })), { code: "provider_overlay" });
+  await assert.rejects(host.hostCommand("provider_remove", { id: "acme", revision: view.revision }), { code: "provider_overlay" });
+  // It is still pi's own provider in the account list, not a custom one.
+  assert.equal((await host.hostQuery("accounts")).providers.find(provider => provider.id === "acme")!.custom, undefined);
+  await writeFile(modelsFile(root), "{ broken");
+  view = await host.hostQuery("providers"); assert.deepEqual(view.providers, []); assert.match(view.error!, /not valid JSON/);
+  await assert.rejects(host.hostCommand("provider_save", providerArgs({ revision: view.revision })), { code: "providers_unreadable" });
+  assert.equal(await readFile(modelsFile(root), "utf8"), "{ broken");
+  assert((await host.hostQuery("accounts")).providers.length >= 3, "accounts still list");
+}));
+test("deleting a saved session: only a listed one that is not open and not held by another service, to the trash when there is one", async () => withHost(async (host, child, fixture) => {
+  const { root, foreign } = fixture, custom = join(root, "custom");
+  const add = (text: string) => { const manager = SessionManager.create(join(root, "other"), custom); manager.appendMessage({ role: "user", content: text, timestamp: 9 });
+    manager.appendMessage({ role: "assistant", content: [{ type: "text", text: "a" }], api: "fixture", provider: "local", model: "fixture", timestamp: 10, stopReason: "stop", usage: { input: 0, output: 0, totalTokens: 0, cacheRead: 0, cacheWrite: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } } } as never); return manager; };
+  const second = add("second"), third = add("third");
+  await assert.rejects(host.hostCommand("session_delete", { sessionId: foreign.getSessionId() }), { code: "unknown_session" }); // not listed yet
+  await assert.rejects(host.hostQuery("session_inspect", { sessionId: foreign.getSessionId() }), { code: "unknown_session" });
+  await host.read("sessions", { scope: "all" });
+  const inspected = await host.hostQuery("session_inspect", { sessionId: foreign.getSessionId() });
+  assert.deepEqual(inspected, { id: foreign.getSessionId(), cwd: join(root, "other"), path: await realpath(foreign.getSessionFile()!), messageCount: 2, modified: inspected.modified, current: false, locked: false, trash: true });
+  assert.equal((await host.hostQuery("session_inspect", { sessionId: child.manager.getSessionId() })).current, true);
+  await assert.rejects(host.hostCommand("session_delete", { sessionId: child.manager.getSessionId() }), { code: "session_current" });
+  await assert.rejects(host.hostCommand("session_delete", { sessionId: "../../etc/passwd" }), { code: "unknown_session" });
+  // Held by another /web service on this machine.
+  const other = await SessionFileLock.acquire(second.getSessionFile()!);
+  assert.equal((await host.hostQuery("session_inspect", { sessionId: second.getSessionId() })).locked, true);
+  await assert.rejects(host.hostCommand("session_delete", { sessionId: second.getSessionId() }), { code: "session_locked" });
+  assert.equal(existsSync(second.getSessionFile()!), true); await other.release();
+  // The file behind a listed ID was replaced by something else, or is reached through a link out of the session directory.
+  const replaced = third.getSessionFile()!; const original = await readFile(replaced, "utf8");
+  await writeFile(replaced, original.replace(third.getSessionId(), "another-session-id"));
+  await assert.rejects(host.hostCommand("session_delete", { sessionId: third.getSessionId() }), { code: "session_refused" });
+  await rm(replaced); const outside = join(root, "outside.jsonl"); await writeFile(outside, original); await symlink(outside, replaced);
+  await assert.rejects(host.hostCommand("session_delete", { sessionId: third.getSessionId() }), { code: "session_refused" });
+  assert.equal(existsSync(outside), true); assert.deepEqual(fixture.trashed, []);
+  // Deleted: moved to the trash, forgotten by the listing and by the project that remembered it, and no lock file left next to it.
+  const path = await realpath(foreign.getSessionFile()!);
+  const registry = new ProjectRegistry(join(root, "agent")); const project = await registry.open(join(root, "other"));
+  await registry.setLastSession(project.id, { id: foreign.getSessionId(), file: path }); assert.equal((await registry.list())[0]!.lastSession?.file, path);
+  assert.deepEqual(await host.hostCommand("session_delete", { sessionId: foreign.getSessionId() }), { id: foreign.getSessionId(), method: "trash" });
+  assert.deepEqual(fixture.trashed, [path]); assert.equal(existsSync(path), false);
+  assert.equal((await registry.list())[0]!.lastSession, undefined, "the project no longer offers to resume the deleted session");
+  assert.deepEqual((await readdir(custom)).filter(name => name.includes(".pi-pane.lock")).length, 1, "only the open session's own lock remains");
+  assert.equal((await host.read("sessions", { scope: "all" })).sessions.some(session => session.id === foreign.getSessionId()), false);
+  await assert.rejects(host.hostCommand("session_delete", { sessionId: foreign.getSessionId() }), { code: "unknown_session" });
+  // No trash: removed permanently, and the result says so.
+  fixture.trashWorks = false;
+  assert.deepEqual(await host.hostCommand("session_delete", { sessionId: second.getSessionId() }), { id: second.getSessionId(), method: "deleted" });
+  assert.equal(existsSync(second.getSessionFile()!), false);
+  assert.equal(child.running, true); assert.equal((await host.read("tree")).entries.length > 0, true, "the open session is untouched");
+}));
+test("export is written by pi where the host says, can be read back in parts by its ID only, and old exports are pruned", async () => withHost(async (host, child, { root }) => {
+  child.exportBody = "<html>" + "x".repeat(900 * 1024) + "</html>";
+  const result = await host.hostCommand("session_export", {}) as { exportId: string; path: string; name: string; bytes: number; downloadable: boolean };
+  const directory = join(await realpath(join(root, "agent")), "pi-pane", "exports");
+  assert.equal(dirname(result.path), directory); assert.match(result.name, /^session-[A-Za-z0-9]+-\d{8}-\d{6}-[0-9a-f]{4}\.html$/); assert.equal(result.bytes, child.exportBody.length); assert.equal(result.downloadable, true);
+  assert.deepEqual(child.calls.find(call => call.type === "export_html")?.payload, { outputPath: result.path });
+  let offset: number | undefined = 0; const parts: Buffer[] = [];
+  while (offset !== undefined) { const page: ExportPage = await host.hostQuery("export_page", { exportId: result.exportId, offset }); assert.equal(page.total, result.bytes); parts.push(Buffer.from(page.data, "base64")); offset = page.next; }
+  assert.equal(parts.length, 3); assert.equal(Buffer.concat(parts).toString("utf8"), child.exportBody);
+  await assert.rejects(host.hostQuery("export_page", { exportId: "not-an-export", offset: 0 }), { code: "export_missing" });
+  await assert.rejects(host.hostQuery("export_page", { exportId: result.exportId, offset: result.bytes + 1 }), { code: "export_missing" });
+  // pi writing somewhere else than asked is an error, not a path to hand to the browser.
+  child.exportTo = join(root, "project", "leaked.html");
+  await assert.rejects(host.hostCommand("session_export", {}), { code: "export_failed" }); child.exportTo = undefined;
+  await writeFile(result.path, "changed"); await assert.rejects(host.hostQuery("export_page", { exportId: result.exportId, offset: 0 }), { code: "export_missing" });
+  child.exportBody = "<html>small</html>";
+  for (let index = 0; index < 22; index++) await host.hostCommand("session_export", {});
+  assert.equal((await readdir(directory)).length, 20);
+}));
+test("session numbers and reply text come from pi; /session, /export and /copy open their pages instead of reaching the model", async () => withHost(async (host, child) => {
+  const stats = await host.read("session_stats");
+  assert.deepEqual(stats, { sessionId: child.manager.getSessionId(), sessionFile: child.manager.getSessionFile(), cwd: host.cwd, userMessages: 2, assistantMessages: 1, toolCalls: 0, toolResults: 0, totalMessages: 3,
+    tokens: { input: 10, output: 20, cacheRead: 0, cacheWrite: 0, total: 30 }, cost: 0.0125, context: { tokens: 1200, window: 16000, percent: 7.5 } });
+  child.context = { tokens: null, contextWindow: 16000, percent: null }; assert.deepEqual((await host.read("session_stats")).context, { tokens: null, window: 16000, percent: null });
+  child.context = undefined; assert.equal((await host.read("session_stats")).context, undefined);
+  assert.deepEqual(await host.read("assistant_text"), { text: "first answer", truncated: false });
+  child.lastText = undefined; assert.deepEqual(await host.read("assistant_text"), { text: "", truncated: false });
+  const tree = await host.read("tree"); const assistant = tree.entries.find(entry => entry.role === "assistant")!, user = tree.entries.find(entry => entry.role === "user")!;
+  assert.deepEqual(await host.read("assistant_text", { entryId: assistant.id }), { text: "first answer", truncated: false });
+  await assert.rejects(host.read("assistant_text", { entryId: user.id }), { code: "unknown_message" });
+  await assert.rejects(host.read("assistant_text", { entryId: "nope" }), { code: "unknown_message" });
+  const commands = (await host.read("commands")).commands;
+  assert.deepEqual(["session", "export", "copy"].map(name => { const command = commands.find(item => item.name === name)!; return [command.available, command.browserAction]; }), [[true, "status"], [true, "export"], [true, "copy"]]);
+  for (const text of ["/session", "/export", "/export out.html", "/copy"]) await assert.rejects(host.command("prompt", { text }), { code: "picker_required" });
+  assert(!child.calls.some(call => call.type === "prompt"));
+}));
