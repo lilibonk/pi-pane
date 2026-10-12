@@ -7,7 +7,7 @@ import type { AddressInfo } from "node:net";
 import type { Duplex } from "node:stream";
 import { WebSocket, WebSocketServer, type RawData } from "ws";
 import {
-  LIMITS, PROTOCOL, WS_PATH, ProtocolError, isRecord, parseClientMessage, toWireError,
+  LIMITS, PROTOCOL, LEGACY_PROTOCOL, WS_PATH, ProtocolError, isRecord, parseClientMessage, toWireError,
   commandArgs, hostCommandArgs, hostQueryArgs, type AccountState, type HostQuery, type HostQueryAction, type HostQueryValues, type Ack, type ClientMessage, type CommandEnvelope, type CommandResult, type HostCommandEnvelope, type HostCommandName, type HostState, type ProjectionEvent, type ServerMessage,
   type ExtensionUiState, type WorkbenchAction, type WorkbenchValues,
 } from "../protocol/index.js";
@@ -190,7 +190,7 @@ export class Hub {
     this.server.keepAliveTimeout = 3_000;
     this.server.maxHeadersCount = 32;
     this.wss = new WebSocketServer({ noServer: true, maxPayload: LIMITS.commandFrameBytes, perMessageDeflate: false,
-      handleProtocols: (protocols) => protocols.has(PROTOCOL) ? PROTOCOL : false });
+      handleProtocols: (protocols) => protocols.has(PROTOCOL) ? PROTOCOL : protocols.has(LEGACY_PROTOCOL) ? LEGACY_PROTOCOL : false });
     this.server.on("upgrade", (request, socket, head) => {
       try {
         if (!this.allowRate(this.upgradeRate, 40, 10_000)) return this.rejectUpgrade(socket, 429);
@@ -198,7 +198,7 @@ export class Hub {
         if (!this.validOrigin(request.headers.origin, request.headers.host)) return this.rejectUpgrade(socket, 403);
         const protocols = String(request.headers["sec-websocket-protocol"] ?? "").split(",").map((value) => value.trim());
         const bearer = protocols.filter((value) => value.startsWith("pi-pane.bearer."));
-        if (!protocols.includes(PROTOCOL) || bearer.length !== 1) return this.rejectUpgrade(socket, 401);
+        if ((!protocols.includes(PROTOCOL) && !protocols.includes(LEGACY_PROTOCOL)) || bearer.length !== 1) return this.rejectUpgrade(socket, 401);
         const token = bearer[0]!.slice("pi-pane.bearer.".length);
         // External access accepts only login sessions; the bootstrap link token cannot upgrade.
         const auth = this.publicUrl ? this.authSession(token) : undefined;
@@ -367,6 +367,16 @@ export class Hub {
     timer.unref?.();
   }
   private accept(socket: WebSocket, auth?: AuthSession): void {
+    if (socket.protocol === LEGACY_PROTOCOL) {
+      // Authentication already passed. A frozen v1 page only knows these fatal error codes:
+      // use its existing `unauthorized` path to stop retries and display the refresh instruction.
+      // This is a compatibility notice, not a new auth failure. Never create a lease or send host data.
+      socket.on("error", () => {});
+      socket.send(JSON.stringify({ t: "error", error: { code: "unauthorized", message: "网页版本已过期，请刷新页面以加载新版 pi-pane。会话和访问凭据保持不变。" } }));
+      socket.close(1002, "refresh_required");
+      const timer = setTimeout(() => socket.terminate(), 1000); timer.unref?.();
+      return;
+    }
     const peer: Peer = { socket, auth, alive: true, rateStart: Date.now(), rateCount: 0,
       helloTimer: setTimeout(() => socket.close(1008, "hello_timeout"), this.options.helloTimeoutMs ?? 5000) };
     peer.helloTimer.unref?.();

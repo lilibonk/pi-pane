@@ -5,7 +5,7 @@ import { ThemeMapper } from "./theme.js";
 import {
   COMMANDS, LIMITS, ProtocolError, base64Length, decodeBase64, diffMessage, encodedSize, inspectImage, isRecord,
   type ContentPage, type ContentView, type HistoryPage, type ImagePage, type MessageView, type ModelView,
-  type ProjectionEvent, type Snapshot, type StateView, type ToolView,
+  type ProjectionEvent, type Snapshot, type StateView, type ThemeDecorations, type ToolView,
 } from "../protocol/index.js";
 
 export interface BridgeObserver {
@@ -26,6 +26,8 @@ export interface BridgeOptions {
   pollMs?: number;
   /** Monotonic clock for observed thinking intervals; injectable for deterministic tests. */
   now?: () => number;
+  /** Validated artwork for the active theme; never paths or arbitrary SVG. */
+  themeDecorations?: () => ThemeDecorations | undefined;
 }
 type EventLike = { type: string; [key: string]: unknown };
 type SnapshotBody = Omit<Snapshot, "t" | "epoch" | "seq">;
@@ -532,6 +534,9 @@ export class Bridge {
   private theme(): Record<string, string> {
     return this.themeMapper.map(this.options.ctx.ui.theme, () => this.options.ctx.ui.getAllThemes());
   }
+  private decorations(): ThemeDecorations | undefined {
+    return this.options.themeDecorations ? this.options.themeDecorations() : this.themeMapper.decorations(this.options.ctx.ui.theme);
+  }
   private publishState(): void {
     if (!this.observer || !this.isCurrent()) return;
     const state = this.state();
@@ -540,21 +545,23 @@ export class Bridge {
     if (serialized !== this.lastState) { this.lastState = serialized; this.publish({ type: "agent_state", state: { ...state, tools: [] } }); }
   }
   private publishTheme(): void {
-    const theme = this.theme();
-    const serialized = JSON.stringify(theme);
-    if (serialized !== this.lastTheme) { this.lastTheme = serialized; this.publish({ type: "theme", theme }); }
+    const theme = this.theme(), decorations = this.decorations();
+    const view = { theme, ...(decorations ? { decorations } : {}) };
+    const serialized = JSON.stringify(view);
+    if (serialized !== this.lastTheme) { this.lastTheme = serialized; this.publish({ type: "theme", ...view }); }
   }
   snapshot(): SnapshotBody {
     this.assertCurrent();
     this.refreshBranch();
     const window = this.window();
+    const decorations = this.decorations();
     return structuredClone({
       session: {
         id: this.sessionId, name: this.options.ctx.sessionManager.getSessionName(), cwd: this.options.ctx.cwd,
         leafId: this.options.ctx.sessionManager.getLeafId(), branchRevision: this.branchRevision,
         messages: window.messages, olderCursor: window.olderCursor,
       },
-      state: this.state(), theme: this.theme(),
+      state: this.state(), theme: this.theme(), ...(decorations ? { decorations } : {}),
       caps: { commands: COMMANDS, images: true, promptReceipt: "rpc", queueView: "boolean", extensionDialogs: true, history: "paged", content: "paged", workbench: true, host: true },
     });
   }

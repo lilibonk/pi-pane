@@ -2,6 +2,7 @@ import { useState } from "preact/hooks";
 import { CUSTOM_PROVIDER_APIS, ProtocolError, insecureAddress, validateProvider, type CustomProvider, type CustomProviderResult, type CustomProvidersView } from "../protocol/index.js";
 import { useHostQuery } from "./projects.js";
 import { HostError, runHostCommand, type WebState } from "./store.js";
+import { explainApplyError } from "./apply-error.js";
 
 const API: Record<string, string> = {
   "openai-completions": "OpenAI 兼容（Chat Completions）", "openai-responses": "OpenAI 兼容（Responses）",
@@ -67,29 +68,37 @@ function ProviderForm({ draft, revision, existing, busy, onDone, onCancel }: { d
   };
   const apis = (CUSTOM_PROVIDER_APIS as readonly string[]).includes(form.api) ? [...CUSTOM_PROVIDER_APIS] : [form.api, ...CUSTOM_PROVIDER_APIS];
   return <form class="provider-form" onSubmit={submit} noValidate>
-    <h3>{form.create ? "添加供应商" : `编辑 ${form.id}`}</h3>
-    <label for="provider-id">名称</label>
-    <input id="provider-id" data-autofocus type="text" value={form.id} disabled={!form.create} maxLength={64} autocomplete="off" autocapitalize="off" spellcheck={false} aria-invalid={invalid("id")} placeholder="例如 my-gateway" onInput={event => set({ id: event.currentTarget.value })} />
-    <p class="setting-note">会成为模型名的前缀（名称/模型 ID），保存后不能修改。</p>
-    <label for="provider-api">API 协议</label>
-    <select id="provider-api" value={form.api} aria-invalid={invalid("api")} onChange={event => set({ api: event.currentTarget.value })}>{apis.map(api => <option value={api} key={api}>{API[api] ?? `${api}（表单不提供的协议，保持不变）`}</option>)}</select>
-    <label for="provider-url">Base URL</label>
-    <input id="provider-url" type="url" inputMode="url" value={form.baseUrl} maxLength={2048} autocomplete="off" autocapitalize="off" spellcheck={false} aria-invalid={invalid("baseUrl")} placeholder="https://example.com/v1" onInput={event => set({ baseUrl: event.currentTarget.value })} />
-    {insecureAddress(form.baseUrl) && <p class="setting-note setting-warn">这是发往其他机器的明文 http 地址：请求内容和密钥在网络上不加密。可以保存，请确认这是你想要的。</p>}
-    <p class="setting-note">保存时不会连接这个地址去验证；是否可用要到实际发送消息时才知道。</p>
+    <div class="provider-form-head"><h3>{form.create ? "添加供应商" : `编辑 ${form.id}`}</h3><button type="button" class="quiet" onClick={onCancel}>返回列表</button></div>
+    <fieldset class="provider-form-section">
+      <legend>连接信息</legend>
+      <div class="provider-field"><label for="provider-id">名称</label>
+        <input id="provider-id" data-autofocus type="text" value={form.id} disabled={!form.create} maxLength={64} autocomplete="off" autocapitalize="off" spellcheck={false} aria-invalid={invalid("id")} aria-describedby="provider-id-note" placeholder="例如 my-gateway" onInput={event => set({ id: event.currentTarget.value })} />
+        <p id="provider-id-note" class="setting-note">会成为模型名的前缀（名称/模型 ID），保存后不能修改。</p>
+      </div>
+      <div class="provider-field"><label for="provider-api">API 协议</label>
+        <select id="provider-api" value={form.api} aria-invalid={invalid("api")} onChange={event => set({ api: event.currentTarget.value })}>{apis.map(api => <option value={api} key={api}>{API[api] ?? `${api}（表单不提供的协议，保持不变）`}</option>)}</select>
+      </div>
+      <div class="provider-field"><label for="provider-url">Base URL</label>
+        <input id="provider-url" type="url" inputMode="url" value={form.baseUrl} maxLength={2048} autocomplete="off" autocapitalize="off" spellcheck={false} aria-invalid={invalid("baseUrl")} aria-describedby="provider-url-note" placeholder="https://example.com/v1" onInput={event => set({ baseUrl: event.currentTarget.value })} />
+        {insecureAddress(form.baseUrl) && <p class="setting-note setting-warn">这是发往其他机器的明文 http 地址：请求内容和密钥在网络上不加密。可以保存，请确认这是你想要的。</p>}
+        <p id="provider-url-note" class="setting-note">保存时不会连接这个地址去验证；是否可用要到实际发送消息时才知道。</p>
+      </div>
+    </fieldset>
     <fieldset class="provider-models" aria-invalid={invalid("models")}>
-      <legend>模型</legend>
-      {form.rows.map((item, index) => <div class="provider-model" key={index}>
-        <input type="text" aria-label={`第 ${index + 1} 个模型的 ID`} placeholder="模型 ID（必填）" value={item.id} maxLength={200} autocomplete="off" autocapitalize="off" spellcheck={false} aria-invalid={invalid(`models.${index}.id`)} onInput={event => row(index, { id: event.currentTarget.value })} />
-        <input type="text" aria-label={`第 ${index + 1} 个模型的显示名`} placeholder="显示名（可选）" value={item.name} maxLength={200} aria-invalid={invalid(`models.${index}.name`)} onInput={event => row(index, { name: event.currentTarget.value })} />
-        <input type="text" inputMode="numeric" aria-label={`第 ${index + 1} 个模型的上下文长度`} placeholder="上下文长度（可选）" value={item.contextWindow} maxLength={12} aria-invalid={invalid(`models.${index}.contextWindow`)} onInput={event => row(index, { contextWindow: event.currentTarget.value })} />
-        <button type="button" class="quiet" aria-label={`移除第 ${index + 1} 个模型`} disabled={form.rows.length <= 1} onClick={() => set({ rows: form.rows.filter((_, position) => position !== index) })}>移除</button>
+      <legend>模型列表</legend>
+      {form.rows.map((item, index) => <div class="provider-model-entry" key={index}>
+        <div class="provider-model-heading"><strong>模型 {index + 1}</strong><button type="button" class="quiet" aria-label={`移除第 ${index + 1} 个模型`} disabled={form.rows.length <= 1} onClick={() => set({ rows: form.rows.filter((_, position) => position !== index) })}>移除</button></div>
+        <div class="provider-model">
+          <label class="provider-field"><span>模型 ID</span><input type="text" aria-label={`第 ${index + 1} 个模型的 ID`} placeholder="模型 ID（必填）" value={item.id} maxLength={200} autocomplete="off" autocapitalize="off" spellcheck={false} aria-invalid={invalid(`models.${index}.id`)} onInput={event => row(index, { id: event.currentTarget.value })} /></label>
+          <label class="provider-field"><span>显示名<span class="field-optional">可选</span></span><input type="text" aria-label={`第 ${index + 1} 个模型的显示名`} placeholder="显示名（可选）" value={item.name} maxLength={200} aria-invalid={invalid(`models.${index}.name`)} onInput={event => row(index, { name: event.currentTarget.value })} /></label>
+          <label class="provider-field"><span>上下文长度<span class="field-optional">可选</span></span><input type="text" inputMode="numeric" aria-label={`第 ${index + 1} 个模型的上下文长度`} placeholder="上下文长度（可选）" value={item.contextWindow} maxLength={12} aria-invalid={invalid(`models.${index}.contextWindow`)} onInput={event => row(index, { contextWindow: event.currentTarget.value })} /></label>
+        </div>
       </div>)}
       <button type="button" class="quiet" disabled={form.rows.length >= 64} onClick={() => set({ rows: [...form.rows, { id: "", name: "", contextWindow: "" }] })}>添加模型</button>
     </fieldset>
     {!!existing?.extra.length && <p class="setting-note">这一条在 models.json 里还有表单之外的配置（{existing.extra.join("、")}），保存时原样保留。</p>}
     {!!existing?.modelExtras && <p class="setting-note">{existing.modelExtras} 个模型带有表单之外的配置，保留在各自的模型上；从列表移除的模型会连同它的配置一起删除。</p>}
-    <p class="setting-note">密钥不在这里填写：保存后用“设置密钥”，它经 pi 自己的登录保存到凭据文件，不写进 models.json。</p>
+    <div class="provider-key-note"><strong>下一步：设置密钥</strong><p class="setting-note">保存后用“设置密钥”，它经 pi 自己的登录保存到凭据文件，不写进 models.json。</p></div>
     {problem && <p class="setting-note setting-warn" role="alert">{problem.message}</p>}
     <div class="setting-actions"><button type="submit" class="send-button" disabled={busy}>保存</button><button type="button" class="quiet" onClick={onCancel}>取消</button></div>
   </form>;
@@ -115,15 +124,16 @@ export function ProvidersSection({ state, canConfigure }: { state: WebState; can
   };
   if (draft && view) return <ProviderForm key={draft.create ? "new" : draft.id} draft={draft} revision={view.revision} existing={view.providers.find(provider => provider.id === draft.id && !draft.create)} busy={busy} onDone={saved} onCancel={() => setDraft(undefined)} />;
   return <>
-    <p class="setting-intro">把 pi 没有内置、但使用 OpenAI、Anthropic 或 Google 兼容接口的服务接进来，例如本地模型服务或公司的网关。配置保存在 pi 的 models.json 里，对这台电脑上的所有项目生效。pi 已经内置的服务商请在“账户”里登录。</p>
+    <p class="setting-intro">连接本地模型服务、公司网关，或使用 OpenAI、Anthropic、Google 兼容接口的服务。pi 已经内置的服务商请在“账户”里登录。</p>
     {view?.error && <p class="setting-note setting-warn" role="alert">models.json 无法使用，这里暂时不能修改，文件没有被改动。{view.error}</p>}
-    {view?.pendingApply && <div class="setting-banner" role="status"><span>有已保存的更改在等待当前会话重新加载。{view.applyError ? ERRORS.busy : ""}</span><button type="button" disabled={!canConfigure || busy} onClick={() => run("account_apply", {})}>立即应用</button></div>}
+    {view?.pendingApply && <div class="setting-banner" role="status"><span>有已保存的更改在等待当前会话重新加载。{view.applyError ? explainApplyError(view.applyError) : ""}</span><button type="button" disabled={!canConfigure || busy} onClick={() => run("account_apply", {})}>立即应用</button></div>}
     {message && <p class="setting-note setting-ok" role="status">{message}</p>}
     {error && <p class="setting-note setting-warn" role="alert">{error}</p>}
     {providers.error && !view && <div class="setting-note setting-warn" role="alert"><p>{providers.error}</p><button type="button" onClick={providers.reload}>重新加载</button></div>}
     {!view && providers.loading && <p class="setting-note" role="status">正在读取…</p>}
+    {view && !view.error && <div class="setting-subhead providers-toolbar"><h3>已添加<span class="setting-count">{view.providers.length}</span></h3><button type="button" class="send-button" disabled={busy} onClick={() => { setMessage(""); setError(""); setDraft(blank()); }}>添加供应商</button></div>}
     {view?.providers.map(provider => <div class="setting-row provider-row" key={provider.id}>
-      <div class="setting-head"><strong>{provider.id}</strong><span class={`resource-status ${provider.available ? "active" : ""}`}>{provider.available ? `当前会话可用 ${provider.available} 个模型` : view.pendingApply ? "等待应用" : "已配置，未验证"}</span></div>
+      <div class="setting-head"><strong>{provider.id}{provider.inUse && <span class="source-chip">当前模型</span>}</strong><span class={`resource-status ${provider.available ? "active" : ""}`}>{provider.available ? `当前会话可用 ${provider.available} 个模型` : view.pendingApply ? "等待应用" : "已配置，未验证"}</span></div>
       <dl class="setting-layers">
         <div><dt>API 协议</dt><dd>{API[provider.api] ?? (provider.api || "未填写")}</dd></div>
         <div><dt>Base URL</dt><dd>{provider.baseUrl || "未填写"}</dd></div>
@@ -142,10 +152,9 @@ export function ProvidersSection({ state, canConfigure }: { state: WebState; can
             ? <span class="rotate-confirm" role="group" aria-label={`确认删除 ${provider.id}`}><button type="button" disabled={busy} onClick={() => run("provider_remove", { id: provider.id, revision: view.revision }, result => setMessage(`已从 models.json 删除 ${provider.id}。${result.credentialRemoved ? "为它保存的密钥也已删除。" : ""}`))}>确认删除</button><button type="button" class="quiet" onClick={() => setRemoving("")}>取消</button></span>
             : <button type="button" class="quiet" disabled={busy || !!view.error} onClick={() => setRemoving(provider.id)}>删除</button>}
         </div>}
-      {removing === provider.id && <p class="setting-note setting-warn">会删除这个供应商的 {provider.models.length} 个模型{provider.key === "stored" ? "和为它保存的密钥" : ""}。{provider.inUse ? "当前会话正在使用它的模型：删除并应用后，这个会话需要重新选择模型，页面会提示。" : ""}</p>}
+      {removing === provider.id && <p class="setting-note setting-warn">会删除这个供应商的 {provider.models.length} 个模型{provider.key === "stored" ? "和为它保存的密钥" : ""}。{provider.inUse ? "当前会话正在使用它的模型：删除并应用后，pi 会换用其他可用的模型，页面会提示更换前后的模型；没有其他可用模型时也会提示，需要先登录账户或添加供应商才能继续对话。" : ""}</p>}
     </div>)}
-    {view && !view.providers.length && !view.error && <p class="setting-note">还没有自定义供应商。</p>}
-    {view && !view.error && <div class="setting-actions"><button type="button" class="send-button" disabled={busy} onClick={() => { setMessage(""); setError(""); setDraft(blank()); }}>添加供应商</button></div>}
-    <p class="setting-note">这里只编辑名称、协议、地址和模型列表。请求头、模型的输入类型与采样参数等其他配置仍在 models.json 里编辑，这里不会改动它们。</p>
+    {view && !view.providers.length && !view.error && <div class="settings-empty"><p>还没有自定义供应商。</p><span>添加一个兼容服务，再设置密钥，就能在会话里选择它的模型。</span></div>}
+    <details class="setting-details"><summary>配置保存位置与编辑范围</summary><p class="setting-note">配置保存在 pi 的 models.json 里，对这台电脑上的所有项目生效。这里只编辑名称、协议、地址和模型列表。请求头、模型的输入类型与采样参数等其他配置仍在 models.json 里编辑，这里不会改动它们。</p></details>
   </>;
 }

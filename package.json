@@ -1,6 +1,6 @@
 {
   "name": "@lilibonk/pi-pane",
-  "version": "0.2.0",
+  "version": "0.3.0-rc.3",
   "license": "MIT",
   "type": "module",
   "description": "Hand the current pi TUI session to a foreground browser workbench, with RPC-owned conversations and optional HTTPS access",
@@ -26,7 +26,7 @@
   },
   "scripts": {
     "dev": "vite --host 127.0.0.1",
-    "build": "vite build && tsc -p tsconfig.extension.json",
+    "build": "node --import tsx scripts/check-theme-decorations.mjs && vite build && tsc -p tsconfig.extension.json",
     "typecheck": "tsc --noEmit",
     "test": "tsx --test tests/*.test.ts",
     "m0:smoke": "node scripts/m0-smoke.mjs",
@@ -51,7 +51,14 @@
     "m31:settings": "node --import tsx scripts/m31-settings.mjs",
     "m31:providers": "node --import tsx scripts/m31-providers.mjs",
     "m31:ui": "node --import tsx scripts/m31-ui.mjs",
-    "m31:gates": "node --import tsx scripts/m31-g1.mjs && node --import tsx scripts/m31-g2.mjs && node --import tsx scripts/m31-g3.mjs && node --import tsx scripts/m31-g4g5.mjs"
+    "m31:gates": "node --import tsx scripts/m31-g1.mjs && node --import tsx scripts/m31-g2.mjs && node --import tsx scripts/m31-g3.mjs && node --import tsx scripts/m31-g4g5.mjs",
+    "m31:design": "node --import tsx scripts/m31-design.mjs",
+    "m31:theme-tui": "node --import tsx scripts/m31-theme-tui.mjs",
+    "m31:integration": "node --import tsx scripts/m31-integration.mjs",
+    "m31:compat": "node --import tsx scripts/m31-compat.mjs",
+    "m31:resilience": "node --import tsx scripts/m31-resilience.mjs",
+    "m31:regression": "node scripts/m31-regression.mjs",
+    "m31:concurrency": "node --import tsx scripts/m31-concurrency.mjs"
   },
   "peerDependencies": {
     "@earendil-works/pi-ai": "*",
@@ -83,7 +90,9 @@
     "web-dist",
     "themes",
     "README.md",
-    "docs/design.md"
+    "docs/design.md",
+    "theme-decorations",
+    "docs/m3.1-migration.md"
   ],
   "engines": {
     "node": ">=22.19.0"

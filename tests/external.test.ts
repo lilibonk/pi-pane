@@ -10,7 +10,7 @@ import test from "node:test";
 import WebSocket from "ws";
 import { AUTH_EXPIRED, Hub, type HubOptions } from "../src/extension/hub.ts";
 import type { Bridge } from "../src/extension/bridge.ts";
-import { COMMANDS } from "../src/protocol/index.ts";
+import { PROTOCOL, COMMANDS } from "../src/protocol/index.ts";
 
 const PASSWORD = "correct horse battery";
 const PUBLIC = "https://pane.example.test";
@@ -54,7 +54,7 @@ function call(port: number, method: string, path: string, headers: Record<string
   });
 }
 function upgrade(url: string, token: string, headers: Record<string, string>, ca?: Buffer) {
-  const socket = new WebSocket(url, ["pi-pane.v1", `pi-pane.bearer.${token}`], { headers, ...(ca ? { ca, servername: "localhost" } : {}) });
+  const socket = new WebSocket(url, [PROTOCOL, `pi-pane.bearer.${token}`], { headers, ...(ca ? { ca, servername: "localhost" } : {}) });
   const frames: Array<Record<string, unknown>> = [];
   const state = { opened: false, closed: false, code: 0, reason: "", status: 0 };
   socket.on("message", (raw) => frames.push(JSON.parse(raw.toString()) as Record<string, unknown>));

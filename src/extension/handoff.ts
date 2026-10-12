@@ -442,7 +442,8 @@ export class HandoffHost implements HostHandler {
   }
   /**
    * Makes the running session reload pi's credentials, in process: a saved session is reopened on its
-   * own file and an unsaved one is replaced by a new one. Session ID, model and history stay; extensions
+   * own file and an unsaved one is replaced by a new one. Saved ID/history stay; pi restores the model
+   * when still available and reports a fallback otherwise. Extensions
    * keep their veto. Only when the session is idle; otherwise it stays pending until the user asks.
    */
   private applyCredentials(explicit: boolean): Promise<void> {
@@ -538,7 +539,9 @@ export class HandoffHost implements HostHandler {
     const scope = await this.settingsScope();
     const entry = (await this.themes.load(scope.cwd, scope.projectTrusted, false)).entries.get(name);
     if (!entry) throw new ProtocolError("theme_missing", "This theme is not available in the current project.");
-    return { name: entry.name, appearance: entry.theme.appearance, vars: entry.vars };
+    // Revalidate optional artwork even when the catalog's colors came from its short-lived cache.
+    const decorations = this.themes.decorations(entry.theme);
+    return { name: entry.name, appearance: entry.theme.appearance, vars: entry.vars, ...(decorations ? { decorations } : {}) };
   }
   /** The lists a setting is chosen from, and what the running session reports. Read fresh for every view and save. */
   private async settingChoices(scope: SettingsScope): Promise<{ choices: SettingChoices; live: boolean }> {
@@ -806,10 +809,24 @@ export class HandoffHost implements HostHandler {
     const state = await this.child?.request<{ model?: ModelRef }>("get_state").catch(() => undefined);
     return state?.model ? { provider: state.model.provider, id: state.model.id } : undefined;
   }
-  /** A restarted runtime takes the model its transcript records. Say so when that differs from what was in use. */
+  /**
+   * A restarted runtime takes the model its transcript records, or another one when that is no longer
+   * available. Say so when it differs from what was in use, and also when nothing is left to use.
+   */
   private async reportModelChange(expected: ModelRef | undefined, when: string, label: string): Promise<void> {
-    const actual = expected && await this.currentModel();
-    if (!expected || !actual || (actual.provider === expected.provider && actual.id === expected.id)) return;
+    if (!expected || !this.child) return;
+    const [state, available] = await Promise.all([
+      this.child.request<{ model?: ModelRef }>("get_state").catch(() => undefined),
+      this.child.request<{ models: unknown[] }>("get_available_models").then(result => result.models.length, () => undefined)]);
+    if (!state) return; // not an answer about the model
+    const actual = state.model;
+    // With nothing configured pi 1.1.0 reports a placeholder model (unknown/unknown) rather than none.
+    if (!actual || available === 0) {
+      this.log(`No model is available now; ${when} it was ${expected.provider}/${expected.id}.`);
+      this.hub.notifyAll({ t: "notice", message: `当前会话没有可用的模型，${label}是 ${expected.provider}/${expected.id}。请在“设置”里登录账户或添加供应商，再选择模型。` });
+      return;
+    }
+    if (actual.provider === expected.provider && actual.id === expected.id) return;
     this.log(`Model is now ${actual.provider}/${actual.id}; ${when} it was ${expected.provider}/${expected.id}. The session's recorded model takes precedence.`);
     this.hub.notifyAll({ t: "notice", message: `当前模型是 ${actual.provider}/${actual.id}，${label}是 ${expected.provider}/${expected.id}。已按会话记录恢复，需要时请重新选择。` });
   }
@@ -878,8 +895,11 @@ export class HandoffHost implements HostHandler {
     const mirror = new RpcSessionMirror(this.child!, this.activeCwd, () => this.piTheme as ExtensionContext["ui"]["theme"], () => this.target.themes, () => {}, () => this.verifyOwnedChanges());
     try { await mirror.load(); } catch (error) { mirror.dispose(); throw error; }
     if (this.stopping) { mirror.dispose(); throw new Error("The handoff host stopped during startup."); }
-    const bridge = new Bridge({ pi: mirror.api(), ctx: mirror.context(), generation, isCurrent: () => this.generation === generation && !this.stopping });
-    mirror.attach(bridge); this.mirror = mirror; this.bridge = bridge; this.workspace = new WorkspaceService(this.activeCwd);
+    const bridge = new Bridge({ pi: mirror.api(), ctx: mirror.context(), generation, isCurrent: () => this.generation === generation && !this.stopping,
+      themeDecorations: () => this.themes.decorations(this.piTheme) });
+    mirror.attach(bridge); this.mirror = mirror; this.bridge = bridge;
+    this.workspace = new WorkspaceService(this.activeCwd, () => [this.agentDir, ...this.directories,
+      ...(process.env.PI_CODING_AGENT_SESSION_DIR ? [process.env.PI_CODING_AGENT_SESSION_DIR] : [])]);
     // The launched runtime legitimately persists initial model/system/session updates.
     // Establish its acknowledged startup baseline before exposing the first snapshot.
     // The same holds for every newly started child. Between the gate check and this point only it could write.

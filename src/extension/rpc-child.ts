@@ -58,6 +58,31 @@ export interface RpcConnection {
   respondUi(id: string, response: Record<string, unknown>): void;
   stop(options?: StopOptions): Promise<StopOutcome | void>;
 }
+/** How long a child whose host is gone may spend stopping before it exits regardless. */
+const ORPHAN_EXIT_MS = 2000;
+/**
+ * Runs before pi in the child. The IPC channel to the host stays open (unreferenced) for the child's
+ * whole life, and its closing is how the child learns that the host is gone: stdin may have no reader
+ * yet while pi awaits startup hooks, and pi's own end-of-input shutdown may be waiting on extension code.
+ *
+ * - Before the start gate opens pi is not loaded: exit at once.
+ * - Afterwards, call the termination handlers pi has installed. That is where pi stops the commands
+ *   it started, which run in their own process groups and would otherwise outlive it with no owner.
+ *   They are called directly instead of by a real signal, with one more listener added first: pi's
+ *   dependencies include a handler that re-raises the signal when it is the only one left, which would
+ *   kill a pi that has already begun its own shutdown before that shutdown stops the commands.
+ * - Whatever startup, shutdown or extension code is still doing, exit after ORPHAN_EXIT_MS.
+ */
+const BOOTSTRAP = `import {pathToFileURL} from "node:url";
+let started=false;
+process.on("disconnect",()=>{
+  if(!started)process.exit(0);
+  setTimeout(()=>process.exit(0),${ORPHAN_EXIT_MS});
+  process.on("SIGTERM",()=>{});
+  process.emit("SIGTERM","SIGTERM");
+});
+const timer=setTimeout(()=>process.exit(1),10000);
+process.once("message",async value=>{if(value!=="start")return; started=true; clearTimeout(timer); process.channel?.unref(); await import(pathToFileURL(process.argv[1]).href);});`;
 /** How long a stop waits after closing stdin before it signals the child. */
 export interface StopOptions { graceMs?: number; killAfterMs?: number }
 /** `forced` when any signal was needed: the child's shutdown handlers may not have completed. */
@@ -90,11 +115,9 @@ export class RpcChild implements RpcConnection {
     const entry = this.entry;
     if (!entry) throw new Error("The running pi installation does not provide an RPC entry.");
     // Own process group: Ctrl+C in the terminal reaches the host, which stops the child in order.
-    // The child exits when its stdin closes, so it cannot outlive a crashed host as a second writer.
-    // Startup gate prevents a host crash between spawn and durable writer-PID registration
+    // The startup gate prevents a host crash between spawn and durable writer-PID registration
     // from exposing an unlocked child. It is process lifecycle IPC, not an extension channel.
-    const bootstrap = `import {pathToFileURL} from "node:url"; const orphan=()=>process.exit(0); process.on("disconnect",orphan); const timer=setTimeout(()=>process.exit(1),10000); process.once("message",async value=>{if(value!=="start")return; clearTimeout(timer); process.off("disconnect",orphan); process.disconnect(); await import(pathToFileURL(process.argv[1]).href);});`;
-    const child = spawn(process.execPath, ["--input-type=module", "-e", bootstrap, entry, ...this.args], { cwd: this.cwd, env: this.env, stdio: ["pipe", "pipe", "pipe", "ipc"], detached: true });
+    const child = spawn(process.execPath, ["--input-type=module", "-e", BOOTSTRAP, entry, ...this.args], { cwd: this.cwd, env: this.env, stdio: ["pipe", "pipe", "pipe", "ipc"], detached: true });
     this.process = child;
     child.stderr!.on("data", (data: Buffer) => { this.stderr = (this.stderr + data.toString()).slice(-16_384); });
     const finish = (code: number | null, error?: Error) => {

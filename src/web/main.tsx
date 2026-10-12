@@ -3,7 +3,7 @@ import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "preact/ho
 import type { JSX } from "preact";
 import { IMAGE_TYPES } from "../protocol/index.js";
 import {
-  addImages, answerDialog, forgetSubmission, issueCommand, issueHostCommand, loadOlder, login, logout, queryReceipt, reconnect, removeAttachment, setDraft,
+  addImages, answerDialog, forgetSubmission, issueCommand, issueHostCommand, loadOlder, login, logout, openSettings, queryReceipt, reconnect, removeAttachment, setDraft, setProjectDialog,
   startConnection, submitPrompt, webStore, type Attachment, type Dialog, type MessageView, type Submission, type ToolView, type WebState,
 } from "./store.js";
 import { Message, ToolCard, type ToolContext } from "./messages.js";
@@ -14,6 +14,7 @@ import { AccountDialogs } from "./accounts.js";
 import { SettingsDialog } from "./settings.js";
 import { ContextMeter, SessionDialogs } from "./sessions.js";
 import { extensionText } from "./ui-state.js";
+import { ThemeDecoration } from "./decorations.js";
 import "./style.css";
 
 /** First answer wins in the host; dialogs survive network loss and are restored on reconnect. */
@@ -340,10 +341,13 @@ function App() {
   }
   function submit(mode: "followUp" | "steer") {
     if (!canPrompt || composing.current) return;
-    const slash = resolveSlash(state.draft, commandCatalog.value?.commands ?? []);
+    // Input updates the store before Preact renders. A paste followed immediately by Enter must
+    // route the same current draft that submitPrompt reads, rather than the previous render's text.
+    const current = webStore.getState();
+    const slash = resolveSlash(current.draft, commandCatalog.value?.commands ?? []);
     if (slash?.command) {
       const command = slash.command;
-      if (state.attachments.length) { webStore.setState({ notice: "执行命令前请移除图片；命令与图片消息需要分别提交。" }); return; }
+      if (current.attachments.length) { webStore.setState({ notice: "执行命令前请移除图片；命令与图片消息需要分别提交。" }); return; }
       if (!command.available) { webStore.setState({ notice: command.reason || "交接模式不支持此命令。" }); return; }
       if (!workbench.current?.execute(command, slash.args)) { webStore.setState({ notice: "当前无法执行此命令，请等待运行结束，或使用对应面板完成操作。" }); return; }
       webStore.setState({ notice: "" });
@@ -363,14 +367,9 @@ function App() {
 
   return (
     <div class="app-shell">
-      <header class="topbar">
-        <div class="brand"><span class="brand-icon">π</span><span>pi-pane</span></div>
-        <div class="connection">
-          <span class={`status-dot status-${connection}`} /><span>{labels[connection]}</span>
-          {state.authMode === "password" && connection !== "login" && <button type="button" class="quiet logout-button" onClick={() => void logout()}>退出登录</button>}
-        </div>
-      </header>
-      <Workbench state={state} canConfigure={canConfigure} commands={commandCatalog.value?.commands ?? []} controller={workbench} onFocusComposer={() => textarea.current?.focus()}>
+      <Workbench state={state} canConfigure={canConfigure} commands={commandCatalog.value?.commands ?? []} controller={workbench} onFocusComposer={() => textarea.current?.focus()}
+        empty={!!snapshot && !snapshot.session.messages.length && !host?.tools.length && !recovery && connection !== "login"}
+        connectionIndicator={<div class="connection" role="status"><span class={`status-dot status-${connection}`} /><span>{labels[connection]}</span>{state.authMode === "password" && connection !== "login" && <button type="button" class="quiet logout-button" onClick={() => void logout()}>退出登录</button>}</div>}>
       <div class="session-bar">
         <div class="session-identity"><h1>{snapshot?.session.name || "当前 pi 会话"}</h1><p title={snapshot?.session.cwd}>{snapshot?.session.cwd || "在浏览器中继续当前终端会话"}</p></div>
         <div class="session-details">
@@ -385,7 +384,7 @@ function App() {
         <div class="timeline-inner" ref={feedInner}>
           {start > 0 && <div class="history-limit"><button type="button" onClick={showEarlier}>显示更早的 {Math.min(start, WINDOW_STEP)} 条（已在浏览器中）</button></div>}
           {!start && snapshot?.session.olderCursor && <div class="history-limit"><button type="button" disabled={state.historyLoading || !online} onClick={olderPage}>{state.historyLoading ? "正在加载更早的消息…" : "加载更早的消息"}</button>{state.historyError && <span>{state.historyError}</span>}</div>}
-          {recovery ? <Recovery state={state} /> : !snapshot ? <div class="empty-state"><span class="empty-pi">π</span><h2>{connection === "switching" ? "等待新会话" : "连接当前会话"}</h2><p>在终端输入 /web 后，当前分支和正在生成的内容会显示在这里。</p></div> : !snapshot.session.messages.length && !host?.tools.length ? <div class="empty-state"><span class="empty-pi">π</span><h2>可以开始了</h2><p>会话已交给浏览器。发送消息后，pi 的实际输出会出现在这里。</p></div> : null}
+          {recovery ? <Recovery state={state} /> : !snapshot ? <div class="empty-state"><span class="empty-pi">π</span><h2>{connection === "switching" ? "等待新会话" : "连接当前会话"}</h2><p>在终端输入 /web 后，当前分支和正在生成的内容会显示在这里。</p></div> : !snapshot.session.messages.length && !host?.tools.length ? <div class="empty-state empty-ready"><ThemeDecoration slot="empty" /><h2>从一个想法开始</h2><p>描述你的任务，和 pi 一起把它完成。</p><button type="button" class="empty-project" title={snapshot.session.cwd} disabled={!canConfigure} onClick={() => setProjectDialog({ mode: "open" })}><span aria-hidden="true">▱</span>{snapshot.session.cwd.replace(/\/$/, "").split(/[\\/]/).pop() || "选择项目"}<span aria-hidden="true">⌄</span></button>{resources.value && !resources.value.models.length && <p><button type="button" class="link-button" onClick={() => openSettings("accounts")}>连接模型账户</button>后即可开始。</p>}</div> : null}
           {shown.map(message => <Message key={message.id} message={message} tools={view.tools} expansions={state.expansions} />)}
           {!!view.orphans.length && <div class="tools"><div class="section-label">工具执行</div>{view.orphans.map(tool => <ToolCard key={tool.id} live={tool} expansions={state.expansions} />)}</div>}
           {host?.running && <div class="running-line"><span class="running-indicator" />pi 正在运行</div>}
@@ -395,12 +394,6 @@ function App() {
       <footer class="composer-region" hidden={recovery}>
         <div class="composer-inner">
           <ExtensionWidgets state={state} placement="aboveEditor" />
-          <div class="host-controls">
-            <label><span>模型</span><select aria-label="模型" value={host?.model ? JSON.stringify({ provider: host.model.provider, id: host.model.id }) : ""} disabled={!canConfigure || !snapshot?.caps.commands.includes("set_model")} onChange={event => { const model = event.currentTarget.value; if (model) issueCommand("set_model", JSON.parse(model)); }}>{!resources.value?.models.some(model => model.provider === host?.model?.provider && model.id === host?.model?.id) && <option value="">{host?.model?.name || "未设置"}</option>}{resources.value?.models.map(model => <option key={`${model.provider}:${model.id}`} value={JSON.stringify({ provider: model.provider, id: model.id })}>{model.name || model.id}</option>)}</select></label>
-            <label><span>thinking</span><select aria-label="thinking 等级" value={host?.thinking ?? "off"} disabled={!canConfigure || !snapshot?.caps.commands.includes("set_thinking") || !resources.value?.thinkingLevels?.length} onChange={event => issueCommand("set_thinking", { level: event.currentTarget.value })}>{(resources.value?.thinkingLevels ?? [host?.thinking || "off"]).map(level => <option value={level} key={level}>{level}</option>)}</select></label>
-            <button type="button" class="compact-button" disabled={!canConfigure || !!host?.hasPendingMessages || !snapshot?.caps.commands.includes("compact")} onClick={() => issueCommand("compact")}>压缩上下文</button>
-            <ContextMeter state={state} />
-          </div>
           <div class="composer-wrap">
           {snapshot?.caps.workbench && <CommandMenu commands={commandCatalog.value?.commands ?? []} draft={state.draft} onChoose={command => { setDraft(`/${command.name} `); textarea.current?.focus(); }} />}
           <div class={`composer ${!canPrompt ? "composer-disabled" : ""} ${dragging ? "composer-dragging" : ""}`}
@@ -412,10 +405,16 @@ function App() {
             <textarea ref={textarea} aria-label="消息" rows={3} placeholder={host?.running ? coarsePointer ? "补充下一步…" : "补充下一步… Enter 请求 followUp；⌘ / Ctrl + Enter 请求 steer" : snapshot?.caps.workbench ? "给 pi 发送消息… / 命令 · @ 文件" : "给 pi 发送消息…"} value={state.draft} onInput={event => { const draft = event.currentTarget.value; setDraft(draft); const mention = /(?:^|\s)@([^\s]*)$/.exec(draft); if (snapshot?.caps.workbench && mention && !composing.current) workbench.current?.files(true, mention[1]); }} onKeyDown={onKeyDown}
               onPaste={event => { if (canAttach && event.clipboardData?.files.length && attachImages([...event.clipboardData.files])) event.preventDefault(); }} />
             <input ref={fileInput} type="file" accept={IMAGE_TYPES.join(",")} multiple hidden onChange={event => { attachImages([...(event.currentTarget.files ?? [])]); event.currentTarget.value = ""; }} />
+          <div class="host-controls">
+            <label><span>模型</span><select aria-label="模型" value={host?.model ? JSON.stringify({ provider: host.model.provider, id: host.model.id }) : ""} disabled={!canConfigure || !snapshot?.caps.commands.includes("set_model")} onChange={event => { const model = event.currentTarget.value; if (model) issueCommand("set_model", JSON.parse(model)); }}>{!resources.value?.models.some(model => model.provider === host?.model?.provider && model.id === host?.model?.id) && <option value="">{host?.model?.name || "未设置"}</option>}{resources.value?.models.map(model => <option key={`${model.provider}:${model.id}`} value={JSON.stringify({ provider: model.provider, id: model.id })}>{model.name || model.id}</option>)}</select></label>
+            <label><span>thinking</span><select aria-label="thinking 等级" value={host?.thinking ?? "off"} disabled={!canConfigure || !snapshot?.caps.commands.includes("set_thinking") || !resources.value?.thinkingLevels?.length} onChange={event => issueCommand("set_thinking", { level: event.currentTarget.value })}>{(resources.value?.thinkingLevels ?? [host?.thinking || "off"]).map(level => <option value={level} key={level}>{level}</option>)}</select></label>
+            <button type="button" class="compact-button" disabled={!canConfigure || !!host?.hasPendingMessages || !snapshot?.caps.commands.includes("compact")} onClick={() => issueCommand("compact")}>压缩上下文</button>
+            <ContextMeter state={state} />
+          </div>
             <div class="composer-actions"><div class="context-buttons"><button type="button" class="attach-button" disabled={!canAttach || state.attachments.length >= 4} onClick={() => fileInput.current?.click()} aria-label="添加图片">图片</button>{snapshot?.caps.workbench && <button type="button" disabled={!online} onClick={() => workbench.current?.files(true)} aria-label="引用工作区文件">@ 文件</button>}</div><div class="action-buttons">{host && !host.idle && <button type="button" class="abort-button" disabled={!online || !snapshot?.caps.commands.includes("abort")} onClick={() => issueCommand("abort")}>■ 中止</button>}<button type="button" class="steer-button" disabled={!canPrompt || (!state.draft.trim() && !state.attachments.length)} onClick={() => submit("steer")} title="⌘ / Ctrl + Enter">steer</button><button type="button" class="send-button" disabled={!canPrompt || (!state.draft.trim() && !state.attachments.length)} onClick={() => submit("followUp")}>{host?.running ? "请求 followUp ↗" : "发送 ↗"}</button></div></div>
           </div>
           </div>
-          <p class="scope-note">会话已交给浏览器 · slash 命令、模板和 skill 会执行或展开 · 终端 Ctrl+C 停止服务并交还会话</p>
+          <div class="composer-guidance"><span>{coarsePointer ? "Enter 换行" : "Enter 发送 · Shift + Enter 换行"}</span><details class="composer-help"><summary>使用提示</summary><p>输入 / 选择命令、模板与 skill，输入 @ 引用项目文件。运行中可发送 followUp，或用 steer 引导当前回复。终端 Ctrl+C 停止服务并交还会话。</p></details></div>
           <ExtensionWidgets state={state} placement="belowEditor" />
           <Receipts items={state.submissions} online={online} onRecover={text => { setDraft(text); textarea.current?.focus(); }} />
         </div>

@@ -95,14 +95,31 @@ test("bundled themes declare complete independent palettes and package resources
   assert.ok(metadata.pi.themes.includes("./themes/*.json"));
   assert.ok(metadata.files.includes("themes"));
   const baseline = JSON.parse(readFileSync(new URL("../node_modules/@earendil-works/pi-coding-agent/dist/modes/interactive/theme/dark.json", import.meta.url), "utf8"));
-  for (const appearance of ["dark", "light"]) {
+  for (const appearance of ["dark", "light", "porcelain"]) {
     const json = JSON.parse(readFileSync(new URL(`../themes/pi-pane-${appearance}.json`, import.meta.url), "utf8"));
     assert.equal(json.name, `pi-pane-${appearance}`);
-    assert.equal(json.appearance, appearance);
+    assert.equal(json.appearance, appearance === "dark" ? "dark" : "light");
     for (const key of Object.keys(baseline.colors)) {
       assert.ok(Object.hasOwn(json.colors, key), `${appearance}: ${key}`);
       assert.match(exportPageBackground({ ...json, export: { pageBg: json.colors[key] } })!, /^#[\da-f]{6}$/);
     }
     assert.match(exportPageBackground(json)!, /^#[\da-f]{6}$/);
+  }
+});
+test("bundled reading and feedback roles maintain normal-text contrast on the page and derived surfaces", () => {
+  const luminance = (hex: string): number => {
+    const channels = hex.slice(1).match(/../g)!.map(value => parseInt(value, 16) / 255).map(value => value <= .04045 ? value / 12.92 : ((value + .055) / 1.055) ** 2.4);
+    return channels[0]! * .2126 + channels[1]! * .7152 + channels[2]! * .0722;
+  };
+  for (const name of ["light", "dark", "porcelain"]) {
+    const json = JSON.parse(readFileSync(new URL(`../themes/pi-pane-${name}.json`, import.meta.url), "utf8"));
+    const colors = Object.fromEntries(Object.entries(json.colors as Record<string, string>).map(([role, variable]) => [role, parseColor(json.vars[variable])]));
+    const vars = new ThemeMapper().vars({ appearance: json.appearance, colors }, exportPageBackground(json));
+    for (const role of ["--fg", "--fg-muted", "--fg-dim", "--accent", "--err", "--ok", "--warn"]) {
+      for (const background of ["--bg", "--surface", "--sidebar-bg"]) {
+        const [first, second] = [luminance(vars[role]!), luminance(vars[background]!)].sort((a, b) => b - a);
+        assert.ok((first! + .05) / (second! + .05) >= 4.5, `${name}: ${role} against ${background}`);
+      }
+    }
   }
 });

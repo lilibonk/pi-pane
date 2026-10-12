@@ -1,3 +1,4 @@
+import type { ThemeDecorations } from "./theme-decorations.js";
 /** Host-level reads: about the machine's projects, not about the session that happens to be running. */
 export const HOST_QUERIES = ["projects", "directories", "project_inspect", "accounts", "themes", "theme", "settings", "providers", "session_inspect", "export_page"] as const;
 export type HostQueryAction = (typeof HOST_QUERIES)[number];
@@ -140,7 +141,7 @@ export interface ThemesView {
   /** Whether the current project's own theme directory was read. */
   projectThemes: "loaded" | "untrusted" | "none";
 }
-export interface ThemeView { name: string; appearance: "light" | "dark"; vars: Record<string, string> }
+export interface ThemeView { name: string; appearance: "light" | "dark"; vars: Record<string, string>; decorations?: ThemeDecorations }
 export const SETTING_KEYS = ["theme", "defaultModel", "defaultThinkingLevel", "steeringMode", "followUpMode", "compaction.enabled", "retry.enabled", "images.blockImages", "hideThinkingBlock"] as const;
 export type SettingKey = (typeof SETTING_KEYS)[number];
 /** `null` is "not set": pi's built-in default applies. */

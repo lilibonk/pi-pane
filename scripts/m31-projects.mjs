@@ -10,12 +10,14 @@ import { join, resolve } from "node:path";
 import { ProjectTrustStore, SessionManager } from "@earendil-works/pi-coding-agent";
 import { startFixture, openClient, commandResult, workbenchQuery, waitFor } from "./m0-smoke.mjs";
 import { SessionFileLock } from "../src/extension/session-lock.ts";
+import { chromium } from "playwright";
 
 const out = resolve(process.env.PI_M31_REPORT_DIR || "build-artifacts/m3.1/projects");
 await mkdir(out, { recursive: true });
 const report = { startedAt: new Date().toISOString(), scope: "M31-2 project management", realTui: true, realModelCalls: 0,
   isolation: "temporary HOME + agent/session dirs + local deterministic provider", checks: [], status: "running" };
 const fixtures = [], clients = [];
+let browser;
 const alive = pid => { try { process.kill(pid, 0); return true; } catch { return false; } };
 const plain = text => text.replace(/\u001b\[[0-?]*[ -/]*[@-~]/g, "").replace(/\r/g, "");
 const exists = path => readFile(path).then(() => true, () => false);
@@ -223,8 +225,26 @@ try {
     const { fixture, client, gated, child, commands } = await start({ envOverrides: { PI_M31_TRUST: "no" }, extraArgs: ["--approve"] });
     await check("P-07", "the start --approve does not trust a later project, and a global policy veto is shown as not loaded rather than trusted-and-loaded", async () => {
       const inspection = await hostQuery(client, "project_inspect", { path: gated }); assert.equal(inspection.trust.ask, true); assert.equal(inspection.trust.override, undefined);
-      await hostCommand(client, "project_open", { path: gated, trust: "remember" });
+      browser = await chromium.launch({ channel: "chrome", headless: true });
+      const page = await browser.newPage({ viewport: { width: 1280, height: 720 } });
+      await page.goto(fixture.url); await page.getByText("已连接", { exact: true }).waitFor();
+      await page.getByLabel("添加项目", { exact: true }).click();
+      await page.getByRole("button", { name: "打开项目", exact: true }).click();
+      const picker = page.getByRole("dialog", { name: "打开项目", exact: true });
+      await picker.getByRole("textbox", { name: "文件夹的绝对路径" }).fill(gated);
+      await picker.getByRole("button", { name: "前往", exact: true }).click();
+      await picker.getByText("只有隐藏的子文件夹。", { exact: true }).waitFor();
+      await waitFor(async () => await picker.getByRole("textbox", { name: "文件夹的绝对路径" }).inputValue() === gated
+        && await picker.getByRole("button", { name: "打开此文件夹", exact: true }).isEnabled(), "requested directory ready");
+      await picker.getByRole("button", { name: "打开此文件夹", exact: true }).click();
+      await page.getByRole("heading", { name: "是否信任这个项目？", exact: true }).waitFor();
+      await page.screenshot({ path: join(out, "trust-question-with-start-approve.png") });
+      await page.getByRole("button", { name: "信任并记住这个文件夹", exact: true }).click();
       await waitFor(() => client.snapshot?.session.cwd === gated, "gated project snapshot");
+      await page.locator(".dialog-backdrop").waitFor({ state: "detached" });
+      await page.locator(".project-context > summary").click();
+      await page.getByText("实际加载：没有观察到来自项目的命令", { exact: false }).waitFor();
+      await page.screenshot({ path: join(out, "trust-veto-not-loaded.png") });
       const second = await child(2); assert.ok(!second.argv.includes("--approve"), "--approve stays with the start project");
       assert.ok((await fixture.events()).some(item => item.event === "m31_project_trust" && item.pid === second.pid), "the global policy extension was consulted");
       assert.ok(!(await commands()).includes("m31-gated"), "the veto wins over the remembered choice");
@@ -233,11 +253,13 @@ try {
       await hostCommand(client, "project_open", { path: await realpath(fixture.cwd) });
       const third = await child(3); assert.ok(third.argv.includes("--approve"), "the start project keeps the flag it was started with");
       assert.equal((await hostQuery(client, "projects")).current.trust.override, "approve");
+      await browser.close(); browser = undefined;
     });
   }
   report.status = "passed";
 } catch (error) { report.status = "failed"; report.error = String(error.stack ?? error); process.exitCode = 1; console.error(error); }
 finally {
+  await browser?.close();
   for (const client of clients) await client.close().catch(() => {});
   for (const fixture of fixtures) { await fixture.close().catch(() => {}); await fixture.remove().catch(() => {}); }
   report.finishedAt = new Date().toISOString();

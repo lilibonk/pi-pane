@@ -67,6 +67,37 @@ test("workspace preview rejects traversal, external symlinks, binaries and crede
   } finally { await f.close(); await outside.close(); }
 });
 
+test("custom agent and session roots stay excluded inside a HOME workspace, including aliases and deleted Git paths", async () => {
+  const f = await fixture();
+  try {
+    const protectedRoots = [join(f.root, "custom-agent"), join(f.root, "custom-sessions")];
+    const service = new WorkspaceService(f.root, () => protectedRoots);
+    await git(f.root, "init", "-b", "boundaries");
+    for (const root of protectedRoots) {
+      await mkdir(root); await writeFile(join(root, "private.txt"), "private fixture");
+    }
+    await writeFile(join(f.root, "visible.txt"), "public fixture");
+    await git(f.root, "add", "."); await git(f.root, "commit", "-m", "fixture");
+    await symlink(protectedRoots[0], join(f.root, "agent-alias"));
+    await symlink(join(protectedRoots[1], "private.txt"), join(f.root, "session-alias.txt"));
+    for (const path of ["custom-agent/private.txt", "custom-sessions/private.txt", "agent-alias/private.txt", "session-alias.txt"]) {
+      await assert.rejects(service.file(path), { code: "excluded_file" });
+      await assert.rejects(service.gitDiff(path), { code: "excluded_file" });
+    }
+    assert.deepEqual((await service.files()).files.map(item => item.path), ["visible.txt"]);
+    await rm(join(protectedRoots[0], "private.txt"));
+    await writeFile(join(protectedRoots[1], "private.txt"), "changed private fixture");
+    await writeFile(join(f.root, "visible.txt"), "changed public fixture");
+    const status = await service.gitStatus();
+    assert.deepEqual(status.files.map(item => item.path), ["visible.txt"]);
+    await assert.rejects(service.gitDiff("custom-agent/private.txt"), { code: "excluded_file" });
+    // A session root registered after construction is immediately protected too.
+    await mkdir(join(f.root, "later")); await writeFile(join(f.root, "later", "history.jsonl"), "history");
+    protectedRoots.push(join(f.root, "later"));
+    await assert.rejects(service.file("later/history.jsonl"), { code: "excluded_file" });
+  } finally { await f.close(); }
+});
+
 test("file lists and previews have explicit limits without corrupting a UTF-8 boundary", async () => {
   const f = await fixture();
   try {
@@ -184,5 +215,38 @@ test("Git views disable executable filters, external diff and fsmonitor without 
     for (const marker of ["filter-marker", "process-marker", "diff-marker", "monitor-marker"])
       await assert.rejects(stat(join(f.root, marker)), { code: "ENOENT" });
     assert.deepEqual(await readFile(join(f.root, ".git", "config")), config);
+  } finally { await f.close(); }
+});
+
+test("a project that itself lives below a dot-directory keeps its files; only the protected roots are hidden", async () => {
+  const base = await mkdtemp(join(tmpdir(), "pi-pane-workspace-"));
+  try {
+    // Tool-managed checkouts live in places like ~/.codex/worktrees/<id>/<repo>.
+    const root = join(base, ".codex", "worktrees", "a1", "repo"); const agent = join(base, "agent");
+    await mkdir(join(root, "src"), { recursive: true }); await mkdir(agent);
+    await writeFile(join(root, "src", "index.ts"), "export {};\n"); await writeFile(join(root, "README.md"), "# Repo\n");
+    const service = new WorkspaceService(root, () => [agent]);
+    assert.deepEqual((await service.files()).files.map(item => item.path), ["README.md", "src/index.ts"]);
+    assert.equal((await service.file("src/index.ts")).text, "export {};\n");
+  } finally { await rm(base, { recursive: true, force: true }); }
+});
+
+test("a protected root that has been deleted stays protected under its real location, so Git cannot show what it held", async () => {
+  const f = await fixture();
+  try {
+    // The session directory is configured through a link; its real location is inside the project.
+    await mkdir(join(f.root, "real", "custom-sessions"), { recursive: true }); await symlink(join(f.root, "real"), join(f.root, "alias"));
+    const service = new WorkspaceService(f.root, () => [join(f.root, "alias", "custom-sessions")]);
+    await git(f.root, "init", "-b", "boundaries");
+    await writeFile(join(f.root, "real", "custom-sessions", "history.jsonl"), "PRIVATE HISTORY\n"); await writeFile(join(f.root, "visible.txt"), "public\n");
+    await git(f.root, "add", "real", "visible.txt"); await git(f.root, "commit", "-m", "fixture");
+    await rm(join(f.root, "real", "custom-sessions"), { recursive: true }); await rm(join(f.root, "visible.txt"));
+    assert.deepEqual((await service.gitStatus()).files.map(item => item.path).sort(), ["alias", "visible.txt"]);
+    await assert.rejects(service.gitDiff("real/custom-sessions/history.jsonl"), { code: "excluded_file" });
+    await assert.rejects(service.gitDiff("alias/custom-sessions/history.jsonl"), { code: "excluded_file" });
+    assert.match((await service.gitDiff("visible.txt")).text, /-public/);
+    // Nothing of the configured path exists any more, not even the link: the nearest real ancestor still anchors it.
+    await rm(join(f.root, "alias"));
+    await assert.rejects(service.gitDiff("alias/custom-sessions/history.jsonl"), { code: "excluded_file" });
   } finally { await f.close(); }
 });

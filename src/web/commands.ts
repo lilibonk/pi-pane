@@ -3,10 +3,10 @@ import type { WorkbenchCommand } from "../protocol/workbench.js";
 /** RPC does not parse pi's interactive builtins. Reserve them even while the catalog is unavailable. */
 const actions: Record<string, WorkbenchCommand["browserAction"]> = {
   new: "new", resume: "sessions", fork: "tree", model: "model", thinking: "thinking",
-  compact: "compact", settings: "settings", session: "status", name: "rename", clone: "clone", export: "export", copy: "copy",
+  compact: "compact", settings: "settings", session: "status", name: "rename", clone: "clone", export: "export", copy: "copy", login: "accounts", logout: "accounts",
 };
 const unsupported = ["tree", "scoped-models", "import", "share", "bug", "changelog", "hotkeys",
-  "trust", "login", "logout", "reload", "quit", "debug", "arminsayshi", "dementedelves", "web"];
+  "trust", "reload", "quit", "debug", "arminsayshi", "dementedelves", "web"];
 export function builtinCommand(name: string): WorkbenchCommand | undefined {
   const action = actions[name];
   if (action) return { name, description: "打开对应工作台入口", source: "builtin", available: true, browserAction: action };

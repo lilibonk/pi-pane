@@ -15,12 +15,22 @@ function contentText(content: unknown): string {
 }
 
 export default function boundaryHooks(pi: ExtensionAPI) {
-  // This custom provider deliberately has no configured key in the isolated environment.
+  // Normally unconfigured; the key-loss case supplies a synthetic startup key and then removes it.
   pi.registerProvider("pi-pane-m0-noauth", {
     baseUrl: "http://does-not-exist.invalid", apiKey: "$PI_M0_ABSENT_AUTH_KEY", api: "pi-pane-m0-noauth-api",
     models: [{ id: "deterministic", name: "M0 controlled missing authentication", reasoning: false, input: ["text"],
       cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 16_384, maxTokens: 2_048 }],
     streamSimple: deterministicStream,
+  });
+  pi.registerCommand("m0-withdraw-auth", {
+    description: "Boundary fixture: remove the synthetic startup key before prompt preflight.",
+    async handler(_args, ctx) {
+      delete process.env.PI_M0_ABSENT_AUTH_KEY;
+      await ctx.modelRegistry.refresh({ allowNetwork: false, providers: ["pi-pane-m0-noauth"] });
+      const model = ctx.modelRegistry.find("pi-pane-m0-noauth", "deterministic");
+      if (!model || ctx.modelRegistry.hasConfiguredAuth(model)) throw new Error("The fixture key is still configured after removal.");
+      record("boundary_auth_removed", { provider: model.provider, configured: false });
+    },
   });
   pi.on("resources_discover", () => {
     const agentDir = process.env.PI_CODING_AGENT_DIR;

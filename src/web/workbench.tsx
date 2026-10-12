@@ -6,6 +6,7 @@ import { highlight, languageForPath } from "./highlight.js";
 import { copyReply, issueCommand, openSettings, queryWorkbench, setDraft, setSessionDialog, webStore, type WebState } from "./store.js";
 import { LIMITS } from "../protocol/index.js";
 import { ProjectSection } from "./projects.js";
+import { ThemeDecoration } from "./decorations.js";
 
 export interface QueryState<T> { value?: T; loading: boolean; error: string; reload: () => void }
 /** Cancelling the component read also removes its transport timeout and reply handler. */
@@ -128,11 +129,11 @@ function FileCode({ value }: { value: WorkspaceFileView }) {
   return html ? <div class="file-code" dangerouslySetInnerHTML={{ __html: html }} /> : <pre class="file-code">{value.text}</pre>;
 }
 
-export function Workbench({ state, canConfigure, commands, controller, onFocusComposer, children }: {
-  state: WebState; canConfigure: boolean; commands: WorkbenchCommand[]; controller: RefObject<WorkbenchController | undefined>; onFocusComposer: () => void; children: ComponentChildren;
+export function Workbench({ state, canConfigure, commands, controller, onFocusComposer, children, empty, connectionIndicator }: {
+  state: WebState; canConfigure: boolean; commands: WorkbenchCommand[]; controller: RefObject<WorkbenchController | undefined>; onFocusComposer: () => void; children: ComponentChildren; empty?: boolean; connectionIndicator?: ComponentChildren;
 }) {
   const [leftOpen, setLeftOpen] = useState(false);
-  const [rightOpen, setRightOpen] = useState(() => !matchMedia("(max-width: 1100px)").matches);
+  const [rightOpen, setRightOpen] = useState(false);
   const [leftMode, setLeftMode] = useState<"sessions" | "tree">("sessions");
   const [sessionSearch, setSessionSearch] = useState("");
   const [tab, setTab] = useState<"changes" | "files" | "resources">("changes");
@@ -152,6 +153,8 @@ export function Workbench({ state, canConfigure, commands, controller, onFocusCo
   const narrow = useMediaQuery("(max-width: 760px)");
   const overlayInspector = useMediaQuery("(max-width: 1100px)");
   const modal = narrow && leftOpen ? "left" : overlayInspector && rightOpen ? "right" : null;
+  const dialogOpen = !!(state.dialogs.length || state.projectDialog || state.settings || state.sessionDialog ||
+    (state.account?.owner && state.account.id !== state.accountDismissed));
   const online = state.connection === "online" && !!state.snapshot?.caps.workbench;
   const settledSessionSearch = useDebounced(sessionSearch);
   const settledFileSearch = useDebounced(fileSearch);
@@ -187,23 +190,23 @@ export function Workbench({ state, canConfigure, commands, controller, onFocusCo
     return depths;
   }, [tree.value]);
   useEffect(() => { setSelectedPath(""); setReferenceMode(false); setRenaming(false); setRotateConfirm(false); }, [state.snapshot?.epoch]);
-  useEffect(() => {
+  useLayoutEffect(() => {
     const escape = (event: KeyboardEvent) => {
-      if (event.key !== "Escape" || !modal || state.dialogs.length) return;
+      if (event.key !== "Escape" || event.defaultPrevented || !modal || dialogOpen) return;
+      // A dialog owns Escape as soon as it is mounted, including before deferred effects run.
+      if (workbenchRef.current?.parentElement?.querySelector(":scope > .dialog-backdrop")) return;
+      if (workbenchRef.current?.querySelector(".session-menu[open], .project-add-menu[open]")) return;
       event.preventDefault();
       if (modal === "left") { setLeftOpen(false); requestAnimationFrame(() => toggleLeft.current?.focus()); }
       else { setRightOpen(false); requestAnimationFrame(() => toggleRight.current?.focus()); }
     };
     document.addEventListener("keydown", escape);
     return () => document.removeEventListener("keydown", escape);
-  }, [modal, state.dialogs.length]);
+  }, [modal, dialogOpen]);
   useLayoutEffect(() => {
     const panel = modal === "left" ? leftRef.current : modal === "right" ? rightRef.current : null;
-    if (!panel || state.dialogs.length) return;
-    const topbar = workbenchRef.current?.parentElement?.querySelector<HTMLElement>(":scope > .topbar");
-    const previousInert = topbar?.inert;
-    if (topbar) topbar.inert = true;
-    const focusable = () => [...panel.querySelectorAll<HTMLElement>('button:not(:disabled), input:not(:disabled), select:not(:disabled), textarea:not(:disabled), a[href], summary, [tabindex="0"]')].filter(element => element.getClientRects().length && !element.closest("[inert]"));
+    if (!panel || dialogOpen) return;
+    const focusable = () => [...panel.querySelectorAll<HTMLElement>('button:not(:disabled), input:not(:disabled), select:not(:disabled), textarea:not(:disabled), a[href], summary, [tabindex="0"]')].filter(element => element.getClientRects().length && !element.closest('[inert], details:not([open]) > :not(summary)'));
     const firstInput = panel.querySelector<HTMLInputElement>("input:not(:disabled)");
     if (!panel.contains(document.activeElement)) (firstInput || focusable()[0])?.focus();
     const trap = (event: KeyboardEvent) => {
@@ -216,13 +219,16 @@ export function Workbench({ state, canConfigure, commands, controller, onFocusCo
       else if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first.focus(); }
     };
     document.addEventListener("keydown", trap);
-    return () => { document.removeEventListener("keydown", trap); if (topbar) topbar.inert = previousInert ?? false; };
-  }, [modal, state.dialogs.length]);
+    return () => document.removeEventListener("keydown", trap);
+  }, [modal, dialogOpen]);
   useEffect(() => {
     if (!leftOpen) return;
     const element = leftRef.current?.querySelector<HTMLInputElement>("input");
     element?.focus();
   }, [leftOpen]);
+  useLayoutEffect(() => {
+    if (renaming) leftRef.current?.querySelector<HTMLInputElement>('.rename-session input')?.focus();
+  }, [renaming]);
   function focusComposer() { requestAnimationFrame(onFocusComposer); }
   function focusInspector() { requestAnimationFrame(() => rightRef.current?.querySelector<HTMLElement>('input:not(:disabled), button:not(:disabled)')?.focus()); }
   function showFiles(reference = false, query = "") { setTab("files"); setLeftOpen(false); setRightOpen(true); setReferenceMode(reference); setFileSearch(query); setSelectedPath(""); }
@@ -292,16 +298,27 @@ export function Workbench({ state, canConfigure, commands, controller, onFocusCo
     const first = !shownProject.current; shownProject.current = currentCwd;
     if (!first && matchMedia("(max-width: 760px)").matches) { setLeftOpen(false); focusComposer(); }
   }, [currentCwd]);
+  useEffect(() => {
+    const closeMenu = (event: MouseEvent | KeyboardEvent) => {
+      for (const menu of workbenchRef.current?.querySelectorAll<HTMLDetailsElement>(".session-menu[open], .project-add-menu[open]") ?? []) {
+        if (event instanceof KeyboardEvent) { if (event.key === "Escape") { event.preventDefault(); menu.open = false; menu.querySelector<HTMLElement>("summary")?.focus(); } }
+        else if (!menu.contains(event.target as Node)) menu.open = false;
+        else if ((event.target as Element).closest("button")) { menu.open = false; menu.querySelector<HTMLElement>("summary")?.focus(); }
+      }
+    };
+    document.addEventListener("click", closeMenu); document.addEventListener("keydown", closeMenu);
+    return () => { document.removeEventListener("click", closeMenu); document.removeEventListener("keydown", closeMenu); };
+  }, []);
   return <div class={`workbench ${leftOpen ? "left-open" : ""} ${rightOpen ? "right-open" : ""}`} ref={workbenchRef}>
     {modal && <button type="button" tabindex={-1} class={`drawer-backdrop ${modal === "left" ? "for-left" : "for-right"}`} aria-label="关闭侧栏" onClick={() => { setLeftOpen(false); setRightOpen(false); focusComposer(); }} />}
     <aside class="workspace-sidebar" aria-label="工作区与会话" ref={leftRef} role={modal === "left" ? "dialog" : undefined} aria-modal={modal === "left" ? true : undefined} inert={modal === "right" || (narrow && !leftOpen)} aria-hidden={modal === "right" || (narrow && !leftOpen) ? true : undefined}>
+      <div class="sidebar-brand"><div class="brand"><span class="brand-icon">π</span><span>pi-pane</span></div><ThemeDecoration slot="brand" /><button type="button" class="icon-button mobile-close" aria-label="关闭会话侧栏" onClick={() => { setLeftOpen(false); requestAnimationFrame(() => toggleLeft.current?.focus()); }}><Icon name="close" /></button></div>
+      <button type="button" class="new-session-button" disabled={!canNavigate} onClick={() => { issueCommand("session_new"); setLeftOpen(false); focusComposer(); }}><Icon name="plus" />新建会话</button>
       <ProjectSection state={state} canSwitch={canNavigate} onSwitched={() => { setLeftOpen(false); focusComposer(); }} />
-      <div class="sidebar-heading"><span>会话</span><button type="button" class="icon-button mobile-close" aria-label="关闭会话侧栏" onClick={() => { setLeftOpen(false); requestAnimationFrame(() => toggleLeft.current?.focus()); }}><Icon name="close" /></button><button type="button" class="icon-button" aria-label="刷新会话列表" disabled={!online || sessionsRead.loading} onClick={sessions.reload}><Icon name="refresh" /></button></div>
-      <button type="button" class="new-session-button" disabled={!canNavigate} onClick={() => issueCommand("session_new")}><Icon name="plus" />新建会话</button>
-      <div class="session-management"><button type="button" disabled={!canNavigate} onClick={() => { setSessionName(state.snapshot?.session.name || ""); setRenaming(value => !value); }}>重命名</button><button type="button" disabled={!canNavigate} onClick={() => issueCommand("session_clone")}>克隆会话</button></div>
+      <div class="sidebar-heading"><span>会话</span><button type="button" class="icon-button" aria-label="刷新会话列表" disabled={!online || sessionsRead.loading} onClick={sessions.reload}><Icon name="refresh" /></button><details class="session-menu"><summary aria-label="当前会话操作" title="当前会话操作">···</summary><div class="session-menu-items"><button type="button" disabled={!canNavigate} onClick={() => { setSessionName(state.snapshot?.session.name || ""); setRenaming(value => !value); }}>重命名</button><button type="button" disabled={!canNavigate} onClick={() => issueCommand("session_clone")}>克隆会话</button><button type="button" disabled={!online} onClick={() => setSessionDialog({ mode: "info" })}>会话信息</button><button type="button" disabled={!online} onClick={() => setSessionDialog({ mode: "export" })}>导出会话</button><button type="button" onClick={() => setLeftMode(leftMode === "tree" ? "sessions" : "tree")}><Icon name="branch" />{leftMode === "tree" ? "会话列表" : "分支树"}</button></div></details></div>
       {renaming && <form class="rename-session" onSubmit={event => { event.preventDefault(); if (canNavigate && sessionName.trim()) { issueCommand("session_rename", { name: sessionName.trim() }); setRenaming(false); } }}><input aria-label="会话名称" maxLength={256} value={sessionName} onInput={event => setSessionName(event.currentTarget.value)} placeholder="会话名称" /><button type="submit" disabled={!canNavigate || !sessionName.trim()}>保存</button><button type="button" class="quiet" onClick={() => setRenaming(false)}>取消</button></form>}
       <label class="panel-search"><Icon name="search" /><input type="search" aria-label="搜索会话" placeholder="搜索会话" value={sessionSearch} onInput={event => { setSessionSearch(event.currentTarget.value); setLeftMode("sessions"); }} /></label>
-      <div class="sidebar-tabs" role="group" aria-label="会话导航"><button type="button" aria-pressed={leftMode === "sessions"} onClick={() => setLeftMode("sessions")}>会话</button><button type="button" aria-pressed={leftMode === "tree"} onClick={() => setLeftMode("tree")}><Icon name="branch" />分支树</button></div>
+      {leftMode === "tree" && <button type="button" class="tree-back" onClick={() => setLeftMode("sessions")}>← 返回会话列表</button>}
       <div class="sidebar-scroll">
         {leftMode === "sessions" ? <ReadState read={sessionsRead}>
           {!catalog.length && <p class="panel-message">{sessionSearch ? "没有匹配的会话。" : "这个项目尚无会话。发送第一条消息后会出现在这里。"}</p>}
@@ -319,10 +336,10 @@ export function Workbench({ state, canConfigure, commands, controller, onFocusCo
           {tree.value?.truncated && <p class="panel-message">分支树已截断，更多内容请在终端查看。</p>}
         </ReadState>}
       </div>
-      <div class="sidebar-footer"><p>{pendingSession ? "正在处理会话或模型操作…" : !canNavigate && online ? "运行或待发消息处理完后可切换。" : "浏览器管理当前会话；终端 Ctrl+C 停止服务。"}</p><button type="button" class="settings-button" onClick={() => { setLeftOpen(false); openSettings(); }}><Icon name="settings" />设置<Icon name="arrow" /></button></div>
+      <div class="sidebar-footer"><p>{pendingSession ? "正在处理会话或模型操作…" : !canNavigate && online ? "运行或待发消息处理完后可切换。" : ""}</p><button type="button" class="settings-button" onClick={() => { setLeftOpen(false); openSettings(); }}><Icon name="settings" />设置<Icon name="arrow" /></button></div>
     </aside>
-    <main class="conversation-panel" inert={!!modal} aria-hidden={modal ? true : undefined}>
-      <div class="workbench-controls"><button type="button" class="icon-button sidebar-toggle" ref={toggleLeft} aria-label="打开工作区与会话" aria-expanded={leftOpen} onClick={() => { setLeftOpen(!leftOpen); if (!leftOpen && matchMedia("(max-width: 1100px)").matches) setRightOpen(false); }}><Icon name="menu" /></button><span title={currentCwd}>{workspaceName(currentCwd)}</span><button type="button" class="inspect-toggle" ref={toggleRight} aria-expanded={rightOpen} onClick={() => { setRightOpen(!rightOpen); setLeftOpen(false); }}><Icon name="panel" />{rightOpen ? "收起面板" : "文件与改动"}</button></div>
+    <main class={`conversation-panel ${empty ? "is-empty" : ""}`} inert={!!modal} aria-hidden={modal ? true : undefined}>
+      <div class="workbench-controls"><button type="button" class="icon-button sidebar-toggle" ref={toggleLeft} aria-label="打开工作区与会话" aria-expanded={leftOpen} onClick={() => { setLeftOpen(!leftOpen); if (!leftOpen && matchMedia("(max-width: 1100px)").matches) setRightOpen(false); }}><Icon name="menu" /></button><span class="workbench-project" title={currentCwd}>{workspaceName(currentCwd)}</span>{connectionIndicator}<button type="button" class="inspect-toggle" ref={toggleRight} aria-label={rightOpen ? "收起面板" : "文件与改动"} aria-expanded={rightOpen} onClick={() => { setRightOpen(!rightOpen); setLeftOpen(false); }}><Icon name="panel" />{rightOpen ? "收起面板" : "文件与改动"}</button></div>
       {children}
     </main>
     <aside class="workspace-inspector" aria-label="文件、改动与资源" ref={rightRef} role={modal === "right" ? "dialog" : undefined} aria-modal={modal === "right" ? true : undefined} inert={modal === "left" || !rightOpen} aria-hidden={modal === "left" || !rightOpen ? true : undefined}>

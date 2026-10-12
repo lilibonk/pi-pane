@@ -23,7 +23,9 @@ class FakeChild implements RpcConnection {
   responses: { id: string; response: Record<string, unknown> }[] = [];
   onUiResponse?: (id: string, response: Record<string, unknown>) => void;
   manager: SessionManager; entries: Record<string, unknown>[];
-  model = { provider: "local", id: "fixture", name: "Fixture" }; level = "off";
+  model: { provider: string; id: string; name: string } | undefined = { provider: "local", id: "fixture", name: "Fixture" }; level = "off";
+  /** What a reopened session ends up with when its own model is gone: another model, or `null` for none. Unset keeps the model. */
+  modelAfterReload?: { provider: string; id: string; name: string } | null;
   /** Like pi: queue modes live in the session, and the RPC setters also save the global default. */
   modes = { steeringMode: "one-at-a-time", followUpMode: "one-at-a-time", autoCompactionEnabled: true };
   saveSettings = true;
@@ -65,12 +67,13 @@ class FakeChild implements RpcConnection {
       const since = entries.findIndex(entry => entry.id === payload.since);
       if (payload.since && since < 0) throw new Error(`Entry ${String(payload.since)} not found`);
       value = { entries: structuredClone(payload.since ? entries.slice(since + 1) : entries), leafId: entries.at(-1)?.id ?? null };
-    } else if (type === "get_available_models") value = { models: [this.model, ...this.loaded.map(provider => ({ provider, id: `${provider}-model`, name: provider }))] };
+    } else if (type === "get_available_models") value = { models: [...(this.model && this.model.provider !== "unknown" ? [this.model] : []), ...this.loaded.map(provider => ({ provider, id: `${provider}-model`, name: provider }))] };
     else if (type === "get_available_thinking_levels") value = { levels: ["off", "low", "high"] };
     else if (type === "get_commands") value = { commands: this.commands };
     else if (["new_session", "switch_session", "fork", "clone"].includes(type)) {
       if (this.cancelNext) { this.cancelNext = false; return { cancelled: true } as T; }
       this.loaded = this.credentials?.() ?? [];
+      if (type === "switch_session" && this.modelAfterReload !== undefined) { this.model = this.modelAfterReload ?? undefined; this.modelAfterReload = undefined; }
       if (type === "switch_session") this.manager = SessionManager.open(String(payload.sessionPath));
       else {
         const next = SessionManager.create(this.manager.getCwd(), join(this.root, "custom"));
@@ -716,12 +719,26 @@ const themeFile = async (name: string, accent: string, appearance: "light" | "da
   return JSON.stringify({ ...base, name, appearance, colors: { ...base.colors, accent } });
 };
 const globalSettings = async (root: string) => JSON.parse(await readFile(join(root, "agent", "settings.json"), "utf8").catch(() => "{}"));
+test("theme queries and follow-pi snapshots carry validated artwork only for the bundled source", async () => withHost(async (host, _child, { root, bridges }) => {
+  const theme = await host.hostQuery("theme", { name: "pi-pane-porcelain" });
+  assert.equal(theme.decorations?.id, "pi-pane-porcelain");
+  assert.doesNotMatch(JSON.stringify(theme.decorations), /\/Users\/|\.svg|url\(|https?:/);
+  await mkdir(join(root, "agent", "themes"), { recursive: true });
+  await writeFile(join(root, "agent", "settings.json"), JSON.stringify({ theme: "pi-pane-porcelain" }));
+  await host.hostQuery("themes");
+  assert.deepEqual(bridges.at(-1)!.snapshot().decorations, theme.decorations);
+  await writeFile(join(root, "agent", "themes", "porcelain.json"), await themeFile("pi-pane-porcelain", "#112233", "light"));
+  await host.hostQuery("themes");
+  const shadow = await host.hostQuery("theme", { name: "pi-pane-porcelain" });
+  assert.equal(shadow.vars["--accent"], "#112233"); assert.equal(shadow.decorations, undefined);
+  assert.equal(bridges.at(-1)!.snapshot().decorations, undefined);
+}));
 test("follow pi is the theme pi would use in the current project; saving pi's default changes it for every viewer", async () => withHost(async (host, _child, { root, bridges }) => {
   await mkdir(join(root, "agent", "themes"), { recursive: true }); await writeFile(join(root, "agent", "themes", "mine.json"), await themeFile("mine", "#123456"));
   let themes = await host.hostQuery("themes");
   // Nothing is configured: pi's default is its terminal theme, which only the handoff captured.
   assert.deepEqual(themes.pi, { source: "default", name: "system", appearance: "dark", origin: "handoff", reason: "system" });
-  assert.deepEqual(themes.themes.map(item => [item.name, item.source, item.global]), [["pi-pane-dark", "pi-pane", false], ["pi-pane-light", "pi-pane", false], ["mine", "user", true]]);
+  assert.deepEqual(themes.themes.map(item => [item.name, item.source, item.global]), [["pi-pane-dark", "pi-pane", false], ["pi-pane-light", "pi-pane", false], ["pi-pane-porcelain", "pi-pane", false], ["mine", "user", true]]);
   assert.equal(themes.projectThemes, "none"); assert.deepEqual(themes.problems, []);
   const mine = await host.hostQuery("theme", { name: "mine" }); assert.equal(mine.vars["--accent"], "#123456"); assert.equal(mine.appearance, "dark");
   await assert.rejects(host.hostQuery("theme", { name: "gone" }), { code: "theme_missing" });
@@ -863,6 +880,20 @@ test("a provider saved while pi is replying waits to be applied; removing one al
   assert.deepEqual((await host.hostQuery("providers")).providers, []); assert.equal((await host.hostQuery("accounts")).providers.some(provider => provider.id === "mine"), false);
   await assert.rejects(host.hostCommand("account_begin", { provider: "mine", method: "api_key" }, 0, "lease-1"), { code: "unknown_provider" });
 }));
+// pi 1.1.0 reports a placeholder model (unknown/unknown) and no available model; a runtime reporting no model at all is the same situation.
+for (const [label, after] of [["a placeholder", { provider: "unknown", id: "unknown", name: "unknown" }], ["no model", null]] as const)
+  test(`removing the provider in use when no other model is available says so (${label}), instead of naming a model that cannot be used`, async () => withHost(async (host, child, { notices }) => {
+    let view = await host.hostQuery("providers");
+    await host.hostCommand("provider_save", providerArgs({ revision: view.revision }));
+    await signIn(host, "lease-1", "mine", "sk-mine"); await waitFor(async () => (await host.hostQuery("providers")).providers[0]?.available === 1, "available");
+    child.model = { provider: "mine", id: "mine-model", name: "mine" };
+    view = await host.hostQuery("providers"); assert.equal(view.providers[0]!.inUse, true);
+    child.modelAfterReload = after;
+    await host.hostCommand("provider_remove", { id: "mine", revision: view.revision });
+    await waitFor(async () => !(await host.hostQuery("providers")).pendingApply, "removal applied");
+    const told = notices.map(record => record as { t?: string; message?: string }).filter(record => record.t === "notice" && record.message?.includes("mine/mine-model"));
+    assert.equal(told.length, 1, "the page is told once"); assert.match(told[0]!.message!, /没有可用的模型/); assert.doesNotMatch(told[0]!.message!, /unknown/);
+  }));
 test("an entry named like one of pi's providers is shown as changing that provider and cannot be edited; a broken file blocks every change", async () => withHost(async (host, _child, { root }) => {
   await writeFile(modelsFile(root), JSON.stringify({ providers: { acme: { baseUrl: "https://gateway.example/v1", api: "openai-completions", apiKey: "!op read key", models: [{ id: "extra" }] } } }));
   let view = await host.hostQuery("providers");

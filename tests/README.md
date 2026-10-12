@@ -1,5 +1,33 @@
 # Verification
 
+## M3.1 candidate verification
+
+The local `0.3.0-rc.3` candidate adds project/account/settings/provider integration and the M31-D interface. Its current results and remaining release gates are recorded in [M3.1 status](../docs/m3.1-status.md); the 0.2.0 evidence below remains historical. The supported web login is API key; device OAuth is disabled and is not counted as a successful login trial.
+
+After the last source or harness change, build and freeze the archive before running the complete serial matrix:
+
+```sh
+npm run typecheck
+npm test
+npm run build
+node scripts/m31-regression.mjs --list
+node scripts/m31-regression.mjs --run --output build-artifacts/releases/0.3.0-rc.3/regression --tarball /absolute/candidate.tgz
+PI_M31_INSTALL=1 PI_M2_CANDIDATE_TARBALL=/absolute/candidate.tgz PI_M2_REPORT_DIR=build-artifacts/releases/0.3.0-rc.3/install npm run m2:install
+```
+
+The runner executes 24 suites serially, creates isolated HOME/agent/TMPDIR environments, hashes source, build and harnesses before and after each suite, retains per-suite logs/reports and cleanup evidence, and refuses to reuse a nonempty evidence directory. `--suite <name>` runs a diagnostic subset and cannot claim a full-matrix pass. The final performance suite uses three observations per configuration; its RPC writer metrics do not isolate total application overhead. Real provider calls, real OAuth, publication and daily installation are separate gates.
+
+| Added harness | What it verifies |
+|---|---|
+| `m31:integration` | Desktop 1280×720 and mobile 390×844: fresh HOME, create B from A, local custom provider, cancel/retry synthetic key, porcelain, a real public extension tool writing only B, slash routes, A draft and B session restoration; actual screenshots |
+| `m31:concurrency` | Actual browser pages competing for project/settings changes; account step ownership, cross-page cancellation, saved credentials during another page's reply, and explicit retry after an extension veto |
+| `m31:compat` | Frozen 0.2.0 → candidate → frozen 0.2.0 with native history/auth/settings; real old browser refresh notice; same-session model preservation across account/settings application and recovery |
+| `m31:resilience` | Three signals at three replacement stages, host SIGKILL while real pi runs a shell command, with and without an extension shutdown hook (neither writer nor command survives), ten A/B round trips with twenty lease reconnects, ordinary TUI/external file conflicts, saved account veto/retry, credential roots/aliases and HOME filtering |
+| `PI_M31_EXTERNAL=1 npm run m2:external` | Existing TLS/Origin/password/rotation baseline plus mobile host-directory creation and same-owner API-key continuation after reload |
+| `PI_M31_INSTALL=1 npm run m2:install` | Exact archive file hashes after clean installation, bundled modules/themes/decorations/migration, existing install baseline, then the complete desktop/mobile integration harness loading the installed extension and web assets |
+
+The integration model is a loopback OpenAI-compatible stand-in that asks pi to execute a real fixture tool. This verifies the tool workflow without invoking a remote provider. The package-install gate supplies the installed extension path and archive SHA to that same harness; it does not load the repository extension. The local registry proxies runtime dependency downloads to public npm, but does not publish this package.
+
 The published **0.2.0 foreground handoff** archive corresponds to source `439c545`, based on `d5cd02d` plus the release-review fixes, on pi/pi-ai 1.1.0. Public version metadata and the downloaded archive match the frozen candidate, and the separate public-registry installation passed 5/5. All current end-to-end fixtures follow **real TUI → `/web` → foreground Hub + one public RPC child → browser/WebSocket operations**. There is no parallel TUI writer, private RPC extension channel, internal command gateway, or mirror mode.
 
 The published 0.1.0 M0–M2 reports and the saved M3 workbench commit `6196c7b` remain historical evidence. Their old passing counts do not verify this backend. Current execution results, unresolved failures and cleanup are recorded in [M3 status](../docs/m3-status.md); script reports default to `build-artifacts/m3/handoff/`, while this frozen candidate is verified separately under `build-artifacts/releases/0.2.0/`.
@@ -68,6 +96,8 @@ npm run m31:ui
 | `m31:settings` | M3.1 themes and settings with a real TUI and real RPC children, offline: theme sources and diagnostics without host paths, what "follow pi" shows and why, saving pi's default theme (fixed and light/dark pair) read back by pi's own settings, queue modes / auto-compaction / auto-retry through pi's RPC with disk confirmation, a default saved while pi replies and applied later by reloading the session in the same child (`images.blockImages` observed at the provider), default model without touching the running session, stale and concurrent saves from two pages, external edits kept, broken and read-only global file never overwritten, unknown settings refused by the protocol, no secret or command in any frame, untrusted and trusted project themes and settings, fallback when the default theme disappears |
 | `m31:providers` | M3.1 custom providers and session extras with a real TUI and real RPC children; a loopback stand-in for an OpenAI-compatible endpoint answers the model requests and a stand-in `trash` keeps deleted files inside the fixture: provider written alone and without a key, key set through pi's login and sent literally (`!touch … $HOME` reaches the endpoint as typed, nothing runs), a reply from the custom model without a restart, form-external fields kept and still sent, key kinds reported without values, stale and broken `models.json`, reserved names and field errors, save while busy, removal with its stored key and a model-change notice; session numbers per turn, reply text, export into pi-pane's directory with chunked read-back, delete to trash / locked / current / unlisted / permanent fallback, `/export` `/copy` `/session` never reaching the model |
 | `m31:ui` | The M3.1 pages in system Chrome (headless) against a real TUI: provider form field errors and save, key typed into pi's login dialog, a reply from the custom model, context meter and `/session`, copy to clipboard and the refused-clipboard fallback, export confirmation and download compared byte for byte, deleting a session from the list, and the provider list and form at 390 px (no overflow, 40 px targets). Screenshots under `build-artifacts/m3.1/ui/` |
+| `m31:design` | M31-D actual UI at 1280×720 and 390×844: bundled light/dark/porcelain and pi light/dark, system appearance, conversation/Markdown/code/tools/Git, project and provider form/error states, keyboard focus, theme preview/cancel, decoration persistence/contrast modes. Uses a temporary HOME and local deterministic provider; report and screenshots in `build-artifacts/m3.1/design/`. Build first. No real model calls or credentials |
+| `m31:theme-tui` | Saves porcelain through the host settings API, restarts a real pi TUI using the same isolated configuration, verifies the complete palette and actual ANSI accent, and confirms decoration metadata is not part of the TUI theme. Zero model requests; report in `build-artifacts/m3.1/theme-tui/` |
 
 Script definitions are not passing results. The frozen release candidate passed typecheck, build and **136/136 unit tests**, with logs and `build-checks.json` under `build-artifacts/releases/0.2.0/`. The sequential deterministic run has **121/121 checks across 13 report suites** in `regression/summary.json`, including `PI_M3_LONG=1` handoff **15/15**, performance **3/3** and theme **2/2**. The exact candidate archive installation passed another **4/4** in `install/report.json`, making **125/125 across 14 suites**. Source and built-asset hashes were unchanged during the matrix; the runner temporary HOME and 25 referenced fixture roots were removed. The independently recorded daily-package discovery check is additional and does not change this total.
 

@@ -31,11 +31,13 @@ export function explain(error: unknown): string {
 export interface HostQueryState<T> { value?: T; loading: boolean; error: string; reload: () => void }
 /** A host read that follows the host's own revision, not the session: it works while no session is running. */
 export function useHostQuery<A extends HostQueryAction>(state: WebState, action: A, args: Record<string, unknown> = {}, enabled = true): HostQueryState<HostQueryValues[A]> {
-  const [value, setValue] = useState<HostQueryValues[A] | undefined>();
+  const [result, setResult] = useState<{ key: string; value: HostQueryValues[A] } | undefined>();
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
   const [revision, refresh] = useState(0);
   const argKey = JSON.stringify(args);
+  const queryKey = `${action}:${argKey}`;
+  const value = result?.key === queryKey ? result.value : undefined;
   const ready = enabled && !!state.clientId && state.connection !== "disconnected" && state.connection !== "fatal" && state.connection !== "login" && state.connection !== "connecting";
   useEffect(() => {
     setError("");
@@ -43,9 +45,9 @@ export function useHostQuery<A extends HostQueryAction>(state: WebState, action:
     const abort = new AbortController();
     setLoading(true);
     void queryHost(action, JSON.parse(argKey), abort.signal).then(result => {
-      if (!abort.signal.aborted) { setValue(result); setLoading(false); }
+      if (!abort.signal.aborted) { setResult({ key: queryKey, value: result }); setLoading(false); }
     }, failure => {
-      if (!abort.signal.aborted) { setValue(undefined); setError(explain(failure)); setLoading(false); }
+      if (!abort.signal.aborted) { setResult(undefined); setError(explain(failure)); setLoading(false); }
     });
     return () => abort.abort();
   }, [ready, action, argKey, state.clientId, state.host?.revision, revision]);
@@ -80,6 +82,7 @@ export function ProjectSection({ state, canSwitch, onSwitched }: { state: WebSta
   const projects = useHostQuery(state, "projects");
   const [error, setError] = useState("");
   const [confirming, setConfirming] = useState("");
+  const [managing, setManaging] = useState(false);
   const busy = !!state.hostAction;
   useEffect(() => { setError(""); setConfirming(""); }, [state.host?.revision]);
   const open = (project: ProjectItem) => {
@@ -90,19 +93,22 @@ export function ProjectSection({ state, canSwitch, onSwitched }: { state: WebSta
   const remove = (project: ProjectItem) => { setError(""); setConfirming(""); runHostCommand("project_remove", { path: project.path }).catch(failure => setError(explain(failure))); };
   const view = projects.value;
   const trust = view && trustLines(view.current.trust);
-  return <section class="project-section" aria-label="项目">
+  return <section class={`project-section ${managing ? "is-managing" : ""}`} aria-label="项目">
     <div class="sidebar-heading"><span>项目</span>
-      <button type="button" class="project-action" disabled={!canSwitch || busy} onClick={() => setProjectDialog({ mode: "open" })}>打开</button>
-      <button type="button" class="project-action" disabled={!canSwitch || busy} onClick={() => setProjectDialog({ mode: "create" })}>新建</button>
+      <button type="button" class="project-action quiet" aria-pressed={managing} onClick={() => { setManaging(!managing); setConfirming(""); }}>{managing ? "完成" : "管理"}</button>
+      <details class="project-add-menu"><summary aria-label="添加项目" title="打开或新建项目">＋</summary><div class="project-add-options">
+        <button type="button" disabled={!canSwitch || busy} onClick={event => { const menu = event.currentTarget.closest("details"); menu?.querySelector<HTMLElement>(":scope > summary")?.focus(); menu?.removeAttribute("open"); setProjectDialog({ mode: "open" }); }}>打开项目</button>
+        <button type="button" disabled={!canSwitch || busy} onClick={event => { const menu = event.currentTarget.closest("details"); menu?.querySelector<HTMLElement>(":scope > summary")?.focus(); menu?.removeAttribute("open"); setProjectDialog({ mode: "create" }); }}>新建项目</button>
+      </div></details>
     </div>
     {projects.error && !view && <div class="panel-message panel-error" role="alert"><p>{projects.error}</p><button type="button" onClick={projects.reload}>重新加载</button></div>}
     {!view && projects.loading && <p class="panel-message" role="status">正在加载项目…</p>}
     {view && <ul class="project-list">{view.projects.map(project => <li key={project.path} class={`project-row ${project.current ? "is-current" : ""} ${project.available ? "" : "is-missing"}`}>
       <button type="button" class="project-item" aria-current={project.current ? "true" : undefined} title={project.path} disabled={project.current ? false : !canSwitch || busy || !project.available} onClick={() => open(project)}>
-        <span class="project-name">{project.name}</span>
-        <span class="project-meta">{!project.available ? "文件夹不可用" : project.current ? "当前项目" : project.sessions ? `${project.sessions} 个会话` : "尚无会话"}</span>
+        <span class="project-symbol" aria-hidden="true"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M3 7a2 2 0 0 1 2-2h5l2 2h7a2 2 0 0 1 2 2v10H3Z" /></svg></span>
+        <span class="project-label"><span class="project-name">{project.name}</span><span class="project-meta">{!project.available ? "文件夹不可用" : project.current ? "当前项目" : project.sessions ? `${project.sessions} 个会话` : "尚无会话"}</span></span>
       </button>
-      {!project.current && (confirming === project.path
+      {!project.current && (managing || !project.available) && (confirming === project.path
         ? <span class="project-confirm" role="group" aria-label={`确认从列表移除 ${project.name}`}><button type="button" disabled={busy} onClick={() => remove(project)}>移除</button><button type="button" class="quiet" onClick={() => setConfirming("")}>取消</button></span>
         : <span class="project-tools">
           {!project.available && project.source !== "history" && <button type="button" class="quiet" disabled={busy} onClick={() => setProjectDialog({ mode: "relocate", from: project.path })}>重新定位</button>}
@@ -114,10 +120,21 @@ export function ProjectSection({ state, canSwitch, onSwitched }: { state: WebSta
     {view?.historyIncomplete && <p class="project-note">历史会话没有在限定时间内读完，列表可能不完整。</p>}
     {view?.registryError && <p class="project-note project-warning" role="alert">项目列表文件无法使用，已保持原样未作修改；打开和移除的记录暂时不会保存。<span>{view.registryError}</span></p>}
     {error && <p class="project-note project-warning" role="alert">{error}</p>}
-    {trust && <div class="project-trust"><p>{trust.choice}</p>{trust.loaded && <p>{trust.loaded}</p>}
-      {trust.action && <button type="button" class="quiet" disabled={!canSwitch || busy} onClick={() => { setError(""); queryHost("project_inspect", { path: view!.current.path }).then(project => setProjectDialog({ mode: "trust", project }), failure => setError(explain(failure))); }}>{trust.action}</button>}</div>}
-    {view && <p class="project-note">工具和命令使用启动 /web 的那个终端的环境变量。</p>}
+    {view && <details class="project-context"><summary>{trust?.action ? "项目配置未加载" : "项目配置与环境"}</summary>
+      {trust && <div class="project-trust"><p>{trust.choice}</p>{trust.loaded && <p>{trust.loaded}</p>}
+        {trust.action && <button type="button" class="quiet" disabled={!canSwitch || busy} onClick={() => { setError(""); queryHost("project_inspect", { path: view.current.path }).then(project => setProjectDialog({ mode: "trust", project }), failure => setError(explain(failure))); }}>{trust.action}</button>}</div>}
+      <p class="project-note">工具和命令使用启动 /web 的那个终端的环境变量。</p>
+    </details>}
   </section>;
+}
+
+/** Closed details can retain child rectangles in Chromium even though those children cannot focus. */
+function visibleControl(element: HTMLElement): boolean {
+  if (!element.getClientRects().length || element.closest("[inert]") || getComputedStyle(element).visibility === "hidden") return false;
+  for (let parent = element.parentElement; parent; parent = parent.parentElement) {
+    if (parent.tagName === "DETAILS" && !parent.hasAttribute("open") && !parent.querySelector(":scope > summary")?.contains(element)) return false;
+  }
+  return true;
 }
 
 /** A modal that owns focus while open and gives it back afterwards. Rendered as a child of the app shell. */
@@ -132,7 +149,7 @@ export function Modal({ titleId, onClose, wide, children }: { titleId: string; o
     const background = [...(shell?.children ?? [])].filter(child => child !== element.parentElement) as HTMLElement[];
     const inertStates = background.map(child => child.inert);
     for (const child of background) child.inert = true;
-    const controls = () => [...element.querySelectorAll<HTMLElement>('button:not(:disabled), input:not(:disabled), select:not(:disabled), textarea:not(:disabled), a[href]')].filter(control => control.getClientRects().length);
+    const controls = () => [...element.querySelectorAll<HTMLElement>('button:not(:disabled), input:not(:disabled), select:not(:disabled), textarea:not(:disabled), a[href], summary')].filter(visibleControl);
     (element.querySelector<HTMLElement>("[data-autofocus]") || controls()[0] || element).focus();
     const keys = (event: KeyboardEvent) => {
       if (event.key === "Escape") { event.preventDefault(); close.current(); return; }
@@ -145,7 +162,14 @@ export function Modal({ titleId, onClose, wide, children }: { titleId: string; o
     return () => {
       document.removeEventListener("keydown", keys);
       background.forEach((child, index) => { child.inert = inertStates[index]!; });
-      if (previous?.isConnected && !previous.closest("[inert]")) previous.focus();
+      let target = previous;
+      for (let parent = previous?.parentElement; parent; parent = parent.parentElement) {
+        if (parent.tagName === "DETAILS" && !parent.hasAttribute("open")) {
+          const summary = parent.querySelector<HTMLElement>(":scope > summary");
+          if (summary && !summary.contains(target)) target = summary;
+        }
+      }
+      if (target?.isConnected && visibleControl(target)) target.focus();
     };
   }, []);
   return <div class="dialog-backdrop"><div class={`dialog ${wide ? "project-dialog" : ""}`} ref={panel} role="dialog" aria-modal="true" aria-labelledby={titleId} tabindex={-1}>{children}</div></div>;
@@ -154,6 +178,8 @@ export function Modal({ titleId, onClose, wide, children }: { titleId: string; o
 function DirectoryPicker({ state, dialog }: { state: WebState; dialog: { mode: "open" | "create" } | { mode: "relocate"; from: string } }) {
   const [path, setPath] = useState<string | undefined>();
   const [input, setInput] = useState("");
+  const editedInput = useRef(false);
+  const pathInput = useRef<HTMLInputElement>(null);
   const [name, setName] = useState("");
   const [showHidden, setShowHidden] = useState(false);
   const [error, setError] = useState("");
@@ -161,8 +187,8 @@ function DirectoryPicker({ state, dialog }: { state: WebState; dialog: { mode: "
   const [working, setWorking] = useState(false);
   const listing = useHostQuery(state, "directories", path ? { path } : {});
   const current = listing.value;
-  useEffect(() => { if (current) setInput(current.path); }, [current?.path]);
-  const go = (target: string) => { setError(""); setExisting(""); setPath(target.trim()); if (target.trim() === path) listing.reload(); };
+  useEffect(() => { if (current && !editedInput.current) setInput(current.path); }, [current?.path]);
+  const go = (target: string) => { editedInput.current = false; setError(""); setExisting(""); setPath(target.trim()); if (target.trim() === path) listing.reload(); };
   const fail = (failure: unknown) => {
     setWorking(false);
     // The recovery page takes over; a dialog on top of it would hide the choices.
@@ -184,8 +210,8 @@ function DirectoryPicker({ state, dialog }: { state: WebState; dialog: { mode: "
   return <Modal titleId="project-dialog-title" wide onClose={() => setProjectDialog(null)}>
     <h2 id="project-dialog-title">{title}</h2>
     <p>{dialog.mode === "relocate" ? `为 ${dialog.from} 选择它现在所在的文件夹。` : dialog.mode === "create" ? "选择上级文件夹，再填写新文件夹的名字。" : "选择一个已有的文件夹。"}这里列出的是运行 pi 的那台电脑上的文件夹，不是这台设备上的文件。</p>
-    <form class="path-row" onSubmit={event => { event.preventDefault(); go(input); }}>
-      <input type="text" aria-label="文件夹的绝对路径" autocapitalize="off" autocorrect="off" spellcheck={false} maxLength={4096} value={input} onInput={event => setInput(event.currentTarget.value)} placeholder="/path/to/folder" />
+    <form class="path-row" onSubmit={event => { event.preventDefault(); go(pathInput.current?.value ?? input); }}>
+      <input ref={pathInput} type="text" aria-label="文件夹的绝对路径" autocapitalize="off" autocorrect="off" spellcheck={false} maxLength={4096} value={input} onInput={event => { editedInput.current = true; setInput(event.currentTarget.value); }} placeholder="/path/to/folder" />
       <button type="submit" disabled={!input.trim()}>前往</button>
     </form>
     <div class="path-shortcuts">

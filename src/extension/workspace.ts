@@ -3,6 +3,7 @@ import { constants } from "node:fs";
 import { open, opendir, realpath, stat } from "node:fs/promises";
 import { basename, dirname, extname, isAbsolute, relative, resolve, sep, win32 } from "node:path";
 import { ProtocolError } from "../protocol/index.js";
+import { canonicalDirectories, insideAny } from "./project-root.js";
 
 const FILE_LIMIT = 500;
 const SCAN_LIMIT = 10_000;
@@ -66,14 +67,22 @@ function isCode(error: unknown, code: string): boolean { return (error as NodeJS
 /** Read-only files and Git views. Every request stays inside the active workspace. */
 export class WorkspaceService {
   private readonly cwd: string;
-  constructor(cwd: string) { this.cwd = resolve(cwd); }
+  constructor(cwd: string, private readonly protectedDirectories: () => readonly string[] = () => []) { this.cwd = resolve(cwd); }
+
+  /**
+   * The agent and session directories as real paths, read once per request: a directory registered
+   * later is protected from the next request on. Only these are judged by absolute path. Names such as
+   * `.ssh` are judged relative to the project, so a project that itself lives below a dot-directory
+   * (a tool-managed checkout, say) keeps its files.
+   */
+  private protectedRoots(): Promise<string[]> { return canonicalDirectories(this.protectedDirectories()); }
 
   private async root(): Promise<string> {
     try { return await realpath(this.cwd); }
     catch { throw new ProtocolError("workspace_unavailable", "The workspace directory is unavailable."); }
   }
 
-  private async checkedPath(path: string, allowMissing = false): Promise<{ root: string; target: string }> {
+  private async checkedPath(path: string, allowMissing = false, protectedRoots?: readonly string[]): Promise<{ root: string; target: string }> {
     validPath(path);
     const root = await this.root();
     const lexical = resolve(root, path);
@@ -96,13 +105,15 @@ export class WorkspaceService {
       }
     }
     if (!inside(root, target)) throw new ProtocolError("outside_workspace", "The file is outside the workspace.");
-    if (excluded(relative(root, target))) throw new ProtocolError("excluded_file", "This file is excluded from workspace preview.");
+    if (excluded(relative(root, target)) || insideAny(target, protectedRoots ?? await this.protectedRoots()))
+      throw new ProtocolError("excluded_file", "This file is excluded from workspace preview.");
     return { root, target };
   }
 
   async files(query = ""): Promise<WorkspaceFilesView> {
     if (typeof query !== "string" || query.length > 256) throw new ProtocolError("invalid_query", "The file search is too long.");
     const root = await this.root();
+    const protectedRoots = await this.protectedRoots();
     const needle = query.trim().toLowerCase();
     const files: WorkspaceFilesView["files"] = [];
     const pending = [root];
@@ -113,7 +124,8 @@ export class WorkspaceService {
       // Directories are never followed through symlinks; re-check before enumeration as well.
       let entries;
       try {
-        if (!inside(root, await realpath(directory))) continue;
+        const canonical = await realpath(directory);
+        if (!inside(root, canonical) || insideAny(canonical, protectedRoots)) continue;
         entries = await opendir(directory);
       } catch { continue; }
       for await (const entry of entries) {
@@ -125,7 +137,7 @@ export class WorkspaceService {
         if (!entry.isFile() || (needle && !path.toLowerCase().includes(needle))) continue;
         if (files.length === FILE_LIMIT) { truncated = true; break; }
         try {
-          const checked = await this.checkedPath(path);
+          const checked = await this.checkedPath(path, false, protectedRoots);
           const info = await stat(checked.target);
           if (info.isFile()) files.push({ path, name: basename(path), type: "file", size: info.size });
         } catch { /* A file removed or replaced during enumeration is omitted. */ }

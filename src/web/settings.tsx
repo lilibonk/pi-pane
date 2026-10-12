@@ -1,13 +1,23 @@
-import { useEffect, useState } from "preact/hooks";
+import { useLayoutEffect, useState } from "preact/hooks";
 import type { ComponentChildren } from "preact";
 import type { PiThemeView, ReadonlySettingGroup, SettingItem, SettingKey, SettingResult, SettingValue, SettingsView, ThemeItem, ThemeProblem, ThemesView } from "../protocol/index.js";
 import { DARK_THEME, LIGHT_THEME, type Appearance } from "./appearance.js";
 import { AccountsPanel } from "./accounts.js";
 import { ProvidersSection } from "./providers.js";
+import { ThemeDecoration } from "./decorations.js";
+import { explainApplyError } from "./apply-error.js";
 import { Modal, useHostQuery } from "./projects.js";
 import { HostError, clearAppearance, closeSettings, commitAppearance, openSettings, previewAppearance, runHostCommand, setHideThinking, type SettingsSection, type WebState } from "./store.js";
 
 const SECTIONS: [SettingsSection, string][] = [["appearance", "外观"], ["defaults", "模型默认"], ["behavior", "会话行为"], ["accounts", "账户"], ["providers", "自定义供应商"], ["other", "其他设置"]];
+const SECTION_NOTES: Record<SettingsSection, string> = {
+  appearance: "让工作台适合你的阅读习惯。",
+  defaults: "为之后的新会话选择模型与思考强度。",
+  behavior: "调整消息发送、上下文与重试的方式。",
+  accounts: "连接服务商，管理这台电脑上的登录。",
+  providers: "接入自己的模型服务与兼容接口。",
+  other: "查看 pi 的配置来源与网页支持范围。",
+};
 const ERRORS: Record<string, string> = {
   stale_setting: "这个设置刚被其他页面或另一个 pi 改过。现在显示的是已保存的值，需要的话请重新选择。",
   busy: "pi 正在回复、有待发消息或有待回答的对话框，结束后再改。",
@@ -59,7 +69,7 @@ function SettingRow({ item, state, canConfigure, children }: { item: SettingItem
   const [draft, setDraft] = useState<SettingValue>(saved);
   const [message, setMessage] = useState("");
   const [error, setError] = useState("");
-  useEffect(() => { setDraft(saved); }, [saved]);
+  useLayoutEffect(() => { setDraft(saved); }, [saved]);
   const text = TEXT[item.key];
   const blocked = !item.editable || !!state.hostAction || (item.writes === "runtime" && !canConfigure);
   const changed = draft !== saved && draft !== null;
@@ -80,13 +90,17 @@ function SettingRow({ item, state, canConfigure, children }: { item: SettingItem
         </select>)}
     </div>
     <p class="setting-note">{text.description}</p>
-    <dl class="setting-layers">
+    <details class="setting-details">
+      <summary>全局默认：{show(item.global)}<span>查看值来源</span></summary>
+      <dl class="setting-layers">
       <div><dt>全局默认</dt><dd>{item.global === null ? `未设置${item.defaultValue !== null ? `（pi 默认：${show(item.defaultValue)}）` : ""}` : show(item.global)}</dd></div>
       {item.project !== undefined && <div><dt>当前项目覆盖</dt><dd>{show(item.project)}</dd></div>}
       {item.cli && <div><dt>启动参数</dt><dd>{item.cli}（只对本次启动有效）</dd></div>}
       {item.runtime !== undefined && <div><dt>当前会话</dt><dd>{show(item.runtime)}</dd></div>}
-    </dl>
-    <p class="setting-note">{SCOPE[`${item.writes}:${item.applies}`]}</p>
+      </dl>
+      <p class="setting-note">{SCOPE[`${item.writes}:${item.applies}`]}</p>
+    </details>
+    {item.project !== undefined && <p class="setting-note">当前项目设置：{show(item.project)}</p>}
     {!item.editable && item.reason && <p class="setting-note setting-warn">{REASON[item.reason]}</p>}
     {item.editable && item.writes === "runtime" && !canConfigure && <p class="setting-note">pi 正在工作，空闲后可以修改。</p>}
     {changed && !children && <div class="setting-actions"><button type="button" class="send-button" disabled={blocked} onClick={save}>保存</button><button type="button" class="quiet" onClick={() => { setDraft(saved); setError(""); }}>撤销</button></div>}
@@ -102,9 +116,13 @@ function piThemeText(pi: PiThemeView): string {
   if (pi.reason === "missing") return `${where}指定的“${pi.setting}”在这里不可用，显示的是运行 /web 时终端的颜色快照。`;
   return `${where}的主题设置“${pi.setting}”无法识别，显示的是运行 /web 时终端的颜色快照。`;
 }
-const sameLook = (a: Appearance, b: Appearance): boolean => a.mode === b.mode && (a.mode !== "theme" || a.theme === b.theme);
+const sameTheme = (a: Appearance, b: Appearance): boolean => a.mode === b.mode && (a.mode !== "theme" || a.theme === b.theme);
+const sameLook = (a: Appearance, b: Appearance): boolean => sameTheme(a, b) && (a.showDecorations !== false) === (b.showDecorations !== false);
 function Swatch({ item }: { item?: ThemeItem }) {
-  return <span class="theme-swatch" aria-hidden="true" style={item ? { background: item.preview.bg, color: item.preview.fg, borderColor: item.preview.accent } : undefined}>Aa</span>;
+  return <span class="theme-swatch theme-preview" aria-hidden="true" style={item ? { background: item.preview.bg, color: item.preview.fg, "--preview-accent": item.preview.accent } : undefined}>
+    <span class="theme-preview-sidebar"><i /><i /><i /></span>
+    <span class="theme-preview-page"><span>Aa</span><i /><i /><b /></span>
+  </span>;
 }
 /** The theme of pi itself: a fixed name, or a light/dark pair pi chooses between by the terminal's appearance. */
 function PiDefaultTheme({ item, state, agentDir }: { item: SettingItem; state: WebState; agentDir: string }) {
@@ -114,7 +132,7 @@ function PiDefaultTheme({ item, state, agentDir }: { item: SettingItem; state: W
   const [second, setSecond] = useState(current.split("/")[1] || "dark");
   const [message, setMessage] = useState("");
   const [error, setError] = useState("");
-  useEffect(() => { setPaired(current.includes("/")); setFirst(current.split("/")[0] || "system"); setSecond(current.split("/")[1] || "dark"); }, [current]);
+  useLayoutEffect(() => { setPaired(current.includes("/")); setFirst(current.split("/")[0] || "system"); setSecond(current.split("/")[1] || "dark"); }, [current]);
   const options = item.options ?? ["system"];
   const named = options.filter(option => option !== "system");
   const value = paired ? `${first}/${second}` : first;
@@ -128,12 +146,15 @@ function PiDefaultTheme({ item, state, agentDir }: { item: SettingItem; state: W
   };
   return <div class="setting-row">
     <div class="setting-head"><strong>{TEXT.theme.label}</strong></div>
-    <p class="setting-note">这是另一件事：它保存到 pi 的全局设置（{agentDir}），供之后启动的终端 pi 使用。不改变已经打开的终端，也不改变上面为此浏览器选择的外观。</p>
+    <p class="setting-note">保存到 pi 的全局设置，供之后启动的终端使用。此浏览器和已经打开的终端保持各自的外观。</p>
+    <details class="setting-details"><summary>查看终端主题的配置来源</summary>
     <dl class="setting-layers">
       <div><dt>全局默认</dt><dd>{item.global === null ? "未设置（pi 默认：system）" : show(item.global)}</dd></div>
       {item.project !== undefined && <div><dt>当前项目覆盖</dt><dd>{show(item.project)}（全局默认在这个项目里不生效）</dd></div>}
       {item.cli && <div><dt>启动参数</dt><dd>--use-theme {item.cli}（只对那次启动的终端有效）</dd></div>}
     </dl>
+    <p class="setting-note">全局设置目录：{agentDir}</p>
+    </details>
     <label class="setting-check"><input type="checkbox" checked={paired} disabled={blocked || named.length < 1} onChange={event => { setPaired(event.currentTarget.checked); if (event.currentTarget.checked && first === "system") setFirst(named.includes("light") ? "light" : named[0] ?? "system"); }} />按终端的明暗自动切换（保存为“浅色主题/深色主题”）</label>
     <div class="theme-default-controls">
       {paired ? <>{select("theme-default-light", "终端为浅色时", first, setFirst, named)}{select("theme-default-dark", "终端为深色时", second, setSecond, named)}</> : select("theme-default-fixed", "主题", first, setFirst, options)}
@@ -152,21 +173,23 @@ function AppearanceSection({ state, themes, settings, reload }: { state: WebStat
   const choose = (look: Appearance) => previewAppearance(sameLook(look, state.appearance) ? null : look);
   const item = (name: string) => themes?.themes.find(theme => theme.name === name);
   const option = (look: Appearance, title: string, note: string, swatch?: ThemeItem) => {
-    const selected = sameLook(active, look);
-    return <button type="button" class={`theme-option ${selected ? "is-current" : ""}`} role="radio" aria-checked={selected} key={`${look.mode}:${look.theme ?? ""}`} onClick={() => choose(look)}>
-      <Swatch item={swatch} /><span class="theme-option-text"><strong>{title}{sameLook(state.appearance, look) && <small>此浏览器的选择</small>}</strong><span>{note}</span></span>
+    const selected = sameTheme(active, look);
+    return <button type="button" class={`theme-option ${selected ? "is-current" : ""}`} role="radio" aria-label={title} aria-checked={selected} key={`${look.mode}:${look.theme ?? ""}`} onClick={() => choose({ ...look, showDecorations: active.showDecorations !== false })}>
+      <Swatch item={swatch} /><span class="theme-option-text"><strong>{title}{sameTheme(state.appearance, look) && <small>已选</small>}</strong><span>{note}</span></span>
     </button>;
   };
   const piDefault = settings?.items.find(entry => entry.key === "theme");
   const hide = settings?.items.find(entry => entry.key === "hideThinkingBlock");
   return <>
-    <p class="setting-intro">外观只属于此浏览器：保存在这里，不修改 pi 的设置，其他设备各自选择。偏好按网址（包括端口）保存，端口变了需要重新选择。</p>
+    <p class="setting-intro">外观保存在此浏览器，其他设备可以各自选择。</p>
     <div class="theme-options" role="radiogroup" aria-label="此浏览器的外观">
-      {option({ mode: "pi" }, "跟随 pi", themes ? piThemeText(themes.pi) : "使用 pi 在当前项目的主题。")}
-      {option({ mode: "system" }, "跟随此设备的浅色或深色", "按这台设备的明暗偏好，在 pi-pane 的浅色与深色主题之间切换。与 pi 的 system 主题不是一回事。")}
+      {option({ mode: "pi" }, "跟随 pi", "使用 pi 在当前项目的主题。", item(themes?.pi.name ?? ""))}
+      {option({ mode: "system" }, "跟随此设备的浅色或深色", "随设备自动切换 pi-pane 的浅色与深色。")}
       {option({ mode: "light" }, "浅色", "pi-pane 自带的浅色主题。", item(LIGHT_THEME))}
       {option({ mode: "dark" }, "深色", "pi-pane 自带的深色主题。", item(DARK_THEME))}
     </div>
+    {active.mode === "pi" && themes && <p class="setting-note">{piThemeText(themes.pi)}</p>}
+    {active.mode === "system" && <p class="setting-note">这里跟随设备的明暗偏好；pi 的 system 主题则取自终端配色。</p>}
     <div class="setting-subhead"><h3>已安装的 pi 主题</h3><button type="button" class="quiet" onClick={reload}>刷新主题</button></div>
     {!themes && <p class="setting-note" role="status">正在读取主题…</p>}
     {themes && <div class="theme-options" role="radiogroup" aria-label="已安装的 pi 主题">
@@ -176,12 +199,15 @@ function AppearanceSection({ state, themes, settings, reload }: { state: WebStat
     {themes?.projectThemes === "untrusted" && <p class="setting-note">当前项目带有自己的主题。项目未被信任，没有读取它们。</p>}
     {themes?.truncated && <p class="setting-note">主题文件太多，只读取了前 128 个。</p>}
     {!!themes?.problems.length && <details class="setting-problems"><summary>{themes.problems.length} 个主题文件没有被使用</summary><ul>{themes.problems.map((problem, index) => <li key={index}><code>{problem.file}</code>（{SOURCE[problem.source]}）：{PROBLEM[problem.code]}</li>)}</ul></details>}
-    <p class="setting-note">这里只列出 pi 的内置主题、pi 主题目录、受信任项目的主题目录，以及运行 /web 时 pi 已经加载的主题。之后新装的主题包需要在终端重新运行 /web 才会出现。</p>
+    <details class="setting-details"><summary>主题从哪里来</summary><p class="setting-note">这里只列出 pi 的内置主题、pi 主题目录、受信任项目的主题目录，以及运行 /web 时 pi 已经加载的主题。之后新装的主题包需要在终端重新运行 /web 才会出现。浏览器偏好按网址（包括端口）保存，端口变了需要重新选择。</p></details>
     {state.themeProblem === "missing" && <p class="setting-note setting-warn" role="alert">“{state.themeName}”在当前项目不可用。{state.themeVars ? "暂时保留上次的颜色。" : "暂时使用 pi 的主题。"}</p>}
     {!state.appearanceStored && <p class="setting-note setting-warn" role="alert">此浏览器无法保存偏好（例如处于隐私模式），刷新后会恢复为跟随 pi。</p>}
-    {state.appearance.mode !== "pi" && !previewing && <div class="setting-actions"><button type="button" class="quiet" onClick={clearAppearance}>清除此浏览器的外观偏好</button></div>}
-    <div class="setting-subhead"><h3>思考内容</h3></div>
-    <label class="setting-check"><input type="checkbox" checked={!!state.appearance.hideThinking} onChange={event => setHideThinking(event.currentTarget.checked)} />在此浏览器隐藏思考内容（只影响显示，会话记录不变）</label>
+    {(state.appearance.mode !== "pi" || state.appearance.showDecorations === false) && !previewing && <div class="setting-actions"><button type="button" class="quiet" onClick={clearAppearance}>清除此浏览器的外观偏好</button></div>}
+    <div class="setting-subhead"><h3>显示偏好</h3></div>
+    <div class="setting-browser-options">
+      <label class="setting-check"><input type="checkbox" aria-label="显示主题装饰" aria-describedby="theme-decoration-note" checked={active.showDecorations !== false} onChange={event => choose({ ...active, showDecorations: event.currentTarget.checked })} /><span>显示主题装饰<small id="theme-decoration-note">在品牌区、空状态和设置页眉显示主题提供的纹样。</small></span></label>
+      <label class="setting-check"><input type="checkbox" checked={!!state.appearance.hideThinking} onChange={event => setHideThinking(event.currentTarget.checked)} /><span>在此浏览器隐藏思考内容<small>只影响显示，会话记录不变。</small></span></label>
+    </div>
     {hide && <SettingRow item={hide} state={state} canConfigure={true} />}
     <div class="setting-subhead"><h3>pi 自己的主题</h3></div>
     {piDefault && settings ? <PiDefaultTheme item={piDefault} state={state} agentDir={settings.agentDir} /> : <p class="setting-note" role="status">正在读取设置…</p>}
@@ -228,11 +254,12 @@ export function SettingsDialog({ state, canConfigure }: { state: WebState; canCo
   const apply = () => { setError(""); runHostCommand("account_apply").then(() => settings.reload(), failure => setError(explain(failure))); };
   return <Modal titleId="settings-title" onClose={closeSettings} wide>
     <div class="settings-dialog">
-      <div class="settings-head"><h2 id="settings-title">设置</h2><button type="button" class="quiet" data-autofocus onClick={closeSettings}>关闭</button></div>
+      <div class="settings-head"><h2 id="settings-title">设置</h2><div class="settings-decoration"><ThemeDecoration slot="settingsHeader" /></div><button type="button" class="quiet" data-autofocus onClick={closeSettings}>关闭</button></div>
       <div class="settings-nav" role="group" aria-label="设置分类">{SECTIONS.map(([name, label]) => <button type="button" key={name} aria-pressed={section === name} onClick={() => openSettings(name)}>{label}</button>)}</div>
       <div class="settings-body" key={section}>
+        <header class="settings-section-head"><h3>{SECTIONS.find(([name]) => name === section)?.[1]}</h3><p>{SECTION_NOTES[section]}</p></header>
         {!own && view?.errors.map(item => <p class="setting-note setting-warn" role="alert" key={item.scope}>{item.scope === "global" ? "pi 的全局设置文件无法解析，所有设置暂时只读，文件没有被改动。" : "当前项目的设置文件无法解析，已忽略。"}{item.message}</p>)}
-        {!own && view?.pendingApply && <div class="setting-banner" role="status"><span>有已保存的更改在等待当前会话重新加载。{view.applyError ? ERRORS.busy : ""}</span><button type="button" disabled={!canConfigure || !!state.hostAction} onClick={apply}>立即应用</button></div>}
+        {!own && view?.pendingApply && <div class="setting-banner" role="status"><span>有已保存的更改在等待当前会话重新加载。{view.applyError ? explainApplyError(view.applyError) : ""}</span><button type="button" disabled={!canConfigure || !!state.hostAction} onClick={apply}>立即应用</button></div>}
         {error && <p class="setting-note setting-warn" role="alert">{error}</p>}
         {!own && settings.error && !view && <div class="setting-note setting-warn" role="alert"><p>{settings.error}</p><button type="button" onClick={settings.reload}>重新加载</button></div>}
         {section === "appearance" && <AppearanceSection state={state} themes={themes.value} settings={view} reload={themes.reload} />}

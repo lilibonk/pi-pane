@@ -1,7 +1,8 @@
-import { useEffect, useRef, useState } from "preact/hooks";
+import { useLayoutEffect, useRef, useState } from "preact/hooks";
 import type { AccountMethod, AccountNotice, AccountOperation, AccountProvider } from "../protocol/index.js";
 import { HostError, answerAccount, dismissAccount, runHostCommand, type WebState } from "./store.js";
 import { Modal, useHostQuery } from "./projects.js";
+import { explainApplyError } from "./apply-error.js";
 
 const ACCOUNT_ERRORS: Record<string, string> = {
   account_busy: "另一个账户操作还在进行，请先完成或取消它。",
@@ -63,34 +64,36 @@ export function AccountsPanel({ state, canConfigure }: { state: WebState; canCon
   const configured = (view?.providers ?? []).filter(provider => (provider.stored || provider.models) && matches(provider));
   const others = (view?.providers ?? []).filter(provider => !provider.stored && !provider.models && matches(provider));
   const row = (provider: AccountProvider) => <div class="resource-item account-item" key={provider.id}>
-    <strong>{provider.name}{provider.custom && <span class="source-chip">自定义</span>}<span class={`resource-status ${provider.stored || provider.models ? "active" : ""}`}>{provider.stored ? "已保存" : provider.models ? "可用" : "未配置"}</span></strong>
-    <p>{status(provider, !!view?.pendingApply)}</p>
+    <div class="account-summary">
+      <span class="account-avatar" aria-hidden="true">{provider.name.slice(0, 1).toUpperCase()}</span>
+      <div class="account-identity"><strong>{provider.name}{provider.custom && <span class="source-chip">自定义</span>}</strong><p>{status(provider, !!view?.pendingApply)}</p></div>
+      <span class={`resource-status ${provider.stored || provider.models ? "active" : ""}`}>{provider.stored ? "已保存" : provider.models ? "可用" : "未配置"}</span>
+    </div>
     <div class="account-actions">
-      {provider.methods.map(method => method.web
-        ? <button type="button" key={method.type} disabled={!canConfigure || busy || running} title={method.label} onClick={() => run("account_begin", { provider: provider.id, method: method.type })}>{method.type === "api_key" ? provider.stored === "api_key" ? "替换 API key" : "用 API key 登录" : `登录：${method.label}`}</button>
-        : <span class="account-reason" key={method.type}>{method.label ? `${method.label}：` : ""}{methodReason[method.reason ?? "extension"]}</span>)}
+      {provider.methods.filter(method => method.web).map(method => <button type="button" key={method.type} disabled={!canConfigure || busy || running} title={method.label} onClick={() => run("account_begin", { provider: provider.id, method: method.type })}>{method.type === "api_key" ? provider.stored === "api_key" ? "替换 API key" : "用 API key 登录" : `登录：${method.label}`}</button>)}
       {provider.stored && (confirming === provider.id
         ? <span class="rotate-confirm" role="group" aria-label={`确认退出 ${provider.name}`}><button type="button" disabled={busy || running} onClick={() => run("account_logout", { provider: provider.id })}>确认退出</button><button type="button" class="quiet" onClick={() => setConfirming("")}>取消</button></span>
         : <button type="button" class="quiet" disabled={!canConfigure || busy || running} onClick={() => setConfirming(provider.id)}>退出</button>)}
     </div>
+    {provider.methods.filter(method => !method.web).map(method => <p class="account-reason" key={method.type}>{method.label ? `${method.label}：` : ""}{methodReason[method.reason ?? "extension"]}</p>)}
     {confirming === provider.id && <p class="account-reason">只删除 pi 保存的这份凭据。不会撤销服务商一侧的授权，也不影响环境变量或启动参数里的密钥。</p>}
   </div>;
   return <>
-    <p class="resource-note">账户属于这台电脑上的 pi，对所有项目生效。这里显示的是 pi 保存了什么、当前会话能用什么；保存成功不代表服务商已经验证过这份凭据。</p>
+    <p class="setting-intro">账户属于这台电脑上的 pi，对所有项目生效。保存凭据后，模型的实际可用性会在发送消息时验证。</p>
     {operation && !operation.owner && running && <div class="account-banner" role="status"><span>另一个页面正在登录 {operation.providerName}。</span><button type="button" disabled={busy} onClick={() => run("account_cancel", { operationId: operation.id })}>取消该登录</button></div>}
     {operation?.owner && operation.id === state.accountDismissed && running && <div class="account-banner" role="status"><span>{operation.providerName} 的登录还在进行。</span><button type="button" onClick={() => dismissAccount("")}>查看</button></div>}
-    {view?.pendingApply && <div class="account-banner" role="status"><span>凭据已变更，当前会话还没有重新加载。{view.applyError ? ` ${ACCOUNT_ERRORS.busy}` : ""}</span><button type="button" disabled={!canConfigure || busy} onClick={() => run("account_apply", {})}>立即应用</button></div>}
+    {view?.pendingApply && <div class="account-banner" role="status"><span>凭据已变更，当前会话还没有重新加载。{view.applyError ? ` ${explainApplyError(view.applyError)}` : ""}</span><button type="button" disabled={!canConfigure || busy} onClick={() => run("account_apply", {})}>立即应用</button></div>}
     {view?.storeError && <p class="panel-message panel-error" role="alert">pi 的凭据文件无法读取，未做任何修改。{view.storeError}</p>}
     {error && <p class="panel-message panel-error" role="alert">{error}</p>}
     {accounts.error && !view && <div class="panel-message panel-error" role="alert"><p>{accounts.error}</p><button type="button" onClick={accounts.reload}>重新加载</button></div>}
     {!view && accounts.loading && <p class="panel-message" role="status">正在读取账户…</p>}
     {view && <>
-      <label class="panel-search inspector-search"><input type="search" placeholder="查找服务商" aria-label="查找服务商" value={filter} onInput={event => setFilter(event.currentTarget.value)} /></label>
-      {configured.map(row)}
+      <label class="panel-search inspector-search account-search"><input type="search" placeholder="查找服务商" aria-label="查找服务商" value={filter} onInput={event => setFilter(event.currentTarget.value)} /></label>
+      {!!configured.length && <section class="account-group" aria-label="已连接的服务商"><div class="setting-subhead"><h3>已连接<span class="setting-count">{configured.length}</span></h3></div><div class="account-list">{configured.map(row)}</div></section>}
       {!configured.length && !needle && <p class="panel-message">还没有可用的模型服务商。在下面选择一个登录。</p>}
-      {!!others.length && (needle || showAll ? others.map(row) : <button type="button" class="account-more" onClick={() => setShowAll(true)}>显示其余 {others.length} 个未配置的服务商</button>)}
+      {!!others.length && <section class="account-group" aria-label="添加服务商"><div class="setting-subhead"><h3>添加服务商<span class="setting-count">{others.length}</span></h3></div>{needle || showAll ? <div class="account-list">{others.map(row)}</div> : <button type="button" class="account-more" onClick={() => setShowAll(true)}>显示其余 {others.length} 个未配置的服务商</button>}</section>}
       {needle && !configured.length && !others.length && <p class="panel-message">没有匹配的服务商。</p>}
-      <p class="resource-note">这里的变更只应用到这个网页服务正在运行的会话；同一台电脑上其他已打开的 pi 需要各自重新加载。</p>
+      <p class="setting-note">这里的变更只应用到这个网页服务正在运行的会话；同一台电脑上其他已打开的 pi 需要各自重新加载。</p>
     </>}
   </>;
 }
@@ -115,7 +118,8 @@ function LoginDialog({ state, operation }: { state: WebState; operation: Account
   const input = useRef<HTMLInputElement>(null);
   const step = operation.step;
   const online = state.connection !== "disconnected" && state.connection !== "fatal" && state.connection !== "login";
-  useEffect(() => { setValue(""); setError(""); input.current?.focus(); }, [step?.id]);
+  // Reset before the step becomes interactive; a deferred effect can erase a freshly pasted key.
+  useLayoutEffect(() => { setValue(""); setError(""); input.current?.focus(); }, [step?.id]);
   const submit = (answer: string) => {
     if (!step || !online) return;
     if (!answerAccount(operation.id, step.id, answer)) { setError(ACCOUNT_ERRORS.disconnected!); return; }
@@ -130,7 +134,7 @@ function LoginDialog({ state, operation }: { state: WebState; operation: Account
     {running && operation.notices?.map(notice => <Notice key={notice.type} notice={notice} />)}
     {running && step && (step.kind === "select"
       ? <><p>{step.message}</p><div class="dialog-options">{step.options?.map(option => <button type="button" key={option.id} disabled={!online} onClick={() => submit(option.id)}>{option.label}{option.description && <span>{option.description}</span>}</button>)}</div></>
-      : <form class="account-step" onSubmit={event => { event.preventDefault(); if (value) submit(value); }}>
+      : <form class="account-step" onSubmit={event => { event.preventDefault(); const answer = input.current?.value ?? value; if (answer) submit(answer); }}>
         <label for="account-step-input">{step.message}</label>
         <input id="account-step-input" ref={input} data-autofocus type={step.kind === "secret" ? "password" : "text"} autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck={false} maxLength={8192} placeholder={step.placeholder} value={value} onInput={event => setValue(event.currentTarget.value)} />
         {step.kind === "secret" && <p class="account-hint">按字面值保存到 pi 的凭据文件，只发送一次，不会出现在聊天、草稿或记录里。</p>}

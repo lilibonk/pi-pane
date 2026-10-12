@@ -1,5 +1,7 @@
 import { closeSync, constants, fstatSync, openSync, readSync, statSync } from "node:fs";
 import { colorToHex, mixColors, parseColor, type Color } from "@earendil-works/pi-tui";
+import { loadThemeDecorations } from "./theme-decorations.js";
+import type { ThemeDecorations } from "../protocol/theme-decorations.js";
 
 export interface PaneTheme {
   readonly name?: string;
@@ -88,6 +90,8 @@ export class ThemeMapper {
   }
 
   map(theme: PaneTheme, available?: ThemePaths): Record<string, string> { return this.vars(theme, this.background(theme, available)); }
+  /** Unlike color fallback, decoration binding must never infer a source from a display name. */
+  decorations(theme: PaneTheme): ThemeDecorations | undefined { return loadThemeDecorations(theme.sourcePath); }
   /** The page's CSS variables for a theme whose export background, if it has one, is already known. */
   vars(theme: PaneTheme, pageBg?: string): Record<string, string> {
     const light = theme.appearance === "light";

@@ -10,7 +10,7 @@ import { fileURLToPath } from "node:url";
 import WebSocket from "ws";
 import { chromium } from "playwright";
 import { startFixture, waitFor, setFixtureControl } from "./m0-smoke.mjs";
-import { LIMITS, applyProjectionEvent, mergeOlderPage } from "../dist/protocol/index.js";
+import { LIMITS, PROTOCOL, applyProjectionEvent, mergeOlderPage } from "../dist/protocol/index.js";
 
 const project = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const outputBase = resolve(process.env.PI_M0_REPORT_DIR || join(project, "build-artifacts/m3/handoff/m0"));
@@ -67,7 +67,7 @@ function statistics(values) {
 async function pressureClient(url) {
   const parsed = new URL(url);
   const token = new URLSearchParams(parsed.hash.slice(1)).get("t");
-  const socket = new WebSocket(`ws://${parsed.host}/ws`, ["pi-pane.v1", `pi-pane.bearer.${token}`], { origin: parsed.origin });
+  const socket = new WebSocket(`ws://${parsed.host}/ws`, [PROTOCOL, `pi-pane.bearer.${token}`], { origin: parsed.origin });
   const client = { socket, snapshot: undefined, rawSnapshot: undefined, clientId: undefined, seq: 0, epoch: undefined, closed: false,
     closeCode: undefined, closeReason: undefined, protocolErrors: [], errors: [], snapshots: 0, replies: new Map(), results: new Map(), assembling: undefined, requestNo: 0, nextCommandNo: 1, acknowledgements: new Map(),
     stats: { frames: 0, bytes: 0, events: 0, maxFrameBytes: 0, toolUpdates: 0, maxToolValueCharacters: 0 },

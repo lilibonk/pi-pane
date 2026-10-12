@@ -1,6 +1,6 @@
 import { createStore } from "zustand/vanilla";
-import type { AccountOperation, CommandName, ExtensionUiState, HostCommandName, HostQueryAction, HostQueryValues, HostState, ProjectInspectView, ImageType, MessageView, PromptImage, Snapshot } from "../protocol/index.js";
-import { IMAGE_TYPES, LIMITS, applyProjectionEvent, boundedTools, decodeBase64, encodedSize, inspectImage, isTextContent, mergeOlderPage } from "../protocol/index.js";
+import type { AccountOperation, CommandName, ExtensionUiState, HostCommandName, HostQueryAction, HostQueryValues, HostState, ProjectInspectView, ImageType, MessageView, PromptImage, Snapshot, ThemeDecorations } from "../protocol/index.js";
+import { IMAGE_TYPES, LIMITS, PROTOCOL, applyProjectionEvent, boundedTools, decodeBase64, encodedSize, inspectImage, isTextContent, mergeOlderPage, safeDecorations } from "../protocol/index.js";
 import type { WorkbenchAction, WorkbenchValues } from "../protocol/workbench.js";
 import { loadAppearance, safeVars, saveAppearance, wantedTheme, type Appearance, type ThemeVars } from "./appearance.js";
 import { ForkDraftRecovery } from "./draft-recovery.js";
@@ -74,6 +74,8 @@ export interface WebState {
   themeName: string;
   /** That theme's colors. Null means the session snapshot's theme applies. */
   themeVars: ThemeVars | null;
+  /** Only the host's current validated metadata; never restored from browser storage. */
+  themeDecorations: ThemeDecorations | null;
   /** `missing`: the chosen theme is not available here; the last colors known for it stay. */
   themeProblem: "" | "missing";
   /** Whether this browser could store the last committed choice. */
@@ -88,6 +90,8 @@ export interface WebState {
 export type SettingsSection = "appearance" | "defaults" | "behavior" | "accounts" | "providers" | "other";
 
 function prefersDark(): boolean { try { return matchMedia("(prefers-color-scheme: dark)").matches; } catch { return false; } }
+/** Only a finished login result's ID, scoped to this browser tab; never a key or login step. */
+const ACCOUNT_DISMISSED_KEY = "pi-pane.accountDismissed";
 const storedAppearance = loadAppearance();
 let themeCache: Record<string, ThemeVars> = storedAppearance.cache;
 let themeRequest = 0;
@@ -119,11 +123,12 @@ export const webStore = createStore<WebState>(() => ({
   projectDialog: null,
   account: null,
   accountError: "",
-  accountDismissed: "",
+  accountDismissed: readSession(ACCOUNT_DISMISSED_KEY) ?? "",
   appearance: storedAppearance.appearance,
   appearancePreview: null,
   themeName: wantedTheme(storedAppearance.appearance, prefersDark()) ?? "",
   themeVars: storedAppearance.cache[wantedTheme(storedAppearance.appearance, prefersDark()) ?? ""] ?? null,
+  themeDecorations: null,
   themeProblem: "",
   appearanceStored: true,
   settings: null,
@@ -398,7 +403,7 @@ function handleFrame(raw: unknown) {
         !frame.session || !Array.isArray(frame.session.messages) || !frame.state) throw new Error("snapshot shape");
       uncertainSubmissions(frame.epoch);
       resetReads();
-      const snapshot = capHistory({ ...frame, state: { ...frame.state, tools: boundedTools(frame.state.tools) } } as Snapshot);
+      const snapshot = capHistory({ ...frame, decorations: safeDecorations(frame.decorations), state: { ...frame.state, tools: boundedTools(frame.state.tools) } } as Snapshot);
       const moved = projectDrafts.enter(snapshot.session.cwd, { draft: current.draft, attachments: current.attachments });
       if (moved) { draftRevision++; webStore.setState({ draft: moved.draft, attachments: moved.attachments, attachmentError: "" }); }
       webStore.setState(state => ({ snapshot, lastAppliedSeq: frame.seq, connection: "online", notice: "", snapshotCount: state.snapshotCount + 1 }));
@@ -648,7 +653,7 @@ function connect() {
   webStore.setState({ connection: "connecting", notice: "正在连接当前 pi 会话…" });
   const wsUrl = new URL("/ws", location.href);
   wsUrl.protocol = location.protocol === "https:" ? "wss:" : "ws:";
-  const ws = new WebSocket(wsUrl, ["pi-pane.v1", `pi-pane.bearer.${bearer}`]);
+  const ws = new WebSocket(wsUrl, [PROTOCOL, `pi-pane.bearer.${bearer}`]);
   socket = ws;
   opened = false;
   assembling = undefined;
@@ -816,33 +821,42 @@ export function syncTheme(force = false) {
   const wanted = wantedTheme(state.appearancePreview ?? state.appearance, prefersDark());
   if (!wanted) {
     themeRequest++; themeKey = "";
-    if (state.themeName || state.themeVars || state.themeProblem) webStore.setState({ themeName: "", themeVars: null, themeProblem: "" });
+    if (state.themeName || state.themeVars || state.themeProblem || state.themeDecorations) webStore.setState({ themeName: "", themeVars: null, themeDecorations: null, themeProblem: "" });
     return;
   }
-  if (state.themeName !== wanted) webStore.setState({ themeName: wanted, themeVars: themeCache[wanted] ?? null, themeProblem: "" });
+  if (state.themeName !== wanted) {
+    themeRequest++; themeKey = "";
+    webStore.setState({ themeName: wanted, themeVars: themeCache[wanted] ?? null, themeDecorations: null, themeProblem: "" });
+  }
   const reachable = !!state.clientId && state.connection !== "disconnected" && state.connection !== "fatal" && state.connection !== "login" && state.connection !== "connecting";
   const key = `${wanted}\0${state.clientId}\0${state.host?.revision}`;
   if (!reachable || (key === themeKey && !force)) return;
   themeKey = key;
   const request = ++themeRequest;
+  // Keep cached colors while rechecking a source, but artwork needs a fresh provenance check.
+  webStore.setState({ themeDecorations: null });
   queryHost("theme", { name: wanted }).then(view => {
     if (request !== themeRequest) return;
     const vars = safeVars(view.vars);
-    if (!vars) { webStore.setState({ themeProblem: "missing" }); return; }
+    if (!vars) { webStore.setState({ themeProblem: "missing", themeDecorations: null }); return; }
     themeCache = { ...themeCache, [wanted]: vars };
-    webStore.setState({ themeVars: vars, themeProblem: "" });
+    webStore.setState({ themeVars: vars, themeDecorations: safeDecorations(view.decorations) ?? null, themeProblem: "" });
     const current = webStore.getState();
     if (!current.appearancePreview) saveAppearance(current.appearance, themeCache);
   }, (error: HostError) => {
     if (request !== themeRequest) return;
-    if (error.code === "theme_missing") webStore.setState({ themeProblem: "missing" });
+    if (error.code === "theme_missing") webStore.setState({ themeProblem: "missing", themeDecorations: null });
     else themeKey = ""; // not an answer about the theme: ask again on the next change
   });
 }
 /** Tries a look without storing it. `null` returns to the stored one. */
 export function previewAppearance(appearance: Appearance | null) {
-  const hideThinking = webStore.getState().appearance.hideThinking;
-  webStore.setState({ appearancePreview: appearance && { ...appearance, ...(hideThinking ? { hideThinking } : {}) } });
+  const current = webStore.getState();
+  const { hideThinking } = current.appearance;
+  // A checkbox supplies its new value; changing only the theme keeps the active preview's value.
+  const showDecorations = appearance?.showDecorations ?? (current.appearancePreview ?? current.appearance).showDecorations;
+  const { hideThinking: _thinking, showDecorations: _decorations, ...look } = appearance ?? current.appearance;
+  webStore.setState({ appearancePreview: appearance && { ...look, ...(hideThinking ? { hideThinking } : {}), ...(showDecorations === false ? { showDecorations: false } : {}) } });
   syncTheme();
 }
 /** Makes the previewed look this browser's choice. */
@@ -852,17 +866,18 @@ export function commitAppearance() {
   webStore.setState({ appearance: preview, appearancePreview: null, appearanceStored: saveAppearance(preview, themeCache) });
   syncTheme();
 }
-/** Forgets this browser's choice of look: it follows pi again. The thinking preference is a separate choice and stays. */
+/** Forgets this browser's look, including its decoration choice; the separate thinking preference stays. */
 export function clearAppearance() {
-  const hideThinking = webStore.getState().appearance.hideThinking;
+  const { hideThinking } = webStore.getState().appearance;
   const appearance: Appearance = { mode: "pi", ...(hideThinking ? { hideThinking } : {}) };
   webStore.setState({ appearance, appearancePreview: null, appearanceStored: saveAppearance(appearance, themeCache) });
   syncTheme();
 }
 export function setHideThinking(hide: boolean) {
-  const { hideThinking: _old, ...rest } = webStore.getState().appearance;
-  const appearance: Appearance = { ...rest, ...(hide ? { hideThinking: true } : {}) };
-  webStore.setState({ appearance, appearanceStored: saveAppearance(appearance, themeCache) });
+  const current = webStore.getState();
+  const update = ({ hideThinking: _old, ...rest }: Appearance): Appearance => ({ ...rest, ...(hide ? { hideThinking: true } : {}) });
+  const appearance = update(current.appearance);
+  webStore.setState({ appearance, appearancePreview: current.appearancePreview && update(current.appearancePreview), appearanceStored: saveAppearance(appearance, themeCache) });
 }
 export function setSessionDialog(dialog: WebState["sessionDialog"]) { webStore.setState({ sessionDialog: dialog }); }
 export function sessionDeleted() { webStore.setState(state => ({ sessionsChanged: state.sessionsChanged + 1 })); }
@@ -891,7 +906,14 @@ webStore.subscribe((state, previous) => {
   if (state.clientId !== previous.clientId || state.host?.revision !== previous.host?.revision || state.connection !== previous.connection) syncTheme();
 });
 try { matchMedia("(prefers-color-scheme: dark)").addEventListener("change", () => syncTheme()); } catch { /* no media queries: the system look stays as first read */ }
-export function dismissAccount(operationId: string) { webStore.setState({ accountDismissed: operationId, accountError: "" }); }
+export function dismissAccount(operationId: string) {
+  const operation = webStore.getState().account;
+  // A completed result stays closed after refresh. A running login is only folded away in memory:
+  // after a reload its current step must be visible again so the same tab can continue answering.
+  if (operationId && operation?.id === operationId && operation.status !== "running") saveSession(ACCOUNT_DISMISSED_KEY, operationId);
+  else clearSession(ACCOUNT_DISMISSED_KEY);
+  webStore.setState({ accountDismissed: operationId, accountError: "" });
+}
 export function setProjectDialog(dialog: WebState["projectDialog"]) { webStore.setState({ projectDialog: dialog }); }
 export function issueCommand(command: CommandName, args: Record<string, unknown> = {}, text?: string, mode?: "followUp" | "steer") {
   const state = webStore.getState();

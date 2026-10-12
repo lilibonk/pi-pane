@@ -9,7 +9,7 @@ import { dirname, join, resolve } from "node:path";
 import { createInterface } from "node:readline";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import WebSocket from "ws";
-import { applyProjectionEvent } from "../dist/protocol/index.js";
+import { PROTOCOL, applyProjectionEvent } from "../dist/protocol/index.js";
 
 const project = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const fixturesByUrl = new Map();
@@ -88,6 +88,8 @@ export async function startFixture({ autoWeb = true, extraExtensions = [], setti
     const session = SessionManager.create(cwd, join(agentDir, "sessions"));
     session.appendMessage({ role: "user", content: [{ type: "text", text: "M0_SAVED_FIXTURE" }], timestamp: Date.now() });
     session.appendMessage({ role: "assistant", content: [{ type: "text", text: "M0_SAVED_FIXTURE_REPLY" }], api: "pi-pane-m0-api", provider: "pi-pane-m0", model: "deterministic", timestamp: Date.now(), stopReason: "stop", usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } } });
+    // Saved sessions restore their recorded model; CLI overrides are not replayed during handoff.
+    if (provider && model) session.appendModelChange(provider, model);
     seedSessionFile = session.getSessionFile();
   }
   const port = await freePort();
@@ -193,7 +195,7 @@ export async function startFixture({ autoWeb = true, extraExtensions = [], setti
 export async function openClient(url, clientId, options = {}) {
   const parsed = new URL(url);
   const token = options.token ?? new URLSearchParams(parsed.hash.slice(1)).get("t");
-  const socket = new WebSocket(`${parsed.protocol === "https:" ? "wss" : "ws"}://${parsed.host}/ws`, ["pi-pane.v1", `pi-pane.bearer.${token}`], { origin: parsed.origin, ...options });
+  const socket = new WebSocket(`${parsed.protocol === "https:" ? "wss" : "ws"}://${parsed.host}/ws`, [options.protocol ?? PROTOCOL, `pi-pane.bearer.${token}`], { origin: parsed.origin, ...options });
   const client = { socket, frames: [], snapshot: undefined, clientId, nextCommandNo: 1, closed: false, protocolErrors: [],
     send(frame) { socket.send(JSON.stringify(frame)); },
     makeCommand(command, args = {}, version = client.snapshot) {
@@ -280,7 +282,7 @@ export async function rejectedHandshake(url, overrides = {}) {
   const parsed = new URL(url);
   const token = new URLSearchParams(parsed.hash.slice(1)).get("t");
   return new Promise((resolvePromise, reject) => {
-    const socket = new WebSocket(`ws://${parsed.host}/ws`, ["pi-pane.v1", `pi-pane.bearer.${overrides.token ?? token}`],
+    const socket = new WebSocket(`ws://${parsed.host}/ws`, [PROTOCOL, `pi-pane.bearer.${overrides.token ?? token}`],
       { origin: overrides.origin ?? parsed.origin, ...(overrides.host ? { headers: { Host: overrides.host } } : {}) });
     const timeout = setTimeout(() => { socket.terminate(); reject(new Error("Unauthorized handshake did not settle")); }, 3_000);
     socket.once("open", () => { clearTimeout(timeout); socket.close(); reject(new Error("Unauthorized handshake was accepted")); });

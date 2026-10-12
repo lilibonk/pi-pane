@@ -3,8 +3,9 @@ import { parseColor } from "@earendil-works/pi-tui";
 import { constants } from "node:fs";
 import { open, readdir, realpath } from "node:fs/promises";
 import { basename, join, resolve, sep } from "node:path";
-import type { PiThemeView, ThemeItem, ThemeProblem, ThemeSource } from "../protocol/index.js";
+import type { PiThemeView, ThemeDecorations, ThemeItem, ThemeProblem, ThemeSource } from "../protocol/index.js";
 import { ThemeMapper, exportPageBackground, type PaneTheme } from "./theme.js";
+import { loadThemeDecorations } from "./theme-decorations.js";
 
 const MAX_THEME_BYTES = 256 * 1024;
 const MAX_FILES = 128;
@@ -100,7 +101,7 @@ export function parseThemeText(text: string, sourcePath: string): ParsedTheme {
   const pageBg = exportPageBackground(json);
   return { name, theme, ...(pageBg ? { pageBg } : {}) };
 }
-export interface CatalogEntry extends ParsedTheme { source: ThemeSource; path: string; global: boolean; vars: Record<string, string> }
+export interface CatalogEntry extends ParsedTheme { source: ThemeSource; path: string; global: boolean; vars: Record<string, string>; decorations?: ThemeDecorations }
 export interface Catalog { entries: Map<string, CatalogEntry>; problems: ThemeProblem[]; truncated: boolean; projectThemes: "loaded" | "untrusted" | "none" }
 export interface ThemeCatalogOptions {
   agentDir: string;
@@ -174,7 +175,8 @@ export class ThemeCatalog {
         const earlier = entries.get(parsed.name);
         if (earlier) { problem("duplicate", `Another theme named "${parsed.name}" is used instead.`, parsed.name); continue; }
         const global = source === "builtin" || source === "user" || (source === "pi-pane" ? known.has(parsed.name) : source === "handoff" && inside(real, agentDir));
-        entries.set(parsed.name, { ...parsed, source, path: candidate.path, global, vars: this.mapper.vars(parsed.theme, parsed.pageBg) });
+        const decorations = this.decorations(parsed.theme);
+        entries.set(parsed.name, { ...parsed, source, path: candidate.path, global, vars: this.mapper.vars(parsed.theme, parsed.pageBg), ...(decorations ? { decorations } : {}) });
       } catch (error) {
         if (error instanceof ThemeFileError) problem(error.code, error.message, error.themeName); else problem("invalid_theme", "The theme could not be loaded.");
       }
@@ -189,6 +191,7 @@ export class ThemeCatalog {
       preview: { bg: entry.vars["--bg"]!, fg: entry.vars["--fg"]!, accent: entry.vars["--accent"]! } }))
       .sort((a, b) => rank[a.source] - rank[b.source] || a.name.localeCompare(b.name));
   }
+  decorations(theme: PaneTheme): ThemeDecorations | undefined { return loadThemeDecorations(theme.sourcePath, this.options.bundledDir); }
   /**
    * The theme pi would use in this project, from its setting (`name`, or `light/dark` chosen by the
    * terminal's appearance at handoff). `system`, a name that is not in the catalog and a malformed

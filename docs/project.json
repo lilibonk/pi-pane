@@ -1,7 +1,7 @@
 {
   "name": "pi pane",
-  "stage": "M3",
-  "stageStatus": "completed",
+  "stage": "M3.1",
+  "stageStatus": "in-progress",
   "m0CompletedDate": "2026-10-08",
   "m1LocalAcceptanceCompletedDate": "2026-10-08",
   "m2LocalAcceptanceCompletedDate": "2026-10-08",
@@ -18,11 +18,11 @@
   "evidencePage": "https://chatgpt.com/space/page_b3f2b1dc1800819189f2b90d540f931c",
   "localFollowUpAutomationId": "pi-pane-m0-space",
   "localFollowUpStatus": "PAUSED",
-  "evidenceDirectory": "build-artifacts/releases/0.2.0",
-  "liveTaskStatusSource": "docs/m3-status.md",
+  "evidenceDirectory": "build-artifacts/releases/0.3.0-rc.3",
+  "liveTaskStatusSource": "docs/m3.1-status.md",
   "nextSteps": [
-    "Restart already-open pi processes to load npm:@lilibonk/pi-pane@0.2.0; collect daily stability feedback",
-    "Track upstream RPC tool/tree gaps and design custom TUI and Plan/Goal/Agent semantics"
+    "Retain rc.3 as M31-5 final candidate with maintainer-accepted boundaries and 8 passed/4 partial acceptance items",
+    "Complete final visuals, separately authorized real-provider trial and M31-6 release gates"
   ],
   "pi110CompatibilityStatus": "key-regressions-passed",
   "dailyPackageLoadStatus": "published-npm-0.2.0-installed-single-source-integrity-verified-restart-required",
@@ -492,5 +492,302 @@
       ]
     },
     "sourceCommit": "38152e1b0a585c549f3ef71d11715c29589b61ad"
-  }
+  },
+  "m31Candidate": {
+    "version": "0.3.0-rc.3",
+    "status": "m31-5-final-candidate-maintainer-accepted-boundaries",
+    "branch": "m3.1/gates",
+    "sourceBaseline": "bd6d4b9172b499fe966a8543deb9c526c256fb65",
+    "freezeTimeUncommittedChanges": true,
+    "sourceCheckpoint": "M31-D and M31-5 committed locally on m3.1/gates under explicit maintainer authorization; freeze-time baseline/snapshot remain historical",
+    "pushStatus": "not-pushed",
+    "finalCandidateDecision": {
+      "date": "2026-10-12",
+      "maintainerIndependentReview": "archive, 24 continuous executions/257 checks, exact install 5 checks and integration 20 checks independently verified",
+      "acceptedBoundaries": true,
+      "newCandidateForTheseFindings": false,
+      "deferredToFutureVisualChanges": [
+        "unknown/unknown wording on repeated zero-model reload",
+        "notice delivery to pages connecting after the broadcast"
+      ]
+    },
+    "evidenceDirectory": "build-artifacts/releases/0.3.0-rc.3",
+    "statusDocument": "docs/m3.1-status.md",
+    "migrationDocument": "docs/m3.1-migration.md",
+    "publicationStatus": "not-published",
+    "dailyPackageChanged": false,
+    "webOAuth": "disabled-maintainer-decision",
+    "realProviderTrial": "not-run",
+    "unit": {
+      "passed": 268,
+      "total": 268,
+      "log": "build-artifacts/releases/0.3.0-rc.3/audit/unit.log"
+    },
+    "build": "passed",
+    "typecheck": "passed",
+    "mutation": {
+      "expectedFailures": 2,
+      "sourceRestoredExactly": true,
+      "report": "build-artifacts/releases/0.3.0-rc.3/audit/mutation.json"
+    },
+    "archive": "build-artifacts/releases/0.3.0-rc.3/candidate/lilibonk-pi-pane-0.3.0-rc.3.tgz",
+    "sha256": "8db1793e03db9184c3077ca27599f5023b4082a256945bcedd1b541cfbcb2222",
+    "packagedFiles": 131,
+    "packagedBytes": 661616,
+    "sourceSnapshot": "build-artifacts/releases/0.3.0-rc.3/candidate/source-snapshot.tar.gz",
+    "sourceSnapshotSha256": "dc2720777ad1594096f315f8f418f19bed40d7528e8b0f9581157176094c37fd",
+    "sourceFiles": 217,
+    "regression": {
+      "singleContinuousRun": true,
+      "executions": 24,
+      "reports": 25,
+      "passed": 257,
+      "total": 257,
+      "report": "build-artifacts/releases/0.3.0-rc.3/regression/summary.json"
+    },
+    "exactInstall": {
+      "passed": 5,
+      "total": 5,
+      "report": "build-artifacts/releases/0.3.0-rc.3/install/report.json"
+    },
+    "installedIntegration": {
+      "passed": 20,
+      "total": 20,
+      "report": "build-artifacts/releases/0.3.0-rc.3/install/integration/report.json"
+    },
+    "zeroModelPageSupplement": {
+      "passed": 11,
+      "total": 11,
+      "realPi": "1.1.0",
+      "reloadBranches": [
+        "new_session",
+        "switch_session"
+      ],
+      "sendObserved": "old immediate post-fill disabled observation withdrawn as proof of stable zero-model behavior; original raw evidence preserved; see zeroModelSendFollowup",
+      "runtimeBytesMatchFreeze": true,
+      "report": "build-artifacts/releases/0.3.0-rc.3/zero-model-page/evidence/report.json"
+    },
+    "zeroModelSendFollowup": {
+      "passed": 2,
+      "total": 2,
+      "checkScope": "real enabled button click, one exact prompt dispatch and receipt capture per reload branch; failed prompts are observations, not successful model replies or additional E2E passes",
+      "originalNoticeAndPanelChecksRepeated": { "passed": 11, "total": 11 },
+      "immediatelyEnabled": false,
+      "settledEnabled": true,
+      "renderWaitMsBothCases": 24,
+      "ack": "dispatched",
+      "result": "failed",
+      "errorCode": "operation_failed",
+      "errorFirstLine": "No API key found for the selected model.",
+      "draftAfter": "",
+      "endpointRequestsAdded": 0,
+      "sessionFilesChanged": 0,
+      "pageErrors": 0,
+      "residualProcesses": 0,
+      "forcedCleanup": 0,
+      "runtimeBytesMatchFreeze": true,
+      "oldDisabledConclusionWithdrawn": true,
+      "report": "build-artifacts/releases/0.3.0-rc.3/zero-model-send-followup/evidence/report.json"
+    },
+    "auditReport": "build-artifacts/releases/0.3.0-rc.3/audit/review.json",
+    "auditFindings": [
+      "ancestor-alias deletion/dangling historical diff",
+      "EACCES protection fallback",
+      "case-insensitive missing-root create",
+      "request-local symlink metadata race",
+      "availability-zero despite working selected model",
+      "notice delivery/query failure gaps",
+      "prior RPC/shutdown scope"
+    ],
+    "acceptance": {
+      "passed": 8,
+      "partial": [
+        "E2E-05",
+        "E2E-08",
+        "E2E-09",
+        "E2E-10"
+      ],
+      "partialNotCountedAsPassed": true
+    },
+    "repeats": "not-repeated-this-round; concurrency/resilience included once in full matrix",
+    "closureReport": "build-artifacts/releases/0.3.0-rc.3/candidate-closure-final.json",
+    "validationCompletedDate": "2026-10-12"
+  },
+  "activeCandidate": "m31Candidate",
+  "publicationFieldsScope": "Published package, daily installation and historical real-provider trial fields refer to 0.2.0; current unpublished validation is m31Candidate.",
+  "releaseCandidateScope": "Historical published 0.2.0 baseline; current local candidate is m31Candidate.",
+  "m31PriorCandidates": [
+    {
+      "version": "0.3.0-rc.1",
+      "status": "integration-validation-interrupted",
+      "branch": "m3.1/gates",
+      "sourceBaseline": "bd6d4b9172b499fe966a8543deb9c526c256fb65",
+      "uncommittedChanges": true,
+      "evidenceDirectory": "build-artifacts/releases/0.3.0-rc.1",
+      "statusDocument": "docs/m3.1-status.md",
+      "migrationDocument": "docs/m3.1-migration.md",
+      "publicationStatus": "not-published",
+      "dailyPackageChanged": false,
+      "webOAuth": "disabled-by-maintainer-decision",
+      "realProviderTrial": "not-run-for-this-candidate",
+      "archive": "build-artifacts/releases/0.3.0-rc.1/candidate/lilibonk-pi-pane-0.3.0-rc.1.tgz",
+      "sha256": "0ff73719ba02640a00e150ae95bc0a3844e51e6f70c2ba00e9cc0d9ecb015d72",
+      "packagedFiles": 131,
+      "packagedBytes": 658511,
+      "sourceSnapshot": "build-artifacts/releases/0.3.0-rc.1/candidate/source-snapshot.tar.gz",
+      "sourceSnapshotSha256": "2cac8a6ba5c8891d76b55a9051197070db8d19d219ee3f4dfe01e6f421adac4a",
+      "sourceFiles": 207,
+      "build": "passed",
+      "typecheck": "passed",
+      "unit": {
+        "passed": 259,
+        "total": 259,
+        "log": "build-artifacts/releases/0.3.0-rc.1/unit.log"
+      },
+      "exactInstall": {
+        "passed": 5,
+        "total": 5,
+        "archiveFilesMatched": 131,
+        "report": "build-artifacts/releases/0.3.0-rc.1/install/report.json"
+      },
+      "installedIntegration": {
+        "passed": 20,
+        "total": 20,
+        "report": "build-artifacts/releases/0.3.0-rc.1/install/integration/report.json"
+      },
+      "priorAttempts": [
+        {
+          "status": "incomplete-not-final-candidate",
+          "path": "build-artifacts/releases/0.3.0-rc.1/attempt-1",
+          "archiveSha256": "98276b3118ff30dba1981f2747a30aab57eb72aa12aeca8c78f3a12404b48ce1"
+        },
+        {
+          "status": "incomplete-not-final-candidate",
+          "path": "build-artifacts/releases/0.3.0-rc.1/attempt-2",
+          "archiveSha256": "48cb551af324cd4a3cff06fed80eec3a169ad2f60ea4408997887fe965ea6279",
+          "reason": "retained IPC channel kept event loop alive after shutdown dialog; fixed by channel.unref without dropping disconnect guard"
+        },
+        {
+          "status": "interrupted-before-harness-fix",
+          "path": "build-artifacts/releases/0.3.0-rc.1/attempt-3",
+          "archiveSha256": "0ff73719ba02640a00e150ae95bc0a3844e51e6f70c2ba00e9cc0d9ecb015d72",
+          "reason": "asynchronous model catalog placeholder read too early; bounded DOM wait retains strict assertion; production archive unchanged"
+        },
+        {
+          "status": "installation-harness-race-not-final-validation",
+          "path": "build-artifacts/releases/0.3.0-rc.1/attempt-4",
+          "archiveSha256": "0ff73719ba02640a00e150ae95bc0a3844e51e6f70c2ba00e9cc0d9ecb015d72",
+          "reason": "sidebar auto-close raced a harness click; use real Escape and verify final closed state; production unchanged"
+        }
+      ],
+      "regression": {
+        "status": "interrupted",
+        "completedExecutions": 17,
+        "passed": 178,
+        "interruptedExecution": "m31:design",
+        "fullMatrixPassed": false,
+        "lastExecutionCleanup": "not-confirmed",
+        "report": "build-artifacts/releases/0.3.0-rc.1/regression/summary.json",
+        "interruptionRecord": "build-artifacts/releases/0.3.0-rc.1/regression/interruption.json"
+      }
+    },
+    {
+      "version": "0.3.0-rc.2",
+      "status": "candidate-bytes-validated-with-open-independent-audit-findings",
+      "branch": "m3.1/gates",
+      "sourceBaseline": "bd6d4b9172b499fe966a8543deb9c526c256fb65",
+      "uncommittedChanges": true,
+      "evidenceDirectory": "build-artifacts/releases/0.3.0-rc.2",
+      "statusDocument": "docs/m3.1-status.md",
+      "migrationDocument": "docs/m3.1-migration.md",
+      "publicationStatus": "not-published",
+      "dailyPackageChanged": false,
+      "webOAuth": "disabled-by-maintainer-decision",
+      "realProviderTrial": "not-run-for-this-candidate",
+      "unit": {
+        "passed": 265,
+        "total": 265,
+        "log": "build-artifacts/releases/0.3.0-rc.2/audit/unit.log"
+      },
+      "repeats": {
+        "concurrencyRuns": 5,
+        "concurrencyEach": 7,
+        "resilienceRuns": 5,
+        "resilienceEach": 17,
+        "totalPassed": 120,
+        "report": "build-artifacts/releases/0.3.0-rc.2/audit/repeats.json"
+      },
+      "modelBashSupplement": {
+        "status": "failed",
+        "passed": 1,
+        "total": 2,
+        "commandProcessesRemainingInBothCases": 0,
+        "failure": "300 ms shutdown hook did not finish; assertion preserved",
+        "report": "build-artifacts/releases/0.3.0-rc.2/model-bash-orphan/evidence/report.json"
+      },
+      "auditFindings": [
+        "orphan-cleanup-scope",
+        "missing-protected-root-historical-git-content",
+        "request-local-protected-symlink-metadata-window",
+        "provider-removal-copy-with-zero-models"
+      ],
+      "auditReport": "build-artifacts/releases/0.3.0-rc.2/audit/review.json",
+      "archive": "build-artifacts/releases/0.3.0-rc.2/candidate/lilibonk-pi-pane-0.3.0-rc.2.tgz",
+      "sha256": "ce2f0c96f64afee43ba316cc8f7bdffa8112debebc3bb54fc61ec0f8443d64fc",
+      "packagedFiles": 131,
+      "packagedBytes": 660172,
+      "sourceSnapshot": "build-artifacts/releases/0.3.0-rc.2/candidate/source-snapshot.tar.gz",
+      "sourceSnapshotSha256": "f7bf9604332dbc2fd52d139d88a967a2a77d322b2516dabd82a524fbdde5d4fc",
+      "sourceFiles": 209,
+      "build": "passed",
+      "typecheck": "passed",
+      "mutation": {
+        "expectedFailures": 2,
+        "restoredPassed": 10,
+        "sourceRestoredExactly": true,
+        "report": "build-artifacts/releases/0.3.0-rc.2/audit/mutation.json"
+      },
+      "regression": {
+        "status": "passed",
+        "singleContinuousRun": true,
+        "completedExecutions": 24,
+        "reports": 25,
+        "passed": 257,
+        "total": 257,
+        "sourceAndBuildUnchanged": true,
+        "cleanup": "all-executions-clean-no-forced-termination",
+        "report": "build-artifacts/releases/0.3.0-rc.2/regression/summary.json"
+      },
+      "exactInstall": {
+        "passed": 5,
+        "total": 5,
+        "archiveFilesMatched": 131,
+        "registry": "temporary-local-registry",
+        "report": "build-artifacts/releases/0.3.0-rc.2/install/report.json"
+      },
+      "installedIntegration": {
+        "passed": 20,
+        "total": 20,
+        "screenshots": 34,
+        "layouts": 24,
+        "pageErrors": 0,
+        "externalModelRequests": 0,
+        "report": "build-artifacts/releases/0.3.0-rc.2/install/integration/report.json"
+      },
+      "acceptance": {
+        "passed": 8,
+        "partial": [
+          "E2E-05",
+          "E2E-08",
+          "E2E-09",
+          "E2E-10"
+        ],
+        "uncoveredWholeItems": 0,
+        "scope": "Local deterministic provider; partial scenarios remain uncovered; open audit findings retained",
+        "document": "docs/m3.1-gates.md#14-m31-5-整合独立审核与-rc2-候选验证"
+      },
+      "closureReport": "build-artifacts/releases/0.3.0-rc.2/candidate-closure.json",
+      "validationCompletedDate": "2026-10-12"
+    }
+  ]
 }

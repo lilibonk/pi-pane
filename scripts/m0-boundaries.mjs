@@ -64,15 +64,21 @@ export async function runBoundaries() {
       await client.close(); await fixture.close();
       return { ack: ack.status, actualTranscriptDelivery: false, hostErrorObserved: true, placeholderModel: client.snapshot.state.model };
     });
-    await check("missing test-provider authentication fails in the actual host preflight", ["Q2"], async () => {
-      const [fixture, client] = await create("missing-auth", { provider: "pi-pane-m0-noauth", model: "deterministic" });
+    await check("a selected test-provider whose synthetic startup key is removed fails actual prompt preflight", ["Q2"], async () => {
+      // pi restores only configured models; remove this local-only startup key after handoff.
+      const [fixture, client] = await create("missing-auth", { provider: "pi-pane-m0-noauth", model: "deterministic",
+        envOverrides: { PI_M0_ABSENT_AUTH_KEY: "M0_LOCAL_STARTUP_KEY_NOT_A_SECRET" } });
+      assert.equal(client.snapshot.state.model.provider, "pi-pane-m0-noauth");
+      const withdrawn = await client.command("prompt", { text: "/m0-withdraw-auth" });
+      assert.equal((await result(withdrawn.frame, client)).status, "completed");
+      const missing = await fixture.waitEvent("boundary_auth_removed"); assert.equal(missing.configured, false);
       assert.equal(client.snapshot.state.model.provider, "pi-pane-m0-noauth");
       const { ack, frame } = await client.command("prompt", { text: "M0_NO_AUTH_INPUT" }); assert.equal(ack.status, "dispatched");
       const failed = await result(frame, client); assert.equal(failed.status, "failed"); assert.match(failed.error.message, /No API key|Authentication failed/i); await pause(100);
       assert.equal(client.users("M0_NO_AUTH_INPUT").length, 0);
       assert.equal((await fixture.events()).filter((event) => event.event === "provider_call").length, 0);
       await client.close(); await fixture.close();
-      return { ack: ack.status, preflightRejected: true, providerCalls: 0 };
+      return { ack: ack.status, preflightRejected: true, providerCalls: 0, setup: "synthetic key configured only for model restoration, then removed and availability refreshed through the public extension API before prompt" };
     });
     [f, c] = await create("main");
     report.extension = f.extension; report.piCli = f.cli;

@@ -35,3 +35,14 @@ test("anything unexpected in storage means following pi", () => {
   const hostile = parseAppearance(JSON.stringify({ v: 1, mode: "theme", theme: "mine", cache: { mine: { "--bg": "url(x)", "--fg": "#ffffff" }, good: { ...vars, "--evil": "expression(1)" } } }));
   assert.deepEqual(hostile, { appearance: { mode: "theme", theme: "mine" }, cache: { good: vars } });
 });
+test("theme decorations default on and disabling them is a separate persisted browser preference", () => {
+  assert.notEqual(parseAppearance(null).appearance.showDecorations, false);
+  for (const mode of ["pi", "light", "dark", "system"] as const) {
+    const appearance = { mode, showDecorations: false, hideThinking: true };
+    assert.deepEqual(parseAppearance(serializeAppearance(appearance, {})).appearance, appearance);
+  }
+  assert.deepEqual(parseAppearance(serializeAppearance({ mode: "theme", theme: "pi-pane-porcelain", showDecorations: false }, {})).appearance,
+    { mode: "theme", theme: "pi-pane-porcelain", showDecorations: false });
+  for (const value of [true, "false", null, 0, {}]) assert.notEqual(parseAppearance(JSON.stringify({ v: 1, mode: "pi", showDecorations: value })).appearance.showDecorations, false);
+  assert.equal(serializeAppearance({ mode: "pi", showDecorations: true }, {}).includes("showDecorations"), false);
+});

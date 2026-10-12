@@ -1,10 +1,14 @@
 /** Wire contract. Only broadcast events consume sequence numbers. */
 import { WORKBENCH_ACTIONS, type WorkbenchQuery, type WorkbenchResult } from "./workbench.js";
 import { HOST_QUERIES, SETTING_KEYS, type SettingKey, type AccountAnswer, type AccountAnswerError, type AccountState, type HostQuery, type HostQueryAction, type HostResult } from "./host.js";
+import { safeDecorations, type ThemeDecorations } from "./theme-decorations.js";
 export * from "./workbench.js";
 export * from "./host.js";
 export * from "./providers.js";
-export const PROTOCOL = "pi-pane.v1";
+export * from "./theme-decorations.js";
+/** v2 pages understand host recovery, accounts and settings; v1 is accepted only to request a refresh. */
+export const PROTOCOL = "pi-pane.v2";
+export const LEGACY_PROTOCOL = "pi-pane.v1";
 export const WS_PATH = "/ws";
 
 /** Resource limits shared by the extension, the browser and the harnesses. */
@@ -158,6 +162,7 @@ export interface Snapshot {
   session: SessionView;
   state: StateView;
   theme: Record<string, string>;
+  decorations?: ThemeDecorations;
   caps: Caps;
   ui?: ExtensionUiState;
 }
@@ -173,7 +178,7 @@ export type ProjectionEvent =
   | { type: "tool_start" | "tool_update" | "tool_end"; tool: ToolView }
   | { type: "agent_state"; state: StateView }  // `tools` is always empty; see applyProjectionEvent
   | { type: "session_meta"; name?: string }
-  | { type: "theme"; theme: Record<string, string> };
+  | { type: "theme"; theme: Record<string, string>; decorations?: ThemeDecorations };
 export interface WireError { code: string; message: string; field?: string }
 export interface CommandEnvelope {
   t: "command";
@@ -681,6 +686,7 @@ export interface ProjectionState {
   session: SessionView;
   state: StateView;
   theme: Record<string, string>;
+  decorations?: ThemeDecorations;
 }
 /** Applies one sequenced event. Throws on malformed input so callers can resync. */
 export function applyProjectionEvent<T extends ProjectionState>(current: T, ev: ProjectionEvent): T {
@@ -722,6 +728,8 @@ export function applyProjectionEvent<T extends ProjectionState>(current: T, ev: 
       break;
     case "theme":
       if (ev.theme) next.theme = ev.theme;
+      // Absent metadata actively clears artwork from the previously selected theme.
+      next.decorations = safeDecorations(ev.decorations);
       break;
     default:
       throw new Error("unknown event");

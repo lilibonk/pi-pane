@@ -7,7 +7,7 @@ import test from "node:test";
 import WebSocket from "ws";
 import { Hub, type HubOptions, type HostHandler } from "../src/extension/hub.ts";
 import type { Bridge, BridgeObserver } from "../src/extension/bridge.ts";
-import { COMMANDS, ProtocolError, type CommandEnvelope, type ServerMessage } from "../src/protocol/index.ts";
+import { PROTOCOL, COMMANDS, ProtocolError, type CommandEnvelope, type ServerMessage } from "../src/protocol/index.ts";
 
 const delay = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 async function until<T>(predicate: () => T | undefined | false, label: string, timeout = 2_000): Promise<T> {
@@ -42,7 +42,7 @@ async function fixture(options: Partial<HubOptions> = {}, overrides: Record<stri
     async close() { await hub.close(); await rm(directory, { recursive: true, force: true }); } };
 }
 async function client(hub: Hub, clientId?: string) {
-  const socket = new WebSocket(`${hub.origin.replace("http:", "ws:")}/ws`, ["pi-pane.v1", `pi-pane.bearer.${hub.token}`], { origin: hub.origin });
+  const socket = new WebSocket(`${hub.origin.replace("http:", "ws:")}/ws`, [PROTOCOL, `pi-pane.bearer.${hub.token}`], { origin: hub.origin });
   const frames: ServerMessage[] = [];
   let closed = false;
   socket.on("error", () => {});
@@ -60,6 +60,45 @@ function envelope(clientId: string, hub: Hub, commandNo: number): CommandEnvelop
   return { t: "command", clientId, commandNo, id: `${clientId}:${commandNo}`, epoch: hub.epoch,
     sessionId: "fixture-session", branchRevision: 0, command: "prompt", args: { text: "test" } };
 }
+
+test("authenticated v1 pages get only a fatal refresh notice and consume no client lease", async () => {
+  const f = await fixture({ maxClients: 1 });
+  try {
+    const frames: ServerMessage[] = [];
+    const legacy = new WebSocket(`${f.hub.origin.replace("http:", "ws:")}/ws`, ["pi-pane.v1", `pi-pane.bearer.${f.hub.token}`], { origin: f.hub.origin });
+    legacy.on("error", () => {});
+    legacy.on("message", raw => frames.push(JSON.parse(raw.toString())));
+    const closed = new Promise<{ code: number; reason: string }>(resolve => legacy.once("close", (code, reason) => resolve({ code, reason: reason.toString() })));
+    await new Promise<void>((resolve, reject) => { legacy.once("open", resolve); legacy.once("error", reject); });
+    assert.deepEqual(await closed, { code: 1002, reason: "refresh_required" });
+    assert.equal(frames.length, 1);
+    assert.equal(frames[0]?.t, "error");
+    if (frames[0]?.t !== "error") assert.fail("legacy error expected");
+    assert.equal(frames[0].error.code, "unauthorized", "the frozen page recognizes this as fatal and does not reconnect");
+    assert.match(frames[0].error.message, /刷新页面/);
+    assert.equal(f.hub.connectionCount, 0);
+    assert.equal(f.calls(), 0);
+    const current = await client(f.hub);
+    assert.equal(current.socket.protocol, PROTOCOL);
+    await current.wait("snapshot");
+    await current.close();
+  } finally { await f.close(); }
+});
+
+test("v1 compatibility never bypasses bearer authentication", async () => {
+  const f = await fixture();
+  try {
+    const socket = new WebSocket(`${f.hub.origin.replace("http:", "ws:")}/ws`, ["pi-pane.v1", "pi-pane.bearer.invalid"], { origin: f.hub.origin });
+    socket.on("error", () => {});
+    const status = await new Promise<number | undefined>((resolve, reject) => {
+      socket.once("unexpected-response", (_request, response) => { response.resume(); resolve(response.statusCode); socket.terminate(); });
+      socket.once("open", () => { socket.close(); reject(new Error("unauthenticated legacy socket opened")); });
+      socket.once("error", reject);
+    });
+    assert.equal(status, 401);
+    assert.equal(f.hub.connectionCount, 0);
+  } finally { await f.close(); }
+});
 
 test("workbench queries are directed and discard results after an epoch change", async () => {
   let resolveRead: (value: unknown) => void = () => {};
@@ -215,7 +254,7 @@ test("frames above the transport limit are chunked contiguously and reassemble t
   });
   try {
     const raw: string[] = [];
-    const socket = new WebSocket(`${f.hub.origin.replace("http:", "ws:")}/ws`, ["pi-pane.v1", `pi-pane.bearer.${f.hub.token}`], { origin: f.hub.origin });
+    const socket = new WebSocket(`${f.hub.origin.replace("http:", "ws:")}/ws`, [PROTOCOL, `pi-pane.bearer.${f.hub.token}`], { origin: f.hub.origin });
     socket.on("message", (data) => raw.push(data.toString()));
     await new Promise<void>((resolve, reject) => { socket.once("open", resolve); socket.once("error", reject); });
     socket.send(JSON.stringify({ t: "hello" }));
@@ -361,7 +400,7 @@ test("host queries are directed, need a lease but no session, and unauthenticate
     const invalid = await c.wait("error", from); assert.ok(invalid.t === "error"); assert.equal(invalid.error.code, "invalid_args");
     assert.deepEqual(asked, [["directories", { path: "/fixture" }], ["project_inspect", { path: "/fixture/.ssh" }]]);
     // No bearer, no listing: the socket never reaches the handler.
-    const anonymous = new WebSocket(`${f.hub.origin.replace("http:", "ws:")}/ws`, ["pi-pane.v1"], { origin: f.hub.origin });
+    const anonymous = new WebSocket(`${f.hub.origin.replace("http:", "ws:")}/ws`, [PROTOCOL], { origin: f.hub.origin });
     const outcome = await new Promise<string>(resolve => { anonymous.once("open", () => { anonymous.send(JSON.stringify({ t: "host_query", reqId: "q", action: "directories", args: {} })); }); anonymous.once("message", raw => resolve(raw.toString())); anonymous.once("close", () => resolve("closed")); anonymous.once("error", () => resolve("refused")); setTimeout(() => resolve("silent"), 500); });
     assert(!outcome.includes("entries")); assert.equal(asked.length, 2);
     anonymous.terminate(); await c.close(); await other.close();

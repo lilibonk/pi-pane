@@ -81,7 +81,7 @@ try {
   await check("THM-04", "the theme list has pi's built-ins, this package's, the user directory's, and reports a broken file without a host path", async () => {
     const view = await hostQuery(client, "themes");
     const sources = Object.fromEntries(view.themes.map(entry => [entry.name, entry.source]));
-    assert.deepEqual(sources, { "pi-pane-dark": "pi-pane", "pi-pane-light": "pi-pane", dark: "builtin", light: "builtin", "m31-light": "user", "m31-user": "user" });
+    assert.deepEqual(sources, { "pi-pane-dark": "pi-pane", "pi-pane-light": "pi-pane", "pi-pane-porcelain": "pi-pane", dark: "builtin", light: "builtin", "m31-light": "user", "m31-user": "user" });
     assert.deepEqual(view.problems, [{ file: "m31-broken.json", source: "user", code: "invalid_json", message: view.problems[0].message }]);
     assert.equal(JSON.stringify(view).includes(base0), false, "no host path in the theme list");
     assert.equal(view.projectThemes, "none");

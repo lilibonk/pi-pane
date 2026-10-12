@@ -8,7 +8,7 @@
  * - `light` / `dark`: pi-pane's own themes. `theme`: one installed pi theme, by name.
  */
 export type AppearanceMode = "pi" | "system" | "light" | "dark" | "theme";
-export interface Appearance { mode: AppearanceMode; theme?: string; hideThinking?: boolean }
+export interface Appearance { mode: AppearanceMode; theme?: string; hideThinking?: boolean; showDecorations?: boolean }
 export type ThemeVars = Record<string, string>;
 export const LIGHT_THEME = "pi-pane-light", DARK_THEME = "pi-pane-dark";
 export const DEFAULT_APPEARANCE: Appearance = { mode: "pi" };
@@ -51,13 +51,13 @@ export function parseAppearance(text: string | null): { appearance: Appearance; 
     if (safe) cache[name] = safe;
   }
   // A named theme without a name is no choice at all.
-  return { appearance: { mode: mode === "theme" && !theme ? "pi" : mode, ...(mode === "theme" && theme ? { theme } : {}), ...(stored.hideThinking === true ? { hideThinking: true } : {}) }, cache };
+  return { appearance: { mode: mode === "theme" && !theme ? "pi" : mode, ...(mode === "theme" && theme ? { theme } : {}), ...(stored.hideThinking === true ? { hideThinking: true } : {}), ...(stored.showDecorations === false ? { showDecorations: false } : {}) }, cache };
 }
 export function serializeAppearance(appearance: Appearance, cache: Record<string, ThemeVars>): string {
   // Colors are kept for the themes this choice can show, so the page paints before it connects and
   // keeps its last valid colors when a theme later goes missing.
   const names = appearance.mode === "pi" ? [] : appearance.mode === "theme" ? [appearance.theme!] : appearance.mode === "system" ? [LIGHT_THEME, DARK_THEME] : [appearance.mode === "light" ? LIGHT_THEME : DARK_THEME];
-  return JSON.stringify({ v: 1, mode: appearance.mode, ...(appearance.theme && appearance.mode === "theme" ? { theme: appearance.theme } : {}), ...(appearance.hideThinking ? { hideThinking: true } : {}),
+  return JSON.stringify({ v: 1, mode: appearance.mode, ...(appearance.theme && appearance.mode === "theme" ? { theme: appearance.theme } : {}), ...(appearance.hideThinking ? { hideThinking: true } : {}), ...(appearance.showDecorations === false ? { showDecorations: false } : {}),
     cache: Object.fromEntries(names.filter(name => cache[name]).map(name => [name, cache[name]])) });
 }
 export function loadAppearance(): { appearance: Appearance; cache: Record<string, ThemeVars> } {
@@ -66,7 +66,7 @@ export function loadAppearance(): { appearance: Appearance; cache: Record<string
 /** Returns false when this browser cannot keep the choice (private mode, storage disabled). */
 export function saveAppearance(appearance: Appearance, cache: Record<string, ThemeVars>): boolean {
   try {
-    if (appearance.mode === "pi" && !appearance.hideThinking) localStorage.removeItem(KEY);
+    if (appearance.mode === "pi" && !appearance.hideThinking && appearance.showDecorations !== false) localStorage.removeItem(KEY);
     else localStorage.setItem(KEY, serializeAppearance(appearance, cache));
     return true;
   } catch { return false; }

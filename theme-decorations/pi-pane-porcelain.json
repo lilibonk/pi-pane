@@ -1,0 +1,9 @@
+{
+  "id": "pi-pane-porcelain",
+  "slots": {
+    "brand": { "asset": "porcelain-branch", "colorRole": "accent", "opacity": 0.18, "tile": "none" },
+    "empty": { "asset": "porcelain-branch", "colorRole": "accent", "opacity": 0.16, "tile": "none" },
+    "settingsHeader": { "asset": "porcelain-wave", "colorRole": "borderAccent", "opacity": 0.15, "tile": "none" },
+    "divider": { "asset": "porcelain-wave", "colorRole": "muted", "opacity": 0.12, "tile": "repeat-x" }
+  }
+}

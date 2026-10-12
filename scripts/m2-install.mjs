@@ -30,6 +30,7 @@ const candidateTarball = process.env.PI_M2_CANDIDATE_TARBALL;
 assert.ok(!(publishedTarball && candidateTarball), "Select either a candidate or a published tarball, not both");
 const suppliedTarball = publishedTarball || candidateTarball;
 const mode = publishedTarball ? "published" : "simulated";
+const m31 = process.env.PI_M31_INSTALL === "1";
 const report = { scope: "A11 install: npm tarball contents and pi install from a registry into a clean agent directory", mode,
   registry: publishedTarball ? `${UPSTREAM}/` : "temporary local registry (proxies other packages to public npm)",
   provider: "pi-pane-m0/deterministic (no provider credentials)", piVersion: host.version, piCli: host.cli, checks: [], status: "running",
@@ -74,6 +75,7 @@ try {
     }
     tarballBytes = await readFile(tarball);
     for (const required of ["package.json", "README.md", "dist/extension/index.js", "dist/extension/theme.js", "dist/protocol/index.js", "web-dist/index.html", "web-dist/pi-pane.css", "themes/pi-pane-dark.json", "themes/pi-pane-light.json"]) assert.ok(files.includes(required), required);
+    if (m31) for (const required of ["dist/extension/handoff.js", "dist/extension/auth-controller.js", "dist/extension/projects.js", "dist/extension/settings-controller.js", "dist/extension/theme-decorations.js", "dist/protocol/host.js", "themes/pi-pane-porcelain.json", "theme-decorations/pi-pane-porcelain.json", "web-dist/decorations/porcelain-wave.svg", "docs/m3.1-migration.md"]) assert.ok(files.includes(required), required);
     assert.ok(files.some(file => /^web-dist\/assets\/index-.*\.js$/.test(file)), "web bundle");
     assert.ok(files.some(file => /^web-dist\/assets\/index-.*\.css$/.test(file)), "web styles");
     for (const file of files) assert.ok(!/^(src|tests|scripts|build-artifacts|node_modules)\//.test(file), `unexpected ${file}`);
@@ -177,6 +179,11 @@ try {
     for (const devOnly of ["vite", "playwright", "typescript", "preact", "shiki"]) assert.ok(!names.includes(devOnly), `${devOnly} is not installed`);
     for (const runtime of ["ws", "qrcode-generator"]) assert.ok(names.includes(runtime), `${runtime} is installed`);
     assert.ok((await stat(join(root, "web-dist/index.html"))).isFile(), "prebuilt web assets are installed");
+    const extracted = join(work, "expected"); await mkdir(extracted);
+    await run("tar", ["-xzf", tarball, "-C", extracted]);
+    for (const file of files) assert.equal(createHash("sha256").update(await readFile(join(root, file))).digest("hex"),
+      createHash("sha256").update(await readFile(join(extracted, "package", file))).digest("hex"), `installed bytes match archive: ${file}`);
+    installed.verifiedArchiveFiles = files.length;
     installed.root = root.replace(fixture.agentDir, "<agentDir>");
     return installed;
   });
@@ -208,7 +215,7 @@ try {
     const page = await browser.newPage();
     await page.goto(fixture.url);
     await page.getByText("已连接", { exact: true }).waitFor();
-    for (const name of ["pi-pane-dark", "pi-pane-light"]) {
+    for (const name of ["pi-pane-dark", "pi-pane-light", ...(m31 ? ["pi-pane-porcelain"] : [])]) {
       const theme = JSON.parse(await readFile(join(installedRoot, "themes", `${name}.json`), "utf8"));
       assert.equal(theme.name, name);
       assert.ok(theme.export.pageBg);
@@ -216,12 +223,27 @@ try {
     }
     // Theme mutation has no public RPC method; the handoff's initial theme is retained.
     assert.ok(await page.evaluate(() => getComputedStyle(document.documentElement).getPropertyValue("--bg").trim().length > 0));
+    const originalCss = await readFile(join(installedRoot, "web-dist/pi-pane.css"));
     await writeFile(join(installedRoot, "web-dist/pi-pane.css"), ':root { font-family: monospace; } .composer { border-radius: 19px; }\n');
     await page.reload();
     await page.getByText("已连接", { exact: true }).waitFor();
     assert.equal(await page.evaluate(() => getComputedStyle(document.querySelector(".composer")).borderRadius), "19px");
     assert.equal(await page.evaluate(() => getComputedStyle(document.documentElement).fontFamily), "monospace");
+    await writeFile(join(installedRoot, "web-dist/pi-pane.css"), originalCss);
     await page.close();
+  });
+  if (m31) await check("M31-E2E-07: the exact installed archive completes the desktop and mobile project/account/theme/tool loop", async () => {
+    const integrationDir = join(reportDir, "integration");
+    const { stdout, stderr } = await execute(process.execPath, ["--import", "tsx", "scripts/m31-integration.mjs"], {
+      cwd: project, env: { PATH: process.env.PATH, HOME: work, PI_M0_CLI: host.cli,
+        PI_M0_EXTENSION: join(installedRoot, "dist/extension/index.js"), PI_M31_TARBALL_SHA256: report.archive.sha256,
+        PI_M31_REPORT_DIR: integrationDir }, timeout: 420_000, maxBuffer: 8 * 1024 * 1024 });
+    await writeFile(join(reportDir, "integration.log"), redact(`${stdout}${stderr}`));
+    const integrated = JSON.parse(await readFile(join(integrationDir, "report.json"), "utf8"));
+    assert.equal(integrated.status, "passed");
+    assert.ok(integrated.checks.every(item => item.status === "passed"));
+    return { archiveSha256: report.archive.sha256, report: "integration/report.json", checks: integrated.checks.length,
+      extension: "<installedPackage>/dist/extension/index.js", sourceExtensionLoaded: false };
   });
   report.status = "passed";
 } catch (error) {
@@ -234,6 +256,7 @@ try {
   if (fixture) { await fixture.close(); await fixture.remove(); }
   await new Promise(done => registry ? registry.close(() => done()) : done());
   await rm(work, { recursive: true, force: true });
+  report.cleanup = { installationRemoved: true, fixtureRemoved: true, registryClosed: true };
   report.finishedAt = new Date().toISOString();
   await writeFile(join(reportDir, "report.json"), `${JSON.stringify(report, null, 2)}\n`);
   console.log(`Report (${mode} registry): ${join(reportDir, "report.json")}`);

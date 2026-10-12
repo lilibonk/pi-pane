@@ -8,7 +8,7 @@
 // Chrome reaches the public host name through --host-resolver-rules and accepts the test certificate (ignoreHTTPSErrors).
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, realpath, rm, stat, writeFile } from "node:fs/promises";
 import { request as httpRequest, get as httpGet } from "node:http";
 import { createServer as createHttpsServer, request as httpsRequest } from "node:https";
 import { connect, createServer } from "node:net";
@@ -17,15 +17,17 @@ import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { chromium, devices } from "playwright";
 import WebSocket from "ws";
+import { PROTOCOL } from "../dist/protocol/index.js";
 import { startFixture, waitFor, openClient, commandResult } from "./m0-smoke.mjs";
 
 const project = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const reportDir = resolve(process.env.PI_M2_REPORT_DIR ?? join(project, "build-artifacts/m3/handoff/m2/external"));
 await mkdir(reportDir, { recursive: true });
 const PASSWORD = "m2-fixture-password-not-a-secret";
+const ACCOUNT_KEY = "sk-m31-external-fixture-not-a-credential";
 const HOST = "pane.example.test";
 const stripAnsi = value => value.replace(/\u001b\][^\u0007]*(?:\u0007|\u001b\\)/g, "").replace(/\u001b\[[0-?]*[ -/]*[@-~]/g, "");
-const redact = value => String(value).replace(/#t=[A-Za-z0-9_-]+/g, "#t=[REDACTED]").replace(/pi-pane\.bearer\.[A-Za-z0-9_-]+/g, "pi-pane.bearer.[REDACTED]").replaceAll(PASSWORD, "[PASSWORD]");
+const redact = value => String(value).replace(/#t=[A-Za-z0-9_-]+/g, "#t=[REDACTED]").replace(/pi-pane\.bearer\.[A-Za-z0-9_-]+/g, "pi-pane.bearer.[REDACTED]").replaceAll(PASSWORD, "[PASSWORD]").replaceAll(ACCOUNT_KEY, "[ACCOUNT_KEY]");
 const report = {
   scope: "A10 external access (TLS proxy and direct TLS) and A11 mobile use over a real pi TUI and system Chrome",
   realTui: true, realModelCalls: 0, browser: "system Chrome via Playwright, headless; test certificate accepted via ignoreHTTPSErrors",
@@ -97,7 +99,7 @@ function call(url, { method = "GET", headers = {}, body, ca } = {}) {
 function rejectedUpgrade(url, token, origin) {
   const target = new URL(url);
   return new Promise(done => {
-    const socket = new WebSocket(`wss://127.0.0.1:${target.port}/ws`, ["pi-pane.v1", `pi-pane.bearer.${token}`], { headers: { Host: target.host, Origin: origin }, rejectUnauthorized: false });
+    const socket = new WebSocket(`wss://127.0.0.1:${target.port}/ws`, [PROTOCOL, `pi-pane.bearer.${token}`], { headers: { Host: target.host, Origin: origin }, rejectUnauthorized: false });
     socket.on("unexpected-response", (_request, response) => { done(response.statusCode); socket.terminate(); });
     socket.on("open", () => { done("open"); socket.close(); });
     socket.on("error", () => done("error"));
@@ -242,6 +244,65 @@ try {
     return { overflow, steerHeight: steerSize.height };
   });
 
+  if (process.env.PI_M31_EXTERNAL === "1") await check("M31-E2E-08: mobile HTTPS proxy opens a host project and completes the supported API-key login after reload", async () => {
+    const mobile = await browser.newContext({ ...devices["Pixel 7"], viewport: { width: 390, height: 844 }, ignoreHTTPSErrors: true });
+    const phone = await mobile.newPage();
+    phone.on("pageerror", error => errors.push(String(error)));
+    await phone.goto(fixture.publicUrl); await login(phone, PASSWORD);
+    await phone.getByText("已连接", { exact: true }).waitFor();
+    await phone.getByRole("button", { name: "打开工作区与会话", exact: true }).tap();
+    await phone.getByLabel("添加项目", { exact: true }).tap();
+    await phone.getByRole("button", { name: "新建项目", exact: true }).tap();
+    const directoryDialog = phone.getByRole("dialog", { name: "新建项目", exact: true });
+    await directoryDialog.getByText("这里列出的是运行 pi 的那台电脑上的文件夹", { exact: false }).waitFor();
+    await directoryDialog.getByRole("textbox", { name: "文件夹的绝对路径" }).fill(fixture.directory);
+    await directoryDialog.getByRole("button", { name: "前往", exact: true }).tap();
+    await directoryDialog.getByLabel("新文件夹名", { exact: true }).fill("手机远程项目");
+    const target = join(await realpath(fixture.directory), "手机远程项目");
+    await directoryDialog.locator(".create-preview code").filter({ hasText: target }).waitFor();
+    await phone.screenshot({ path: join(reportDir, "m31-mobile-host-directory.png") });
+    await directoryDialog.getByRole("button", { name: "创建并打开", exact: true }).tap();
+    await directoryDialog.waitFor({ state: "hidden" });
+    await waitFor(async () => (await stat(target).catch(() => undefined))?.isDirectory(), "new host directory");
+    await waitFor(async () => (await phone.locator(".workbench-project").getAttribute("title")) === target, "remote project selected");
+
+    await phone.getByRole("button", { name: "打开工作区与会话", exact: true }).tap();
+    await phone.getByRole("button", { name: "设置", exact: true }).tap();
+    await phone.getByRole("group", { name: "设置分类" }).getByRole("button", { name: "账户", exact: true }).tap();
+    await phone.getByRole("searchbox", { name: "查找服务商", exact: true }).fill("openai");
+    const provider = phone.locator(".account-item").filter({ has: phone.locator("strong").filter({ hasText: /^OpenAI$/i }) });
+    await provider.getByRole("button", { name: "用 API key 登录", exact: true }).tap();
+    const accountDialog = phone.locator('.dialog[aria-labelledby="account-dialog-title"]');
+    await accountDialog.locator('input[type="password"]').waitFor();
+    const owner = await phone.evaluate(() => sessionStorage.getItem("pi-pane.clientId"));
+    // Reload replaces the mobile page while the same host-side login keeps waiting.
+    await phone.reload(); await phone.getByText("已连接", { exact: true }).waitFor();
+    await accountDialog.locator('input[type="password"]').waitFor();
+    assert.equal(await phone.evaluate(() => sessionStorage.getItem("pi-pane.clientId")), owner);
+    await accountDialog.locator('input[type="password"]').fill(ACCOUNT_KEY);
+    await accountDialog.getByRole("button", { name: "提交", exact: true }).tap();
+    await accountDialog.getByText("凭据已写入 pi 的凭据文件。", { exact: false }).waitFor();
+    const disk = JSON.parse(await readFile(join(fixture.agentDir, "auth.json"), "utf8"));
+    assert.equal(disk.openai?.key, ACCOUNT_KEY);
+    assert.equal((await stat(join(fixture.agentDir, "auth.json"))).mode & 0o777, 0o600);
+    assert.equal(await accountDialog.locator('input[type="password"]').count(), 0, "submitted input is cleared");
+    const storage = await phone.evaluate(() => ({ local: { ...localStorage }, session: { ...sessionStorage } }));
+    assert.ok(!JSON.stringify(storage).includes(ACCOUNT_KEY));
+    assert.ok(!(await phone.locator("body").innerText()).includes(ACCOUNT_KEY));
+    assert.ok(!(fixture.terminal + JSON.stringify(await fixture.events())).includes(ACCOUNT_KEY));
+    await phone.screenshot({ path: join(reportDir, "m31-mobile-account-saved.png") });
+    assert.equal(await phone.evaluate(() => document.documentElement.scrollWidth > innerWidth), false);
+    await accountDialog.getByRole("button", { name: "关闭", exact: true }).tap();
+    await accountDialog.waitFor({ state: "detached" });
+    await phone.getByRole("textbox", { name: "消息", exact: true }).fill("M31_HTTPS_PROJECT");
+    await phone.getByRole("button", { name: /^(发送 ↗|请求 followUp ↗)$/ }).tap();
+    await phone.locator(".message-assistant").filter({ hasText: "M0_REPLY:M31_HTTPS_PROJECT:complete" }).waitFor();
+    await mobile.close();
+    return { viewport: "390×844", transport: "HTTPS/WSS through local TLS proxy with password", hostProjectCreated: true,
+      apiKeySavedThroughPi: true, sameLeaseAfterReload: true, secretInStorageOrDom: false, realProviderCalls: 0,
+      notCovered: ["Physical phone and real public-network proxy", "Device OAuth remains disabled by the maintainer's earlier decision", "Several-minute background suspension"] };
+  });
+
   await check("direct TLS: HTTPS/WSS with the certificate and the same login; plain HTTP is not served", async () => {
     await proxy.close(); proxy = undefined;
     fixture.write("\u0003");
@@ -267,6 +328,11 @@ try {
 } catch (error) {
   report.status = "failed";
   report.error = redact(error?.stack ?? error);
+  const failedPage = browser?.contexts().flatMap(context => context.pages()).at(-1);
+  if (failedPage) {
+    await failedPage.screenshot({ path: join(reportDir, "failure.png") }).catch(() => {});
+    await writeFile(join(reportDir, "failure-page.txt"), redact(await failedPage.locator("body").innerText().catch(() => "Page unavailable")));
+  }
   if (fixture) report.terminalTail = redact(terminalText(fixture).slice(-3000));
   process.exitCode = 1;
 } finally {

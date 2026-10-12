@@ -39,11 +39,18 @@ test("the required token list matches what pi's built-in themes define", async (
   }
 });
 test("this package's themes are complete pi themes", async () => {
-  for (const name of ["pi-pane-light", "pi-pane-dark"]) {
+  for (const name of ["pi-pane-light", "pi-pane-dark", "pi-pane-porcelain"]) {
     const parsed = parseThemeText(await readFile(join(bundledDir, `${name}.json`), "utf8"), join(bundledDir, `${name}.json`));
-    assert.equal(parsed.name, name); assert.equal(parsed.theme.appearance, name.endsWith("light") ? "light" : "dark");
+    assert.equal(parsed.name, name); assert.equal(parsed.theme.appearance, name.endsWith("dark") ? "dark" : "light");
   }
 });
+test("a user theme that shadows porcelain keeps its colors without acquiring the bundled artwork", () => fixture(async ({ agentDir, start, base, write, catalog }) => {
+  const themes = catalog();
+  assert.equal((await themes.load(start, false)).entries.get("pi-pane-porcelain")?.decorations?.id, "pi-pane-porcelain");
+  await write(join(agentDir, "themes", "porcelain.json"), { ...base, name: "pi-pane-porcelain" });
+  const entry = (await themes.load(start, false)).entries.get("pi-pane-porcelain")!;
+  assert.equal(entry.source, "user"); assert.equal(entry.decorations, undefined);
+}));
 test("themes come from the trusted project, the user directory, the handoff list, pi and this package, in that order", () => fixture(async ({ agentDir, start, root, base, write, catalog }) => {
   await write(join(agentDir, "themes", "mine.json"), { ...base, name: "mine" });
   await write(join(agentDir, "themes", "shared.json"), { ...base, name: "shared", appearance: "light" });
@@ -54,7 +61,7 @@ test("themes come from the trusted project, the user directory, the handoff list
   const themes = catalog([{ name: "packed", path: packaged }, { name: "cli", path: elsewhere }, { name: "mine", path: join(agentDir, "themes", "mine.json") }, { name: "pi-pane-dark", path: join(bundledDir, "pi-pane-dark.json") }]);
   const trusted = await themes.load(start, true);
   const bySource = Object.fromEntries(themes.items(trusted).map(item => [item.name, item.source]));
-  assert.deepEqual(bySource, { "pi-pane-dark": "pi-pane", "pi-pane-light": "pi-pane", dark: "builtin", light: "builtin", mine: "user", shared: "project", local: "project", packed: "handoff", cli: "handoff" });
+  assert.deepEqual(bySource, { "pi-pane-dark": "pi-pane", "pi-pane-light": "pi-pane", "pi-pane-porcelain": "pi-pane", dark: "builtin", light: "builtin", mine: "user", shared: "project", local: "project", packed: "handoff", cli: "handoff" });
   assert.equal(trusted.entries.get("shared")!.theme.appearance, "dark", "the project's theme wins over the user's of the same name");
   assert.deepEqual(trusted.problems.map(problem => [problem.code, problem.file, problem.source]), [["duplicate", "shared.json", "user"]]);
   assert.equal(trusted.projectThemes, "loaded");
@@ -73,9 +80,9 @@ test("another project sees only what belongs to pi itself, never the start proje
   await write(join(other, ".pi", "themes", "theirs.json"), { ...base, name: "theirs" });
   const themes = catalog([{ name: "local", path: project }, { name: "packed", path: packaged }, { name: "cli", path: elsewhere }]);
   const names = async (cwd: string, trusted: boolean) => themes.items(await themes.load(cwd, trusted)).map(item => item.name).sort();
-  assert.deepEqual(await names(start, false), ["cli", "dark", "light", "local", "packed", "pi-pane-dark", "pi-pane-light"], "what pi itself had loaded at handoff");
-  assert.deepEqual(await names(other, false), ["dark", "light", "packed", "pi-pane-dark", "pi-pane-light"]);
-  assert.deepEqual(await names(other, true), ["dark", "light", "packed", "pi-pane-dark", "pi-pane-light", "theirs"]);
+  assert.deepEqual(await names(start, false), ["cli", "dark", "light", "local", "packed", "pi-pane-dark", "pi-pane-light", "pi-pane-porcelain"], "what pi itself had loaded at handoff");
+  assert.deepEqual(await names(other, false), ["dark", "light", "packed", "pi-pane-dark", "pi-pane-light", "pi-pane-porcelain"]);
+  assert.deepEqual(await names(other, true), ["dark", "light", "packed", "pi-pane-dark", "pi-pane-light", "pi-pane-porcelain", "theirs"]);
   assert.equal((await themes.load(other, false)).projectThemes, "untrusted");
 }));
 test("a broken, oversized, misnamed or hostile theme file is reported and nothing of it is used", () => fixture(async ({ agentDir, start, base, write, catalog }) => {
@@ -103,7 +110,7 @@ test("a broken, oversized, misnamed or hostile theme file is reported and nothin
   if (fifo) expected["pipe-link.json"] = "unreadable";
   assert.deepEqual(Object.fromEntries(loaded.problems.map(problem => [problem.file, problem.code])), expected);
   assert.match(loaded.problems.find(problem => problem.file === "missing.json")!.message, /accent/);
-  assert.deepEqual(themes.items(loaded).map(item => item.name).sort(), ["dark", "good", "light", "pi-pane-dark", "pi-pane-light"]);
+  assert.deepEqual(themes.items(loaded).map(item => item.name).sort(), ["dark", "good", "light", "pi-pane-dark", "pi-pane-light", "pi-pane-porcelain"]);
   // Only colors leave the host: every value is a hex color and no unknown field or path travels with it.
   const good = loaded.entries.get("good")!;
   for (const [key, value] of Object.entries(good.vars)) { assert.match(key, /^--[a-z][a-z0-9-]*$/); assert.match(value, /^#[0-9a-f]{6}$/i); }
@@ -115,7 +122,7 @@ test("with --no-themes only pi's own, this package's and explicitly loaded theme
   const explicit = await write(join(root, "elsewhere", "cli.json"), { ...base, name: "cli" });
   const themes = new ThemeCatalog({ agentDir, bundledDir, handoff: [{ name: "dark", path: join(piThemes, "dark.json") }, { name: "cli", path: explicit }], handoffTheme, startCwd: start, discover: false });
   const loaded = await themes.load(start, true);
-  assert.deepEqual(themes.items(loaded).map(item => item.name).sort(), ["cli", "dark", "pi-pane-dark", "pi-pane-light"]); assert.equal(loaded.projectThemes, "none");
+  assert.deepEqual(themes.items(loaded).map(item => item.name).sort(), ["cli", "dark", "pi-pane-dark", "pi-pane-light", "pi-pane-porcelain"]); assert.equal(loaded.projectThemes, "none");
 }));
 test("the list is bounded", () => fixture(async ({ agentDir, start, base, write, catalog }) => {
   await Promise.all(Array.from({ length: 140 }, (_, index) => write(join(agentDir, "themes", `t${String(index).padStart(3, "0")}.json`), { ...base, name: `t${index}` })));
