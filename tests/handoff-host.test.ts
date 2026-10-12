@@ -635,6 +635,8 @@ test("a key saved from the browser reaches the running session in process: same 
   // Stale page state does not block an account command; it has its own operation identity.
   await signIn(host, "lease-1", "acme", "sk-web-key");
   await waitFor(() => !child.calls.every(call => call.type !== "switch_session") && host.hostState().phase === "ready", "applied");
+  // The reload continues after pi has reopened the session (lock, rebind, model check); the change counts as applied only once that has finished.
+  await waitFor(async () => (await host.hostQuery("accounts")).pendingApply === false, "apply settled");
   await waitFor(async () => (await models(host, "acme"))?.models === 1, "model list refreshed");
   accounts = await host.hostQuery("accounts");
   assert.deepEqual(accounts.providers.map(provider => [provider.id, provider.stored, provider.models]).slice(0, 2), [["acme", "api_key", 1], ["local", undefined, 1]]); assert.equal(accounts.pendingApply, false);
@@ -886,6 +888,8 @@ for (const [label, after] of [["a placeholder", { provider: "unknown", id: "unkn
     let view = await host.hostQuery("providers");
     await host.hostCommand("provider_save", providerArgs({ revision: view.revision }));
     await signIn(host, "lease-1", "mine", "sk-mine"); await waitFor(async () => (await host.hostQuery("providers")).providers[0]?.available === 1, "available");
+    // The reload that applied the key must be over before the model is changed under it, or its own model check reports that change.
+    await waitFor(async () => !(await host.hostQuery("providers")).pendingApply, "key applied");
     child.model = { provider: "mine", id: "mine-model", name: "mine" };
     view = await host.hostQuery("providers"); assert.equal(view.providers[0]!.inUse, true);
     child.modelAfterReload = after;
