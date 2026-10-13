@@ -1,4 +1,4 @@
-import { useState } from "preact/hooks";
+import { useLayoutEffect, useRef, useState } from "preact/hooks";
 import { CUSTOM_PROVIDER_APIS, ProtocolError, insecureAddress, validateProvider, type CustomProvider, type CustomProviderResult, type CustomProvidersView } from "../protocol/index.js";
 import { useHostQuery } from "./projects.js";
 import { HostError, runHostCommand, type WebState } from "./store.js";
@@ -55,9 +55,24 @@ const edit = (provider: CustomProvider): Draft => ({ create: false, id: provider
 function ProviderForm({ draft, revision, existing, busy, onDone, onCancel }: { draft: Draft; revision: string; existing?: CustomProvider; busy: boolean; onDone: (result: CustomProviderResult) => void; onCancel: () => void }) {
   const [form, setForm] = useState(draft);
   const [problem, setProblem] = useState<{ message: string; field?: string }>();
+  const element = useRef<HTMLFormElement>(null);
   const set = (patch: Partial<Draft>) => { setForm(current => ({ ...current, ...patch })); setProblem(undefined); };
   const row = (index: number, patch: Partial<Row>) => set({ rows: form.rows.map((item, position) => position === index ? { ...item, ...patch } : item) });
   const invalid = (field: string): boolean => problem?.field === field;
+  const errorId = (field: string): string => `provider-${field.replace(/\./g, "-")}-error`;
+  const describedBy = (field: string, note?: string): string | undefined => [note, invalid(field) ? errorId(field) : undefined].filter(Boolean).join(" ") || undefined;
+  const fieldError = (field: string) => invalid(field) && <p id={errorId(field)} class="setting-note setting-warn" role="alert" tabindex={-1} data-provider-error>{problem!.message}</p>;
+  const modelField = problem?.field && /^models\.(\d+)\.(id|name|contextWindow)$/.exec(problem.field);
+  const fieldProblem = !!problem?.field && (["id", "api", "baseUrl", "models"].includes(problem.field) || !!modelField && Number(modelField[1]) < form.rows.length);
+  useLayoutEffect(() => {
+    if (!problem || !element.current) return;
+    const error = element.current.querySelector<HTMLElement>("[data-provider-error]");
+    const control = [...element.current.querySelectorAll<HTMLElement>("[data-provider-field]")].find(item => item.dataset.providerField === problem.field);
+    const target = control && !control.matches(":disabled") ? control : error;
+    target?.focus({ preventScroll: true });
+    // Scroll to the message as well as its control, including a model-list error with no row to focus.
+    error?.scrollIntoView({ block: "center" });
+  }, [problem]);
   const submit = (event: Event) => {
     event.preventDefault();
     const models = form.rows.map(item => ({ id: item.id, ...(item.name.trim() ? { name: item.name } : {}), ...(item.contextWindow.trim() ? { contextWindow: Number(item.contextWindow) } : {}) }));
@@ -67,31 +82,35 @@ function ProviderForm({ draft, revision, existing, busy, onDone, onCancel }: { d
     runHostCommand<CustomProviderResult>("provider_save", { id: valid.id, api: valid.api, baseUrl: valid.baseUrl, models: valid.models, revision, create: form.create }).then(onDone, failure => setProblem(explain(failure)));
   };
   const apis = (CUSTOM_PROVIDER_APIS as readonly string[]).includes(form.api) ? [...CUSTOM_PROVIDER_APIS] : [form.api, ...CUSTOM_PROVIDER_APIS];
-  return <form class="provider-form" onSubmit={submit} noValidate>
+  return <form class="provider-form" ref={element} onSubmit={submit} noValidate>
     <div class="provider-form-head"><h3>{form.create ? "添加供应商" : `编辑 ${form.id}`}</h3><button type="button" class="quiet" onClick={onCancel}>返回列表</button></div>
     <fieldset class="provider-form-section">
       <legend>连接信息</legend>
       <div class="provider-field"><label for="provider-id">名称</label>
-        <input id="provider-id" data-autofocus type="text" value={form.id} disabled={!form.create} maxLength={64} autocomplete="off" autocapitalize="off" spellcheck={false} aria-invalid={invalid("id")} aria-describedby="provider-id-note" placeholder="例如 my-gateway" onInput={event => set({ id: event.currentTarget.value })} />
+        <input id="provider-id" data-provider-field="id" data-autofocus type="text" value={form.id} disabled={!form.create} maxLength={64} autocomplete="off" autocapitalize="off" spellcheck={false} aria-invalid={invalid("id")} aria-describedby={describedBy("id", "provider-id-note")} placeholder="例如 my-gateway" onInput={event => set({ id: event.currentTarget.value })} />
+        {fieldError("id")}
         <p id="provider-id-note" class="setting-note">会成为模型名的前缀（名称/模型 ID），保存后不能修改。</p>
       </div>
       <div class="provider-field"><label for="provider-api">API 协议</label>
-        <select id="provider-api" value={form.api} aria-invalid={invalid("api")} onChange={event => set({ api: event.currentTarget.value })}>{apis.map(api => <option value={api} key={api}>{API[api] ?? `${api}（表单不提供的协议，保持不变）`}</option>)}</select>
+        <select id="provider-api" data-provider-field="api" value={form.api} aria-invalid={invalid("api")} aria-describedby={describedBy("api")} onChange={event => set({ api: event.currentTarget.value })}>{apis.map(api => <option value={api} key={api}>{API[api] ?? `${api}（表单不提供的协议，保持不变）`}</option>)}</select>
+        {fieldError("api")}
       </div>
       <div class="provider-field"><label for="provider-url">Base URL</label>
-        <input id="provider-url" type="url" inputMode="url" value={form.baseUrl} maxLength={2048} autocomplete="off" autocapitalize="off" spellcheck={false} aria-invalid={invalid("baseUrl")} aria-describedby="provider-url-note" placeholder="https://example.com/v1" onInput={event => set({ baseUrl: event.currentTarget.value })} />
+        <input id="provider-url" data-provider-field="baseUrl" type="url" inputMode="url" value={form.baseUrl} maxLength={2048} autocomplete="off" autocapitalize="off" spellcheck={false} aria-invalid={invalid("baseUrl")} aria-describedby={describedBy("baseUrl", "provider-url-note")} placeholder="https://example.com/v1" onInput={event => set({ baseUrl: event.currentTarget.value })} />
+        {fieldError("baseUrl")}
         {insecureAddress(form.baseUrl) && <p class="setting-note setting-warn">这是发往其他机器的明文 http 地址：请求内容和密钥在网络上不加密。可以保存，请确认这是你想要的。</p>}
         <p id="provider-url-note" class="setting-note">保存时不会连接这个地址去验证；是否可用要到实际发送消息时才知道。</p>
       </div>
     </fieldset>
-    <fieldset class="provider-models" aria-invalid={invalid("models")}>
+    <fieldset class="provider-models" aria-invalid={invalid("models")} aria-describedby={describedBy("models")}>
       <legend>模型列表</legend>
+      {fieldError("models")}
       {form.rows.map((item, index) => <div class="provider-model-entry" key={index}>
         <div class="provider-model-heading"><strong>模型 {index + 1}</strong><button type="button" class="quiet" aria-label={`移除第 ${index + 1} 个模型`} disabled={form.rows.length <= 1} onClick={() => set({ rows: form.rows.filter((_, position) => position !== index) })}>移除</button></div>
         <div class="provider-model">
-          <label class="provider-field"><span>模型 ID</span><input type="text" aria-label={`第 ${index + 1} 个模型的 ID`} placeholder="模型 ID（必填）" value={item.id} maxLength={200} autocomplete="off" autocapitalize="off" spellcheck={false} aria-invalid={invalid(`models.${index}.id`)} onInput={event => row(index, { id: event.currentTarget.value })} /></label>
-          <label class="provider-field"><span>显示名<span class="field-optional">可选</span></span><input type="text" aria-label={`第 ${index + 1} 个模型的显示名`} placeholder="显示名（可选）" value={item.name} maxLength={200} aria-invalid={invalid(`models.${index}.name`)} onInput={event => row(index, { name: event.currentTarget.value })} /></label>
-          <label class="provider-field"><span>上下文长度<span class="field-optional">可选</span></span><input type="text" inputMode="numeric" aria-label={`第 ${index + 1} 个模型的上下文长度`} placeholder="上下文长度（可选）" value={item.contextWindow} maxLength={12} aria-invalid={invalid(`models.${index}.contextWindow`)} onInput={event => row(index, { contextWindow: event.currentTarget.value })} /></label>
+          <label class="provider-field"><span>模型 ID</span><input type="text" data-provider-field={`models.${index}.id`} aria-label={`第 ${index + 1} 个模型的 ID`} placeholder="模型 ID（必填）" value={item.id} maxLength={200} autocomplete="off" autocapitalize="off" spellcheck={false} aria-invalid={invalid(`models.${index}.id`)} aria-describedby={describedBy(`models.${index}.id`)} onInput={event => row(index, { id: event.currentTarget.value })} />{fieldError(`models.${index}.id`)}</label>
+          <label class="provider-field"><span>显示名<span class="field-optional">可选</span></span><input type="text" data-provider-field={`models.${index}.name`} aria-label={`第 ${index + 1} 个模型的显示名`} placeholder="显示名（可选）" value={item.name} maxLength={200} aria-invalid={invalid(`models.${index}.name`)} aria-describedby={describedBy(`models.${index}.name`)} onInput={event => row(index, { name: event.currentTarget.value })} />{fieldError(`models.${index}.name`)}</label>
+          <label class="provider-field"><span>上下文长度<span class="field-optional">可选</span></span><input type="text" data-provider-field={`models.${index}.contextWindow`} inputMode="numeric" aria-label={`第 ${index + 1} 个模型的上下文长度`} placeholder="上下文长度（可选）" value={item.contextWindow} maxLength={12} aria-invalid={invalid(`models.${index}.contextWindow`)} aria-describedby={describedBy(`models.${index}.contextWindow`)} onInput={event => row(index, { contextWindow: event.currentTarget.value })} />{fieldError(`models.${index}.contextWindow`)}</label>
         </div>
       </div>)}
       <button type="button" class="quiet" disabled={form.rows.length >= 64} onClick={() => set({ rows: [...form.rows, { id: "", name: "", contextWindow: "" }] })}>添加模型</button>
@@ -99,7 +118,7 @@ function ProviderForm({ draft, revision, existing, busy, onDone, onCancel }: { d
     {!!existing?.extra.length && <p class="setting-note">这一条在 models.json 里还有表单之外的配置（{existing.extra.join("、")}），保存时原样保留。</p>}
     {!!existing?.modelExtras && <p class="setting-note">{existing.modelExtras} 个模型带有表单之外的配置，保留在各自的模型上；从列表移除的模型会连同它的配置一起删除。</p>}
     <div class="provider-key-note"><strong>下一步：设置密钥</strong><p class="setting-note">保存后用“设置密钥”，它经 pi 自己的登录保存到凭据文件，不写进 models.json。</p></div>
-    {problem && <p class="setting-note setting-warn" role="alert">{problem.message}</p>}
+    {problem && !fieldProblem && <p class="setting-note setting-warn" role="alert" tabindex={-1} data-provider-error>{problem.message}</p>}
     <div class="setting-actions"><button type="submit" class="send-button" disabled={busy}>保存</button><button type="button" class="quiet" onClick={onCancel}>取消</button></div>
   </form>;
 }

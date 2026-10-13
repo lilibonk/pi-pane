@@ -138,7 +138,7 @@ interface Fixture {
   /** Stand-in for the system trash: moves the file aside and records it, or declines. */
   trash: (path: string) => Promise<boolean>; trashed: string[]; trashWorks: boolean;
 }
-async function withHost(run: (host: HandoffHost, child: FakeChild, fixture: Fixture) => Promise<void>, beforeStart?: (child: FakeChild) => void, argv: string[] = []) {
+async function withHost(run: (host: HandoffHost, child: FakeChild, fixture: Fixture) => Promise<void>, beforeStart?: (child: FakeChild) => void, argv: string[] = [], model?: { provider: string; id: string }) {
   const root = await mkdtemp(join(tmpdir(), "pi-pane-host-")); const cwd = join(root, "project"); const other = join(root, "other"); const custom = join(root, "custom");
   await Promise.all([mkdir(cwd), mkdir(other), mkdir(custom)]); await writeFile(join(cwd, "local.txt"), "local"); await writeFile(join(other, "foreign.txt"), "foreign");
   const manager = SessionManager.create(cwd, custom); manager.appendMessage({ role: "user", content: "first user", timestamp: 1 });
@@ -165,7 +165,7 @@ async function withHost(run: (host: HandoffHost, child: FakeChild, fixture: Fixt
     }
     fixture.launches.push({ args, cwd: directory, child: next }); return next;
   };
-  const host = new HandoffHost(hub, { sessionFile: manager.getSessionFile()!, sessionDir: custom, cwd, argv, theme, themes: [] }, line => { fixture.logs.push(line); }, { createChild, plannedStopMs: 50, agentDir: join(root, "agent"), createAuthRuntime: async custom => custom ? fixture.auth.withCustom() : fixture.auth, accountLimitMs: 400, trash: path => fixture.trash(path), webOAuth: new Set(["kimi-coding"]),
+  const host = new HandoffHost(hub, { sessionFile: manager.getSessionFile()!, sessionDir: custom, cwd, argv, theme, themes: [], ...(model ? { model } : {}) }, line => { fixture.logs.push(line); }, { createChild, plannedStopMs: 50, agentDir: join(root, "agent"), createAuthRuntime: async custom => custom ? fixture.auth.withCustom() : fixture.auth, accountLimitMs: 400, trash: path => fixture.trash(path), webOAuth: new Set(["kimi-coding"]),
     listAll: ((directory?: string) => child.catalogOverride ? Promise.resolve(child.catalogOverride) : directory ? SessionManager.listAll(directory) : Promise.resolve([])) as typeof SessionManager.listAll });
   try { await host.start(); await run(host, child, fixture); }
   finally { await host.stop(); await rm(root, { recursive: true, force: true }); }
@@ -827,6 +827,108 @@ test("start arguments are shown as overrides of the defaults, and /settings open
 }, undefined, ["--provider", "acme", "--model", "fast", "--thinking", "high", "--use-theme", "light"]));
 const modelsFile = (root: string) => join(root, "agent", "models.json");
 const providerArgs = (extra: Record<string, unknown> = {}) => ({ id: "mine", api: "openai-completions", baseUrl: "https://mine.example/v1", models: [{ id: "m1", contextWindow: 32000 }], create: true, ...extra });
+const unknownModel = { provider: "unknown", id: "unknown", name: "unknown" };
+const previousModel = { provider: "previous", id: "recorded" };
+const pendingModelNotice = (host: HandoffHost) => (host as HandoffHost & { pendingModelNotice?: () => { t: "notice"; message: string } | undefined }).pendingModelNotice?.();
+// The fixture's notifyAll recorder also receives ui_state and dialog frames, not just notices.
+const noticeFrames = (frames: unknown[]) => frames.filter((frame): frame is { t: "notice"; message: string } => (frame as { t?: string }).t === "notice");
+async function reloadForModelNotice(host: HandoffHost, id: string) {
+  const view = await host.hostQuery("providers");
+  await host.hostCommand("provider_save", providerArgs({ id, revision: view.revision }));
+  await waitFor(async () => !(await host.hostQuery("providers")).pendingApply, "model notice reload settled");
+}
+test("model notice: an initial placeholder has a generic unavailable-model warning without an expected placeholder name", async () => withHost(async (host, _child, { notices }) => {
+  assert.equal(notices.length, 1);
+  assert.match((notices[0] as { message: string }).message, /没有可用的模型/);
+  assert.doesNotMatch((notices[0] as { message: string }).message, /unknown|交接前是/);
+  assert.deepEqual(pendingModelNotice(host), notices[0]);
+}, child => { child.model = unknownModel; }, [], unknownModel));
+test("model notice: a placeholder restored to a valid model omits the expected placeholder from the recovery message", async () => withHost(async (host, _child, { notices }) => {
+  assert.equal(notices.length, 1);
+  assert.match((notices[0] as { message: string }).message, /当前模型是 local\/fixture/);
+  assert.doesNotMatch((notices[0] as { message: string }).message, /unknown|交接前是/);
+  assert.deepEqual(pendingModelNotice(host), notices[0]);
+}, undefined, [], unknownModel));
+test("model notice: zero-to-zero reload keeps the original warning once and remains bounded to the latest replacement", async () => withHost(async (host, child, { notices }) => {
+  const original = pendingModelNotice(host);
+  assert.ok(original); assert.match(original.message, /previous\/recorded/);
+  const originalSession = child.manager.getSessionId();
+  await reloadForModelNotice(host, "notice-zero");
+  assert.equal(child.manager.getSessionId(), originalSession);
+  assert.deepEqual(notices.map(frame => (frame as { t: string }).t), ["notice", "ui_state"], "the reload clears extension UI but emits no second notice");
+  assert.deepEqual(noticeFrames(notices), [original], "zero-to-zero reload does not rebroadcast the same warning");
+  assert.deepEqual(pendingModelNotice(host), original);
+  for (let index = 1; index <= 3; index++) {
+    child.modelAfterReload = { provider: "restored", id: `model-${index}`, name: `Model ${index}` };
+    await reloadForModelNotice(host, `notice-${index}`);
+    const latest = pendingModelNotice(host);
+    assert.deepEqual(latest, noticeFrames(notices).at(-1), "one pending value is replaced by the latest report");
+    assert.match(latest!.message, new RegExp(`当前模型是 restored/model-${index}`));
+    if (index === 1) assert.doesNotMatch(latest!.message, /unknown|重新加载前是/);
+  }
+  assert.equal(noticeFrames(notices).length, 4, "three replacements produce three live reports, not a replay backlog");
+  assert.deepEqual(notices.map(frame => (frame as { t: string }).t), ["notice", "ui_state", "ui_state", "notice", "ui_state", "notice", "ui_state", "notice"]);
+}, child => { child.model = unknownModel; }, [], previousModel));
+test("model notice: a successful set_model clears only after refresh; failed RPC and failed refresh retain it", async () => withHost(async (host, child) => {
+  const original = pendingModelNotice(host); assert.ok(original);
+  let mode: "rpc-fails" | "refresh-fails" | "success" = "rpc-fails", didSet = false;
+  child.intercept = async type => {
+    if (type === "set_model") {
+      if (mode === "rpc-fails") throw new Error("fixture model refused");
+      child.model = { provider: "selected", id: "usable", name: "Usable" }; didSet = true;
+      return { intercepted: true, value: child.model };
+    }
+    if (type === "get_state" && didSet && mode === "refresh-fails") throw new Error("fixture refresh refused");
+    return { intercepted: false };
+  };
+  await assert.rejects(host.command("set_model", { provider: "selected", id: "usable" }), /model refused/);
+  assert.deepEqual(pendingModelNotice(host), original);
+  mode = "refresh-fails";
+  await assert.rejects(host.command("set_model", { provider: "selected", id: "usable" }), /refresh refused/);
+  assert.deepEqual(pendingModelNotice(host), original);
+  mode = "success";
+  await host.command("set_model", { provider: "selected", id: "usable" });
+  assert.equal(pendingModelNotice(host), undefined);
+}, child => { child.model = unknownModel; }, [], previousModel));
+test("model notice: a normal same-valid-model reload confirms and clears the pending report", async () => withHost(async (host) => {
+  assert.ok(pendingModelNotice(host));
+  await reloadForModelNotice(host, "notice-confirm");
+  assert.equal(pendingModelNotice(host), undefined);
+}, undefined, [], previousModel));
+test("model notice: cancelled and failed session changes retain it; a committed different session clears it", async () => withHost(async (host, child) => {
+  const original = pendingModelNotice(host); assert.ok(original);
+  child.cancelNext = true;
+  assert.equal((await host.command("session_new", {}) as { cancelled: boolean }).cancelled, true);
+  assert.deepEqual(pendingModelNotice(host), original);
+  child.intercept = async type => { if (type === "new_session") throw new Error("fixture session refused"); return { intercepted: false }; };
+  await assert.rejects(host.command("session_new", {}), /session refused/);
+  assert.deepEqual(pendingModelNotice(host), original);
+  child.intercept = undefined;
+  await host.command("session_new", {});
+  assert.equal(pendingModelNotice(host), undefined);
+}, child => { child.model = unknownModel; }, [], previousModel));
+test("model notice: a committed different project clears the previous session's warning", async () => withHost(async (host, _child, { foreign }) => {
+  assert.ok(pendingModelNotice(host));
+  await host.hostCommand("project_open", { path: foreign.getCwd() });
+  assert.equal(pendingModelNotice(host), undefined);
+}, child => { child.model = unknownModel; }, [], previousModel));
+test("model notice: failed project replacement hides the old scope and restoring it retains the original unavailable warning", async () => withHost(async (host, _child, fixture) => {
+  const original = pendingModelNotice(host); assert.ok(original);
+  fixture.prepare = next => { next.intercept = async type => { if (type === "get_state") throw new Error("fixture startup refused"); return { intercepted: false }; }; };
+  await assert.rejects(host.hostCommand("project_open", { path: fixture.foreign.getCwd() }), { code: "recovery_required" });
+  assert.equal(pendingModelNotice(host), undefined, "no session is bound during recovery");
+  fixture.prepare = next => { next.model = unknownModel; };
+  await host.hostCommand("recover_restore");
+  assert.deepEqual(pendingModelNotice(host), original);
+  assert.deepEqual(fixture.notices.map(frame => (frame as { t: string }).t), ["notice", "ui_state"], "the failed replacement clears extension UI but emits no second notice");
+  assert.deepEqual(noticeFrames(fixture.notices), [original], "restoring the same zero-model session does not rebroadcast its pending warning");
+}, child => { child.model = unknownModel; }, [], previousModel));
+test("model notice: ordinary extension notifications are ephemeral and do not replace the pending model report", async () => withHost(async (host, child, { notices }) => {
+  const original = pendingModelNotice(host); assert.ok(original);
+  child.emit({ type: "extension_ui_request", id: "notice", method: "notify", message: "fixture ordinary notice", notifyType: "info" });
+  assert.match((notices.at(-1) as { message: string }).message, /ordinary notice/);
+  assert.deepEqual(pendingModelNotice(host), original);
+}, child => { child.model = unknownModel; }, [], previousModel));
 test("a custom provider is saved to models.json without a key, gets its key through pi's login, and reaches the session by a reload", async () => withHost(async (host, child, { root, auth }) => {
   let view = await host.hostQuery("providers"); assert.deepEqual([view.providers, view.revision, view.error, view.pendingApply], [[], "absent", undefined, false]);
   // Names pi already uses are refused: its own providers, and one the running session has from an extension.

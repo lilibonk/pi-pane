@@ -36,6 +36,7 @@ async function fixture(options: Partial<HubOptions> = {}, overrides: Record<stri
     command: overrides.command ?? (async () => { calls++; return { disposition: "started" }; }),
     read: overrides.read ?? (async () => ({ commands: [] })),
     answer: () => {}, pendingDialogs: () => [], uiState: () => ({ revision: 0, statuses: {}, widgets: {} }),
+    ...(overrides.pendingModelNotice ? { pendingModelNotice: overrides.pendingModelNotice } : {}),
   } as unknown as HostHandler);
   await hub.start(); hub.bindBridge(bridge);
   return { hub, calls: () => calls, observer: () => observer,
@@ -60,6 +61,53 @@ function envelope(clientId: string, hub: Hub, commandNo: number): CommandEnvelop
   return { t: "command", clientId, commandNo, id: `${clientId}:${commandNo}`, epoch: hub.epoch,
     sessionId: "fixture-session", branchRevision: 0, command: "prompt", args: { text: "test" } };
 }
+
+test("model notice: late hello and resync replay only the latest pending report after the snapshot", async () => {
+  let pending: { t: "notice"; message: string } | undefined = { t: "notice", message: "first model report" };
+  const f = await fixture({}, { pendingModelNotice: () => pending });
+  try {
+    f.hub.notifyAll({ t: "notice", message: "ordinary extension notice before connection" });
+    const c = await client(f.hub);
+    await c.wait("snapshot");
+    assert.deepEqual(await c.wait("notice"), pending);
+    assert.deepEqual(c.frames.map(frame => frame.t), ["welcome", "snapshot", "notice"]);
+    pending = { t: "notice", message: "latest model report" };
+    const from = c.frames.length;
+    c.send({ t: "resync" });
+    await c.wait("snapshot", from); assert.deepEqual(await c.wait("notice", from), pending);
+    assert.deepEqual(c.frames.slice(from).map(frame => frame.t), ["snapshot", "notice"]);
+    await c.close();
+    const late = await client(f.hub);
+    await late.wait("snapshot"); assert.deepEqual(await late.wait("notice"), pending);
+    assert.deepEqual(late.frames.filter(frame => frame.t === "notice"), [pending], "old model and ordinary notices are not queued");
+    pending = undefined;
+    const clearFrom = late.frames.length;
+    late.send({ t: "resync" }); await late.wait("snapshot", clearFrom); await delay(20);
+    assert.deepEqual(late.frames.slice(clearFrom).map(frame => frame.t), ["snapshot"]);
+    await late.close();
+    const cleared = await client(f.hub); await cleared.wait("snapshot"); await delay(20);
+    assert.equal(cleared.frames.some(frame => frame.t === "notice"), false);
+    await cleared.close();
+  } finally { await f.close(); }
+});
+test("model notice: session resets do not rebroadcast a pending report and a suspended bridge does not replay it", async () => {
+  let reads = 0;
+  const f = await fixture({}, { pendingModelNotice: () => { reads++; return { t: "notice", message: "model report" }; } });
+  try {
+    const c = await client(f.hub); await c.wait("snapshot"); await c.wait("notice");
+    const from = c.frames.length;
+    f.observer()?.reset("reload"); await c.wait("snapshot", from); await delay(20);
+    assert.deepEqual(c.frames.slice(from).map(frame => frame.t), ["session_reset", "snapshot"]);
+    assert.equal(reads, 1);
+    f.hub.suspendBridge("replacing");
+    const suspended = await client(f.hub); await suspended.wait("switching");
+    const resyncFrom = suspended.frames.length;
+    suspended.send({ t: "resync" }); await suspended.wait("switching", resyncFrom); await delay(20);
+    assert.equal(suspended.frames.some(frame => frame.t === "snapshot" || frame.t === "notice"), false);
+    assert.equal(reads, 1, "pending notices are read only when a real snapshot can precede them");
+    await suspended.close(); await c.close();
+  } finally { await f.close(); }
+});
 
 test("authenticated v1 pages get only a fatal refresh notice and consume no client lease", async () => {
   const f = await fixture({ maxClients: 1 });

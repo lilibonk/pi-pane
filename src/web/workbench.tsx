@@ -129,11 +129,12 @@ function FileCode({ value }: { value: WorkspaceFileView }) {
   return html ? <div class="file-code" dangerouslySetInnerHTML={{ __html: html }} /> : <pre class="file-code">{value.text}</pre>;
 }
 
-export function Workbench({ state, canConfigure, commands, controller, onFocusComposer, children, empty, connectionIndicator }: {
-  state: WebState; canConfigure: boolean; commands: WorkbenchCommand[]; controller: RefObject<WorkbenchController | undefined>; onFocusComposer: () => void; children: ComponentChildren; empty?: boolean; connectionIndicator?: ComponentChildren;
+export function Workbench({ state, canConfigure, commands, controller, onFocusComposer, children, empty, sessionIdentity, sessionStatus, connectionIndicator }: {
+  state: WebState; canConfigure: boolean; commands: WorkbenchCommand[]; controller: RefObject<WorkbenchController | undefined>; onFocusComposer: () => void; children: ComponentChildren; empty?: boolean; sessionIdentity: ComponentChildren; sessionStatus: ComponentChildren; connectionIndicator?: ComponentChildren;
 }) {
   const [leftOpen, setLeftOpen] = useState(false);
   const [rightOpen, setRightOpen] = useState(false);
+  const [navCollapsed, setNavCollapsed] = useState(false);
   const [leftMode, setLeftMode] = useState<"sessions" | "tree">("sessions");
   const [sessionSearch, setSessionSearch] = useState("");
   const [tab, setTab] = useState<"changes" | "files" | "resources">("changes");
@@ -149,12 +150,19 @@ export function Workbench({ state, canConfigure, commands, controller, onFocusCo
   const rightRef = useRef<HTMLElement>(null);
   const toggleLeft = useRef<HTMLButtonElement>(null);
   const toggleRight = useRef<HTMLButtonElement>(null);
+  const conversationRef = useRef<HTMLElement>(null);
+  const navigationOpener = useRef<HTMLElement | null>(null);
+  const inspectorOpener = useRef<HTMLElement | null>(null);
+  const lastWorkspaceFocus = useRef<HTMLElement | null>(null);
   const workbenchRef = useRef<HTMLDivElement>(null);
   const narrow = useMediaQuery("(max-width: 760px)");
-  const overlayInspector = useMediaQuery("(max-width: 1100px)");
-  const modal = narrow && leftOpen ? "left" : overlayInspector && rightOpen ? "right" : null;
+  const mobileView = narrow && leftOpen ? "navigation" : narrow && rightOpen ? "inspector" : null;
+  const navigationHidden = narrow ? mobileView !== "navigation" : navCollapsed;
+  const inspectorHidden = !rightOpen || narrow && mobileView !== "inspector";
   const dialogOpen = !!(state.dialogs.length || state.projectDialog || state.settings || state.sessionDialog ||
     (state.account?.owner && state.account.id !== state.accountDismissed));
+  const dialogActive = useRef(dialogOpen); dialogActive.current = dialogOpen;
+  const focusLayout = useRef({ narrow, mobileView, navigationHidden, inspectorHidden, dialogOpen });
   const online = state.connection === "online" && !!state.snapshot?.caps.workbench;
   const settledSessionSearch = useDebounced(sessionSearch);
   const settledFileSearch = useDebounced(fileSearch);
@@ -192,64 +200,112 @@ export function Workbench({ state, canConfigure, commands, controller, onFocusCo
   useEffect(() => { setSelectedPath(""); setReferenceMode(false); setRenaming(false); setRotateConfirm(false); }, [state.snapshot?.epoch]);
   useLayoutEffect(() => {
     const escape = (event: KeyboardEvent) => {
-      if (event.key !== "Escape" || event.defaultPrevented || !modal || dialogOpen) return;
-      // A dialog owns Escape as soon as it is mounted, including before deferred effects run.
-      if (workbenchRef.current?.parentElement?.querySelector(":scope > .dialog-backdrop")) return;
+      if (event.key !== "Escape" || event.defaultPrevented || !mobileView || hasDialog()) return;
       if (workbenchRef.current?.querySelector(".session-menu[open], .project-add-menu[open]")) return;
       event.preventDefault();
-      if (modal === "left") { setLeftOpen(false); requestAnimationFrame(() => toggleLeft.current?.focus()); }
-      else { setRightOpen(false); requestAnimationFrame(() => toggleRight.current?.focus()); }
+      if (mobileView === "navigation") closeNavigation();
+      else closeInspector();
     };
     document.addEventListener("keydown", escape);
     return () => document.removeEventListener("keydown", escape);
-  }, [modal, dialogOpen]);
+  }, [mobileView, dialogOpen]);
   useLayoutEffect(() => {
-    const panel = modal === "left" ? leftRef.current : modal === "right" ? rightRef.current : null;
-    if (!panel || dialogOpen) return;
-    const focusable = () => [...panel.querySelectorAll<HTMLElement>('button:not(:disabled), input:not(:disabled), select:not(:disabled), textarea:not(:disabled), a[href], summary, [tabindex="0"]')].filter(element => element.getClientRects().length && !element.closest('[inert], details:not([open]) > :not(summary)'));
-    const firstInput = panel.querySelector<HTMLInputElement>("input:not(:disabled)");
-    if (!panel.contains(document.activeElement)) (firstInput || focusable()[0])?.focus();
-    const trap = (event: KeyboardEvent) => {
-      if (event.key !== "Tab") return;
-      const elements = focusable();
-      const first = elements[0], last = elements.at(-1);
-      if (!first || !last) return;
-      if (!panel.contains(document.activeElement)) { event.preventDefault(); (event.shiftKey ? last : first).focus(); }
-      else if (event.shiftKey && document.activeElement === first) { event.preventDefault(); last.focus(); }
-      else if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first.focus(); }
-    };
-    document.addEventListener("keydown", trap);
-    return () => document.removeEventListener("keydown", trap);
-  }, [modal, dialogOpen]);
+    const previous = focusLayout.current;
+    focusLayout.current = { narrow, mobileView, navigationHidden, inspectorHidden, dialogOpen };
+    if (hasDialog()) return;
+    const panel = mobileView === "navigation" ? leftRef.current : mobileView === "inspector" ? rightRef.current : null;
+    const active = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    if (panel) {
+      // These are full workspace views. Move focus into the active view without trapping Tab.
+      if (!panel.contains(active) || !focusable(active)) focusPanel(panel);
+      return;
+    }
+    const transitioned = previous.narrow !== narrow || previous.mobileView !== mobileView || previous.navigationHidden !== navigationHidden || previous.inspectorHidden !== inspectorHidden;
+    const dialogClosed = previous.dialogOpen && !dialogOpen;
+    const onBody = active === document.body || active === document.documentElement;
+    const lostFocus = onBody && (transitioned || dialogClosed) && !!lastWorkspaceFocus.current && !focusable(lastWorkspaceFocus.current);
+    if (!lostFocus && (onBody || focusable(active))) return;
+    const prior = onBody ? lastWorkspaceFocus.current : active;
+    const navigationFocus = !!prior && leftRef.current?.contains(prior) || previous.mobileView === "navigation";
+    const inspectorFocus = !!prior && rightRef.current?.contains(prior) || previous.mobileView === "inspector";
+    const opener = navigationFocus ? navigationOpener.current : inspectorFocus ? inspectorOpener.current : null;
+    const toggle = navigationFocus ? toggleLeft.current : inspectorFocus ? toggleRight.current : null;
+    if (focusable(opener) || focusable(toggle)) focusElement(opener, toggle);
+    else focusComposer();
+  }, [narrow, mobileView, navigationHidden, inspectorHidden, dialogOpen]);
   useEffect(() => {
-    if (!leftOpen) return;
-    const element = leftRef.current?.querySelector<HTMLInputElement>("input");
-    element?.focus();
-  }, [leftOpen]);
+    const element = workbenchRef.current;
+    if (!element) return;
+    const remember = (event: FocusEvent) => { if (event.target instanceof HTMLElement) lastWorkspaceFocus.current = event.target; };
+    element.addEventListener("focusin", remember);
+    return () => element.removeEventListener("focusin", remember);
+  }, []);
   useLayoutEffect(() => {
-    if (renaming) leftRef.current?.querySelector<HTMLInputElement>('.rename-session input')?.focus();
+    if (renaming && !hasDialog()) focusElement(leftRef.current?.querySelector<HTMLInputElement>('.rename-session input'));
   }, [renaming]);
-  function focusComposer() { requestAnimationFrame(onFocusComposer); }
-  function focusInspector() { requestAnimationFrame(() => rightRef.current?.querySelector<HTMLElement>('input:not(:disabled), button:not(:disabled)')?.focus()); }
-  function showFiles(reference = false, query = "") { setTab("files"); setLeftOpen(false); setRightOpen(true); setReferenceMode(reference); setFileSearch(query); setSelectedPath(""); }
+  function hasDialog(): boolean { return dialogActive.current || !!workbenchRef.current?.parentElement?.querySelector(":scope > .dialog-backdrop"); }
+  function focusable(element: HTMLElement | null | undefined): element is HTMLElement {
+    return !!element?.isConnected && !!element.getClientRects().length && getComputedStyle(element).visibility === "visible" && !element.matches(":disabled") && !element.closest('[inert], details:not([open]) > :not(summary)');
+  }
+  function focusElement(element: HTMLElement | null | undefined, fallback?: HTMLElement | null) {
+    requestAnimationFrame(() => {
+      if (hasDialog()) return;
+      const target = focusable(element) ? element : focusable(fallback) ? fallback : null;
+      target?.focus();
+    });
+  }
+  function focusPanel(panel: HTMLElement | null) {
+    if (!panel || hasDialog()) return;
+    const controls = [...panel.querySelectorAll<HTMLElement>('input:not(:disabled), button:not(:disabled), select:not(:disabled), summary')].filter(focusable);
+    const input = controls.find(element => element.tagName === "INPUT");
+    (input || controls[0])?.focus();
+  }
+  function focusComposer() { requestAnimationFrame(() => { if (!hasDialog() && focusable(conversationRef.current)) onFocusComposer(); }); }
+  function focusInspector() { requestAnimationFrame(() => focusPanel(rightRef.current)); }
+  function rememberOpener(opener: RefObject<HTMLElement | null>) {
+    const active = document.activeElement;
+    if (active instanceof HTMLElement && conversationRef.current?.contains(active)) opener.current = active;
+  }
+  function openNavigation() {
+    rememberOpener(navigationOpener);
+    if (!narrow) setNavCollapsed(false);
+    setLeftOpen(narrow);
+    if (narrow) setRightOpen(false);
+    requestAnimationFrame(() => focusPanel(leftRef.current));
+  }
+  function closeNavigation() {
+    setLeftOpen(false);
+    if (!narrow) setNavCollapsed(true);
+    focusElement(navigationOpener.current, toggleLeft.current);
+  }
+  function openInspector() {
+    rememberOpener(inspectorOpener);
+    setLeftOpen(false); setRightOpen(true);
+    focusInspector();
+  }
+  function closeInspector() {
+    setRightOpen(false);
+    focusElement(inspectorOpener.current, toggleRight.current);
+  }
+  function showFiles(reference = false, query = "") { setTab("files"); setReferenceMode(reference); setFileSearch(query); setSelectedPath(""); openInspector(); }
   function run(command: WorkbenchCommand, args = ""): boolean {
     if (!command.available) return false;
     // Picker builtins do not silently discard arguments or send their syntax to the model.
     if (command.browserAction && args.trim() && command.browserAction !== "rename") return false;
     switch (command.browserAction) {
-      case "sessions": setLeftMode("sessions"); setLeftOpen(true); if (overlayInspector) setRightOpen(false); break;
-      case "tree": setLeftMode("tree"); setLeftOpen(true); if (overlayInspector) setRightOpen(false); break;
-      case "model": setTab("resources"); setResourceTab("models"); setLeftOpen(false); setRightOpen(true); focusInspector(); break;
+      case "sessions": setLeftMode("sessions"); openNavigation(); break;
+      case "tree": setLeftMode("tree"); openNavigation(); break;
+      case "model": setTab("resources"); setResourceTab("models"); openInspector(); break;
       case "thinking": {
         const picker = document.querySelector<HTMLSelectElement>('select[aria-label="thinking 等级"]');
         if (!picker || picker.disabled) return false;
         picker.focus(); break;
       }
-      case "accounts": setLeftOpen(false); if (overlayInspector) setRightOpen(false); openSettings("accounts"); break;
-      case "settings": setLeftOpen(false); if (overlayInspector) setRightOpen(false); openSettings(); break;
-      case "resources": setTab("resources"); setResourceTab("commands"); setLeftOpen(false); setRightOpen(true); focusInspector(); break;
-      case "status": setLeftOpen(false); if (overlayInspector) setRightOpen(false); setSessionDialog({ mode: "info" }); break;
-      case "export": setLeftOpen(false); if (overlayInspector) setRightOpen(false); setSessionDialog({ mode: "export" }); break;
+      case "accounts": setLeftOpen(false); if (narrow) setRightOpen(false); openSettings("accounts"); break;
+      case "settings": setLeftOpen(false); if (narrow) setRightOpen(false); openSettings(); break;
+      case "resources": setTab("resources"); setResourceTab("commands"); openInspector(); break;
+      case "status": setLeftOpen(false); if (narrow) setRightOpen(false); setSessionDialog({ mode: "info" }); break;
+      case "export": setLeftOpen(false); if (narrow) setRightOpen(false); setSessionDialog({ mode: "export" }); break;
       case "copy": void copyReply(); break;
       case "new": if (!canNavigate) return false; issueCommand("session_new"); break;
       case "compact": if (!canNavigate) return false; issueCommand("compact"); break;
@@ -257,7 +313,7 @@ export function Workbench({ state, canConfigure, commands, controller, onFocusCo
       case "rename":
         if (!canNavigate) return false;
         if (args.trim()) issueCommand("session_rename", { name: args.trim() });
-        else { setSessionName(state.snapshot?.session.name || ""); setRenaming(true); setLeftMode("sessions"); setLeftOpen(true); if (overlayInspector) setRightOpen(false); }
+        else { setSessionName(state.snapshot?.session.name || ""); setRenaming(true); setLeftMode("sessions"); openNavigation(); }
         break;
       default: if (!canConfigure) return false; issueCommand("run_command", { name: command.name, args }, `/${command.name}${args ? ` ${args}` : ""}`); break;
     }
@@ -286,20 +342,37 @@ export function Workbench({ state, canConfigure, commands, controller, onFocusCo
     setDraft(`${cleaned}${gap}文件：${pathLabel}${actualNote}\n${fence}${value.language || ""}\n${excerpt}${suffix}`);
     if (clipped) webStore.setState({ notice: "已引用文件前面的片段（最多 24 KiB）；发送前可在输入框检查内容。" });
     setReferenceMode(false);
-    if (matchMedia("(max-width: 1100px)").matches) setRightOpen(false);
+    if (narrow) setRightOpen(false);
     focusComposer();
   }
-  function choosePath(path: string, mode: "file" | "diff") { setSelectedPath(path); setPreviewMode(mode); }
+  function choosePath(path: string, mode: "file" | "diff") {
+    setSelectedPath(path); setPreviewMode(mode);
+    requestAnimationFrame(() => {
+      if (hasDialog()) return;
+      [...rightRef.current?.querySelectorAll<HTMLElement>(".preview-heading button:not(:disabled)") ?? []].find(focusable)?.focus();
+    });
+  }
+  function closeFilePreview() {
+    const path = selectedPath;
+    setSelectedPath("");
+    requestAnimationFrame(() => {
+      if (hasDialog()) return;
+      const entry = [...rightRef.current?.querySelectorAll<HTMLElement>(".file-item[title]") ?? []].find(element => element.title === path && focusable(element));
+      if (entry) entry.focus();
+      else focusPanel(rightRef.current);
+    });
+  }
   const currentCwd = state.snapshot?.session.cwd || "";
   // After a project was chosen on a phone, the conversation is what the user came for.
   const shownProject = useRef(currentCwd);
   useEffect(() => {
     if (!currentCwd || currentCwd === shownProject.current) return;
     const first = !shownProject.current; shownProject.current = currentCwd;
-    if (!first && matchMedia("(max-width: 760px)").matches) { setLeftOpen(false); focusComposer(); }
-  }, [currentCwd]);
+    if (!first && narrow) { setLeftOpen(false); setRightOpen(false); focusComposer(); }
+  }, [currentCwd, narrow]);
   useEffect(() => {
     const closeMenu = (event: MouseEvent | KeyboardEvent) => {
+      if (event instanceof KeyboardEvent && hasDialog()) return;
       for (const menu of workbenchRef.current?.querySelectorAll<HTMLDetailsElement>(".session-menu[open], .project-add-menu[open]") ?? []) {
         if (event instanceof KeyboardEvent) { if (event.key === "Escape") { event.preventDefault(); menu.open = false; menu.querySelector<HTMLElement>("summary")?.focus(); } }
         else if (!menu.contains(event.target as Node)) menu.open = false;
@@ -309,10 +382,9 @@ export function Workbench({ state, canConfigure, commands, controller, onFocusCo
     document.addEventListener("click", closeMenu); document.addEventListener("keydown", closeMenu);
     return () => { document.removeEventListener("click", closeMenu); document.removeEventListener("keydown", closeMenu); };
   }, []);
-  return <div class={`workbench ${leftOpen ? "left-open" : ""} ${rightOpen ? "right-open" : ""}`} ref={workbenchRef}>
-    {modal && <button type="button" tabindex={-1} class={`drawer-backdrop ${modal === "left" ? "for-left" : "for-right"}`} aria-label="关闭侧栏" onClick={() => { setLeftOpen(false); setRightOpen(false); focusComposer(); }} />}
-    <aside class="workspace-sidebar" aria-label="工作区与会话" ref={leftRef} role={modal === "left" ? "dialog" : undefined} aria-modal={modal === "left" ? true : undefined} inert={modal === "right" || (narrow && !leftOpen)} aria-hidden={modal === "right" || (narrow && !leftOpen) ? true : undefined}>
-      <div class="sidebar-brand"><div class="brand"><span class="brand-icon">π</span><span>pi-pane</span></div><ThemeDecoration slot="brand" /><button type="button" class="icon-button mobile-close" aria-label="关闭会话侧栏" onClick={() => { setLeftOpen(false); requestAnimationFrame(() => toggleLeft.current?.focus()); }}><Icon name="close" /></button></div>
+  return <div class={`workbench ${leftOpen ? "left-open" : ""} ${rightOpen ? "right-open" : ""} ${!narrow && navCollapsed ? "nav-collapsed" : ""} ${mobileView ? `mobile-${mobileView}` : ""}`} ref={workbenchRef}>
+    <aside class="workspace-sidebar" aria-label="工作区与会话" ref={leftRef} inert={navigationHidden} aria-hidden={navigationHidden ? true : undefined}>
+      <div class="sidebar-brand"><div class="brand"><span class="brand-icon">π</span><span>pi-pane</span></div><ThemeDecoration slot="brand" /><button type="button" class="icon-button sidebar-collapse" aria-label="收起工作区与会话" onClick={closeNavigation}><Icon name="panel" /></button><button type="button" class="mobile-close" aria-label="关闭会话侧栏" onClick={closeNavigation}>返回对话</button></div>
       <button type="button" class="new-session-button" disabled={!canNavigate} onClick={() => { issueCommand("session_new"); setLeftOpen(false); focusComposer(); }}><Icon name="plus" />新建会话</button>
       <ProjectSection state={state} canSwitch={canNavigate} onSwitched={() => { setLeftOpen(false); focusComposer(); }} />
       <div class="sidebar-heading"><span>会话</span><button type="button" class="icon-button" aria-label="刷新会话列表" disabled={!online || sessionsRead.loading} onClick={sessions.reload}><Icon name="refresh" /></button><details class="session-menu"><summary aria-label="当前会话操作" title="当前会话操作">···</summary><div class="session-menu-items"><button type="button" disabled={!canNavigate} onClick={() => { setSessionName(state.snapshot?.session.name || ""); setRenaming(value => !value); }}>重命名</button><button type="button" disabled={!canNavigate} onClick={() => issueCommand("session_clone")}>克隆会话</button><button type="button" disabled={!online} onClick={() => setSessionDialog({ mode: "info" })}>会话信息</button><button type="button" disabled={!online} onClick={() => setSessionDialog({ mode: "export" })}>导出会话</button><button type="button" onClick={() => setLeftMode(leftMode === "tree" ? "sessions" : "tree")}><Icon name="branch" />{leftMode === "tree" ? "会话列表" : "分支树"}</button></div></details></div>
@@ -322,7 +394,7 @@ export function Workbench({ state, canConfigure, commands, controller, onFocusCo
       <div class="sidebar-scroll">
         {leftMode === "sessions" ? <ReadState read={sessionsRead}>
           {!catalog.length && <p class="panel-message">{sessionSearch ? "没有匹配的会话。" : "这个项目尚无会话。发送第一条消息后会出现在这里。"}</p>}
-          {catalog.map(([cwd, items]) => <section class="workspace-group" key={cwd}><h2 title={cwd}><span class="folder-mark">▱</span>{workspaceName(cwd)}<span>{items.length}</span></h2>{items.map(item => <div class="session-row" key={item.id}><button type="button" class={`session-item ${item.current ? "is-current" : ""}`} aria-current={item.current ? "page" : undefined} title={item.name || item.firstMessage || "未命名会话"} disabled={!item.current && !canNavigate} onClick={() => { if (!item.current) issueCommand("session_switch", { sessionId: item.id }); setLeftOpen(false); focusComposer(); }}><span class="session-item-title">{item.name || item.firstMessage || "未命名会话"}</span><span class="session-item-meta">{item.current ? "当前会话" : `${item.messageCount} 条消息`}<time>{timeLabel(item.modified)}</time></span></button>{!item.current && <button type="button" class="icon-button session-delete" aria-label={`删除会话：${item.name || item.firstMessage || "未命名会话"}`} title="删除这个会话" disabled={!online} onClick={() => setSessionDialog({ mode: "delete", sessionId: item.id })}><Icon name="trash" /></button>}</div>)}</section>)}
+          {catalog.map(([cwd, items]) => <section class="workspace-group" key={cwd}>{cwd !== currentCwd && <h2 title={cwd}><span class="folder-mark">▱</span>{workspaceName(cwd)}<span>{items.length}</span></h2>}{items.map(item => <div class="session-row" key={item.id}><button type="button" class={`session-item ${item.current ? "is-current" : ""}`} aria-current={item.current ? "page" : undefined} title={item.name || item.firstMessage || "未命名会话"} disabled={!item.current && !canNavigate} onClick={() => { if (!item.current) issueCommand("session_switch", { sessionId: item.id }); setLeftOpen(false); focusComposer(); }}><span class="session-item-title">{item.name || item.firstMessage || "未命名会话"}</span><span class="session-item-meta">{item.current ? "当前会话" : `${item.messageCount} 条消息`}<time>{timeLabel(item.modified)}</time></span></button>{!item.current && <button type="button" class="icon-button session-delete" aria-label={`删除会话：${item.name || item.firstMessage || "未命名会话"}`} title="删除这个会话" disabled={!online} onClick={() => setSessionDialog({ mode: "delete", sessionId: item.id })}><Icon name="trash" /></button>}</div>)}</section>)}
           {sessions.value?.truncated && <p class="panel-message">仅显示最近的部分会话。</p>}
         </ReadState> : <ReadState read={tree}>
           <p class="reference-note">分支树为只读。pi RPC 暂不支持 tree 导航；可从用户消息之前创建新分叉。</p>
@@ -336,25 +408,25 @@ export function Workbench({ state, canConfigure, commands, controller, onFocusCo
           {tree.value?.truncated && <p class="panel-message">分支树已截断，更多内容请在终端查看。</p>}
         </ReadState>}
       </div>
-      <div class="sidebar-footer"><p>{pendingSession ? "正在处理会话或模型操作…" : !canNavigate && online ? "运行或待发消息处理完后可切换。" : ""}</p><button type="button" class="settings-button" onClick={() => { setLeftOpen(false); openSettings(); }}><Icon name="settings" />设置<Icon name="arrow" /></button></div>
+      <div class="sidebar-footer"><p>{pendingSession ? "正在处理会话或模型操作…" : !canNavigate && online ? "运行或待发消息处理完后可切换。" : ""}</p><button type="button" class="settings-button" onClick={() => openSettings()}><Icon name="settings" />设置<Icon name="arrow" /></button></div>
     </aside>
-    <main class={`conversation-panel ${empty ? "is-empty" : ""}`} inert={!!modal} aria-hidden={modal ? true : undefined}>
-      <div class="workbench-controls"><button type="button" class="icon-button sidebar-toggle" ref={toggleLeft} aria-label="打开工作区与会话" aria-expanded={leftOpen} onClick={() => { setLeftOpen(!leftOpen); if (!leftOpen && matchMedia("(max-width: 1100px)").matches) setRightOpen(false); }}><Icon name="menu" /></button><span class="workbench-project" title={currentCwd}>{workspaceName(currentCwd)}</span>{connectionIndicator}<button type="button" class="inspect-toggle" ref={toggleRight} aria-label={rightOpen ? "收起面板" : "文件与改动"} aria-expanded={rightOpen} onClick={() => { setRightOpen(!rightOpen); setLeftOpen(false); }}><Icon name="panel" />{rightOpen ? "收起面板" : "文件与改动"}</button></div>
+    <main class={`conversation-panel ${empty ? "is-empty" : ""}`} ref={conversationRef} inert={!!mobileView} aria-hidden={mobileView ? true : undefined}>
+      <header class="workbench-controls"><button type="button" class="icon-button sidebar-toggle" ref={toggleLeft} aria-label="打开工作区与会话" aria-expanded={narrow ? leftOpen : !navCollapsed} onClick={() => { if (narrow ? leftOpen : !navCollapsed) closeNavigation(); else openNavigation(); }}><Icon name="menu" /></button>{sessionIdentity}{sessionStatus}{connectionIndicator}<button type="button" class="inspect-toggle" ref={toggleRight} aria-label={rightOpen ? "收起面板" : "文件与改动"} aria-expanded={rightOpen} onClick={() => { if (rightOpen) closeInspector(); else openInspector(); }}><Icon name="panel" />{rightOpen ? "收起面板" : "文件与改动"}</button></header>
       {children}
     </main>
-    <aside class="workspace-inspector" aria-label="文件、改动与资源" ref={rightRef} role={modal === "right" ? "dialog" : undefined} aria-modal={modal === "right" ? true : undefined} inert={modal === "left" || !rightOpen} aria-hidden={modal === "left" || !rightOpen ? true : undefined}>
-      <div class="inspector-tabs" role="group" aria-label="工作区面板">{([['changes', '改动'], ['files', '文件'], ['resources', '资源']] as const).map(([name, label]) => <button type="button" aria-pressed={tab === name} key={name} onClick={() => { setTab(name); setSelectedPath(""); setReferenceMode(false); }}>{label}</button>)}<button type="button" class="icon-button" aria-label="关闭工作区面板" onClick={() => { setRightOpen(false); requestAnimationFrame(() => toggleRight.current?.focus()); }}><Icon name="close" /></button></div>
+    <aside class="workspace-inspector" aria-label="文件、改动与资源" ref={rightRef} inert={inspectorHidden} aria-hidden={inspectorHidden ? true : undefined}>
+      <div class="inspector-tabs" role="group" aria-label="工作区面板">{([['changes', '改动'], ['files', '文件'], ['resources', '资源']] as const).map(([name, label]) => <button type="button" aria-pressed={tab === name} key={name} onClick={() => { setTab(name); setSelectedPath(""); setReferenceMode(false); }}>{label}</button>)}<button type="button" class="icon-button" aria-label="关闭工作区面板" onClick={closeInspector}><Icon name="close" /><span class="inspector-return">返回对话</span></button></div>
       <div class="inspector-scroll">
-        {tab === "changes" && <><div class="panel-heading"><span>{status.value?.branch || "工作区改动"}</span><button type="button" class="icon-button" aria-label="刷新 Git 改动" disabled={!online || status.loading} onClick={() => { status.reload(); diff.reload(); }}><Icon name="refresh" /></button></div><ReadState read={status}>
+        {tab === "changes" && !selectedPath && <><div class="panel-heading"><span>{status.value?.branch || "工作区改动"}</span><button type="button" class="icon-button" aria-label="刷新 Git 改动" disabled={!online || status.loading} onClick={() => { status.reload(); diff.reload(); }}><Icon name="refresh" /></button></div><ReadState read={status}>
           {status.value && !status.value.isRepository ? <p class="panel-message">当前工作区没有 Git 仓库。</p> : !status.value?.files.length ? <p class="panel-message">工作区没有未提交的改动。</p> : <div class="changed-files">{status.value.files.map(item => <button type="button" class={`file-item ${selectedPath === item.path ? "is-current" : ""}`} key={item.path} onClick={() => choosePath(item.path, "diff")} title={item.path}><span class={`git-status status-${item.status.trim().slice(-1)}`}>{item.status.trim() || "M"}</span><span>{item.path}</span><small>{item.staged ? "已暂存" : ""}{item.staged && item.unstaged ? " / " : ""}{item.unstaged ? "工作区" : ""}</small></button>)}</div>}
           {status.value?.truncated && <p class="panel-message">改动列表已截断。</p>}
         </ReadState></>}
-        {tab === "files" && <><label class="panel-search inspector-search"><Icon name="search" /><input type="search" placeholder="查找工作区文件" aria-label="查找工作区文件" value={fileSearch} onInput={event => setFileSearch(event.currentTarget.value)} /></label>{referenceMode && <p class="reference-note">选择文件并将真实内容引用到消息。</p>}<ReadState read={filesRead}><div class="file-list">{files.value?.files.filter(item => item.type !== "directory").map(item => <button type="button" class={`file-item ${selectedPath === item.path ? "is-current" : ""}`} key={item.path} onClick={() => choosePath(item.path, "file")} title={item.path}><Icon name="file" /><span>{item.path}</span></button>)}</div>{!files.value?.files.some(item => item.type !== "directory") && <p class="panel-message">没有匹配的文件。</p>}{files.value?.truncated && <p class="panel-message">文件列表已截断；可在终端查看其他文件。</p>}</ReadState></>}
-        {selectedPath && tab !== "resources" && <section class="file-preview" aria-label="文件预览"><div class="preview-heading"><span title={selectedPath}>{selectedPath}</span><button type="button" class="icon-button" aria-label="关闭文件预览" onClick={() => setSelectedPath("")}><Icon name="close" /></button></div><div class="preview-actions">{tab === "changes" && <button type="button" aria-pressed={previewMode === "diff"} onClick={() => setPreviewMode(previewMode === "diff" ? "file" : "diff")}>{previewMode === "diff" ? "查看文件" : "查看差异"}</button>}{previewMode === "file" && <button type="button" disabled={!file.value || !!file.value.binary} onClick={referenceFile}>引用到消息</button>}</div>{previewMode === "diff" ? <ReadState read={diff}>{diff.value?.text ? <Diff patch={diff.value.text} /> : <p class="panel-message">没有可显示的文本差异。新文件可点“查看文件”。</p>}{diff.value?.truncated && <p class="reference-note">差异过大，只显示前面的片段。</p>}</ReadState> : <ReadState read={file}>{file.value?.binary ? <p class="panel-message">此文件是二进制文件，无法预览文本。</p> : file.value && <FileCode value={file.value} />}{file.value?.truncated && <p class="reference-note">文件过大，只显示预览片段。引用时会标明截断。</p>}</ReadState>}</section>}
+        {tab === "files" && !selectedPath && <><label class="panel-search inspector-search"><Icon name="search" /><input type="search" placeholder="查找工作区文件" aria-label="查找工作区文件" value={fileSearch} onInput={event => setFileSearch(event.currentTarget.value)} /></label>{referenceMode && <p class="reference-note">选择文件并将真实内容引用到消息。</p>}<ReadState read={filesRead}><div class="file-list">{files.value?.files.filter(item => item.type !== "directory").map(item => <button type="button" class={`file-item ${selectedPath === item.path ? "is-current" : ""}`} key={item.path} onClick={() => choosePath(item.path, "file")} title={item.path}><Icon name="file" /><span>{item.path}</span></button>)}</div>{!files.value?.files.some(item => item.type !== "directory") && <p class="panel-message">没有匹配的文件。</p>}{files.value?.truncated && <p class="panel-message">文件列表已截断；可在终端查看其他文件。</p>}</ReadState></>}
+        {selectedPath && tab !== "resources" && <section class="file-preview flat-preview" aria-label="文件预览"><div class="preview-heading"><span title={selectedPath}>{selectedPath}</span>{tab === "changes" && <button type="button" aria-pressed={previewMode === "diff"} onClick={() => setPreviewMode(previewMode === "diff" ? "file" : "diff")}>{previewMode === "diff" ? "查看文件" : "查看差异"}</button>}{previewMode === "file" && <button type="button" disabled={!file.value || !!file.value.binary} onClick={referenceFile}>引用到消息</button>}<button type="button" class="quiet preview-return" aria-label="关闭文件预览" onClick={closeFilePreview}>返回列表</button></div>{previewMode === "diff" ? <ReadState read={diff}>{diff.value?.text ? <><Diff patch={diff.value.text} /><details class="git-details"><summary>原始 Git diff</summary><pre>{diff.value.text}</pre></details></> : <p class="panel-message">没有可显示的文本差异。新文件可点“查看文件”。</p>}{diff.value?.truncated && <p class="reference-note">差异过大，只显示前面的片段。</p>}</ReadState> : <ReadState read={file}>{file.value?.binary ? <p class="panel-message">此文件是二进制文件，无法预览文本。</p> : file.value && <FileCode value={file.value} />}{file.value?.truncated && <p class="reference-note">文件过大，只显示预览片段。引用时会标明截断。</p>}</ReadState>}</section>}
         {tab === "resources" && <><div class="panel-heading"><span>资源</span><button type="button" class="icon-button" aria-label="刷新资源" disabled={!online || resources.loading} onClick={resources.reload}><Icon name="refresh" /></button></div><div class="resource-tabs" role="group" aria-label="资源类型">{([['models', '模型'], ['tools', '工具'], ['commands', '命令'], ['capabilities', '能力']] as const).map(([name, label]) => <button type="button" key={name} aria-pressed={resourceTab === name} onClick={() => setResourceTab(name)}>{label}</button>)}</div><ReadState read={resources}>
-          {resourceTab === "models" && <><p class="resource-note">当前 RPC 会话可用的模型。选择后用于后续回复。</p>{resources.value?.models.map(model => <button type="button" class={`resource-item model-resource ${state.snapshot?.state.model?.provider === model.provider && state.snapshot?.state.model?.id === model.id ? "is-current" : ""}`} key={`${model.provider}:${model.id}`} disabled={!canConfigure} onClick={() => issueCommand("set_model", { provider: model.provider, id: model.id })}><strong>{model.name || model.id}</strong><span>{model.provider} · {model.id}</span>{state.snapshot?.state.model?.provider === model.provider && state.snapshot?.state.model?.id === model.id && <small>当前模型</small>}</button>)}{!resources.value?.models.length && <div class="panel-message"><p>没有可用模型。先登录一个模型服务商。</p><button type="button" onClick={() => openSettings("accounts")}>打开账户</button></div>}</>}
+          {resourceTab === "models" && <><p class="resource-note">当前 RPC 会话可用的模型。选择后用于后续回复。</p>{resources.value?.models.map(model => <button type="button" class={`resource-item model-resource ${state.snapshot?.state.model?.provider === model.provider && state.snapshot?.state.model?.id === model.id ? "is-current" : ""}`} key={`${model.provider}:${model.id}`} disabled={!canConfigure} onClick={() => { issueCommand("set_model", { provider: model.provider, id: model.id }); focusElement(rightRef.current?.querySelector<HTMLElement>('.resource-tabs button[aria-pressed="true"]')); }}><strong>{model.name || model.id}</strong><span>{model.provider} · {model.id}</span>{state.snapshot?.state.model?.provider === model.provider && state.snapshot?.state.model?.id === model.id && <small>当前模型</small>}</button>)}{!resources.value?.models.length && <div class="panel-message"><p>没有可用模型。先登录一个模型服务商。</p><button type="button" onClick={() => openSettings("accounts")}>打开账户</button></div>}</>}
           {resourceTab === "tools" && <>{resources.value?.tools.map(tool => <div class="resource-item" key={tool.name}><strong>{tool.name}<span class={`resource-status ${tool.active ? "active" : ""}`}>{tool.active ? "已启用" : "未启用"}</span></strong><p>{tool.description}</p>{tool.source && <span>{tool.source}</span>}</div>)}{!resources.value?.tools.length && <p class="panel-message">工具列表与启停需要 pi RPC 上游支持；交接模式暂不提供。</p>}</>}
-          {resourceTab === "commands" && <>{(resources.value?.commands || commands).map((command, index) => <button type="button" class="resource-item command-resource" key={`${command.source}:${command.name}:${index}`} disabled={!command.available} title={command.reason} onClick={() => { setDraft(`/${command.name} `); if (overlayInspector) setRightOpen(false); focusComposer(); }}><strong>/{command.name}<span class="source-chip">{sourceLabels[command.source]}</span></strong><p>{command.description}</p>{!command.available && <span>{command.reason || "请在终端使用"}</span>}</button>)}</>}
+          {resourceTab === "commands" && <>{(resources.value?.commands || commands).map((command, index) => <button type="button" class="resource-item command-resource" key={`${command.source}:${command.name}:${index}`} disabled={!command.available} title={command.reason} onClick={() => { setDraft(`/${command.name} `); if (narrow) setRightOpen(false); focusComposer(); }}><strong>/{command.name}<span class="source-chip">{sourceLabels[command.source]}</span></strong><p>{command.description}</p>{!command.available && <span>{command.reason || "请在终端使用"}</span>}</button>)}</>}
           {resourceTab === "capabilities" && <>{state.snapshot?.caps.commands.includes("access_rotate") && <div class="resource-item"><strong>访问凭据</strong><p>轮换后，已有链接与其他访客登录会失效。新链接会显示在交接终端。</p>{rotateConfirm ? <div class="rotate-confirm" role="group" aria-label="确认轮换访问凭据"><button type="button" disabled={!online} onClick={() => { issueCommand("access_rotate"); setRotateConfirm(false); }}>确认轮换</button><button type="button" class="quiet" onClick={() => setRotateConfirm(false)}>取消</button></div> : <button type="button" disabled={!online} onClick={() => setRotateConfirm(true)}>轮换凭据</button>}</div>}{resources.value?.capabilities.map(capability => <div class="resource-item" key={capability.name}><strong>{capabilityLabels[capability.name]?.[0] || capability.name}<span class={`resource-status ${capability.available ? "active" : ""}`}>{capability.available ? "可用" : "待接入"}</span></strong><p>{capability.detail || capabilityLabels[capability.name]?.[1]}</p></div>)}</>}
         </ReadState></>}
         {!state.snapshot?.caps.workbench && <p class="panel-message">当前 pi-pane 主机尚未提供工作台能力，请更新扩展并重新加载 pi。</p>}

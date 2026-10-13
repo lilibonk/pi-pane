@@ -172,6 +172,8 @@ export class HandoffHost implements HostHandler {
   private recovery?: NonNullable<HostStatus["recovery"]>;
   /** The model of the runtime that was stopped, to compare when its session is restored. */
   private previousModel?: ModelRef;
+  /** One unresolved model report, retained across reloads of this session but never another scope. */
+  private modelNotice?: { sessionId: string; cwd: string; unavailable: boolean; message: string };
   private end!: (value: HostEnd) => void;
   /** Settles once: the ready child exited on its own, the host failed closed, or the user stopped a failed replacement. */
   readonly finished = new Promise<HostEnd>(resolve => { this.end = resolve; });
@@ -820,15 +822,28 @@ export class HandoffHost implements HostHandler {
       this.child.request<{ models: unknown[] }>("get_available_models").then(result => result.models.length, () => undefined)]);
     if (!state) return; // not an answer about the model
     const actual = state.model;
+    const knownExpected = expected.provider !== "unknown" || expected.id !== "unknown";
+    const previous = knownExpected ? `，${label}是 ${expected.provider}/${expected.id}` : "";
+    const logPrevious = knownExpected ? `; ${when} it was ${expected.provider}/${expected.id}` : "";
     // With nothing configured pi 1.1.0 reports a placeholder model (unknown/unknown) rather than none.
     if (!actual || available === 0) {
-      this.log(`No model is available now; ${when} it was ${expected.provider}/${expected.id}.`);
-      this.hub.notifyAll({ t: "notice", message: `当前会话没有可用的模型，${label}是 ${expected.provider}/${expected.id}。请在“设置”里登录账户或添加供应商，再选择模型。` });
+      this.reportModelNotice(`当前会话没有可用的模型${previous}。请在“设置”里登录账户或添加供应商，再选择模型。`, true,
+        `No model is available now${logPrevious}.`);
       return;
     }
-    if (actual.provider === expected.provider && actual.id === expected.id) return;
-    this.log(`Model is now ${actual.provider}/${actual.id}; ${when} it was ${expected.provider}/${expected.id}. The session's recorded model takes precedence.`);
-    this.hub.notifyAll({ t: "notice", message: `当前模型是 ${actual.provider}/${actual.id}，${label}是 ${expected.provider}/${expected.id}。已按会话记录恢复，需要时请重新选择。` });
+    if (actual.provider === expected.provider && actual.id === expected.id) { this.modelNotice = undefined; return; }
+    this.reportModelNotice(`当前模型是 ${actual.provider}/${actual.id}${previous}。已按会话记录恢复，需要时请重新选择。`, false,
+      `Model is now ${actual.provider}/${actual.id}${logPrevious}. The session's recorded model takes precedence.`);
+  }
+  private reportModelNotice(message: string, unavailable: boolean, log: string): void {
+    const sessionId = this.mirror?.sessionId;
+    if (!sessionId) return;
+    const current = this.modelNotice;
+    // Reopening an already empty runtime often reports unknown/unknown again. Keep the first
+    // actionable warning (and its real previous model) without broadcasting a second one.
+    if (unavailable && current?.unavailable && current.sessionId === sessionId && current.cwd === this.activeCwd) return;
+    this.modelNotice = { sessionId, cwd: this.activeCwd, unavailable, message };
+    this.log(log); this.hub.notifyAll({ t: "notice", message });
   }
   private record(child: RpcConnection, record: RpcRecord): void {
     if (child === this.retiring) {
@@ -904,6 +919,7 @@ export class HandoffHost implements HostHandler {
     // Establish its acknowledged startup baseline before exposing the first snapshot.
     // The same holds for every newly started child. Between the gate check and this point only it could write.
     if (this.child !== this.readyChild) await this.lock!.acceptChanges();
+    if (this.modelNotice && (this.modelNotice.sessionId !== mirror.sessionId || this.modelNotice.cwd !== this.activeCwd)) this.modelNotice = undefined;
     this.hub.bindBridge(bridge, reason);
     if (reason !== "handoff") this.log(`Current workspace: ${this.activeCwd}\nSession: ${this.lastSessionFile}`);
   }
@@ -1102,6 +1118,7 @@ export class HandoffHost implements HostHandler {
     else if (name === "session_rename") value = await child.request("set_session_name", { name: args.name });
     else throw new ProtocolError("unknown_command", "Unknown handoff command.");
     await this.refreshAfterWrite();
+    if (name === "set_model") this.modelNotice = undefined;
     return name === "session_rename" ? { name: this.mirror!.sessionName, sessionId: this.mirror!.sessionId } : value;
   }
   /** Registered RPC extension commands can replace sessions through their public command context. */
@@ -1130,6 +1147,12 @@ export class HandoffHost implements HostHandler {
   }
   uiState(): HostUiState { return structuredClone(this.ui); }
   pendingDialogs(): Dialog[] { return [...this.dialogs.values()].map(dialog => structuredClone(dialog)); }
+  pendingModelNotice(): { t: "notice"; message: string } | undefined {
+    const notice = this.modelNotice;
+    if (!notice || this.phase !== "ready" || this.stopping || !this.bridge || !this.child?.running
+      || notice.sessionId !== this.mirror?.sessionId || notice.cwd !== this.activeCwd) return;
+    return { t: "notice", message: notice.message };
+  }
   answer(id: string, response: Record<string, unknown>): void {
     const dialog = this.dialogs.get(id);
     if (!dialog) throw new ProtocolError("dialog_closed", "This dialog was already answered or closed.");
@@ -1298,7 +1321,7 @@ export class HandoffHost implements HostHandler {
     if (this.stopPromise) return this.stopPromise;
     const remembered = this.phase === "ready" ? this.rememberSession(false) : Promise.resolve();
     this.accounts.dispose();
-    this.stopping = true; this.clearDialogs("stopped", true); this.mirror?.dispose(); this.bridge?.dispose(); this.unsubscribe?.();
+    this.stopping = true; this.modelNotice = undefined; this.clearDialogs("stopped", true); this.mirror?.dispose(); this.bridge?.dispose(); this.unsubscribe?.();
     this.stopPromise = (async () => {
       try { await remembered; await this.child?.stop(); }
       finally { for (const lock of [...this.locks]) await this.drop(lock); this.hub.setHostHandler(undefined); this.phase = "stopped"; this.hostRevision++; }

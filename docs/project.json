@@ -18,11 +18,11 @@
   "evidencePage": "https://chatgpt.com/space/page_b3f2b1dc1800819189f2b90d540f931c",
   "localFollowUpAutomationId": "pi-pane-m0-space",
   "localFollowUpStatus": "PAUSED",
-  "evidenceDirectory": "build-artifacts/releases/0.3.0-rc.3",
+  "evidenceDirectory": "build-artifacts/releases/0.3.0-rc.4",
   "liveTaskStatusSource": "docs/m3.1-status.md",
   "nextSteps": [
-    "Retain rc.3 as M31-5 final candidate with maintainer-accepted boundaries and 8 passed/4 partial acceptance items",
-    "Complete final visuals, separately authorized real-provider trial and M31-6 release gates"
+    "Await maintainer final visual review of the exact rc.4 screenshots; preserve partial acceptance boundaries and the current no-commit, no-push, no-publication scope. Runtime gates and writeback byte verification have passed.",
+    "Run only separately authorized real-provider/release gates; public/daily 0.2.0 remains unchanged, no commit/push/publication in this round"
   ],
   "pi110CompatibilityStatus": "key-regressions-passed",
   "dailyPackageLoadStatus": "published-npm-0.2.0-installed-single-source-integrity-verified-restart-required",
@@ -494,111 +494,148 @@
     "sourceCommit": "38152e1b0a585c549f3ef71d11715c29589b61ad"
   },
   "m31Candidate": {
-    "version": "0.3.0-rc.3",
-    "status": "m31-5-final-candidate-maintainer-accepted-boundaries",
+    "version": "0.3.0-rc.4",
+    "status": "frozen-current-candidate-local-validation-and-byte-verification-1-passed-exact-maintainer-visual-pending",
     "branch": "m3.1/gates",
-    "sourceBaseline": "bd6d4b9172b499fe966a8543deb9c526c256fb65",
+    "sourceBaseline": "3f116977185fc6685c3926c0378518468201676f",
     "freezeTimeUncommittedChanges": true,
-    "sourceCheckpoint": "M31-D and M31-5 committed locally on m3.1/gates under explicit maintainer authorization; freeze-time baseline/snapshot remain historical",
+    "sourceCheckpoint": "Frozen 2026-10-12 Beijing from tracked/untracked working-tree bytes; non-packaged allowlist documents and representative images written back 2026-10-13 Beijing. No new commit/push/publication in this round.",
+    "frozenAtUtc": "2026-10-12T15:38:35.914455+00:00",
+    "frozenAtBeijing": "2026-10-12T23:38:35.914455+08:00",
+    "freezeReport": "build-artifacts/releases/0.3.0-rc.4/candidate/freeze.json",
     "pushStatus": "not-pushed",
-    "finalCandidateDecision": {
-      "date": "2026-10-12",
-      "maintainerIndependentReview": "archive, 24 continuous executions/257 checks, exact install 5 checks and integration 20 checks independently verified",
-      "acceptedBoundaries": true,
-      "newCandidateForTheseFindings": false,
-      "deferredToFutureVisualChanges": [
-        "unknown/unknown wording on repeated zero-model reload",
-        "notice delivery to pages connecting after the broadcast"
-      ]
-    },
-    "evidenceDirectory": "build-artifacts/releases/0.3.0-rc.3",
-    "statusDocument": "docs/m3.1-status.md",
-    "migrationDocument": "docs/m3.1-migration.md",
+    "commitStatus": "not-committed-this-round",
     "publicationStatus": "not-published",
     "dailyPackageChanged": false,
+    "publishedAndDailyPackageVersion": "0.2.0",
     "webOAuth": "disabled-maintainer-decision",
-    "realProviderTrial": "not-run",
-    "unit": {
-      "passed": 268,
-      "total": 268,
-      "log": "build-artifacts/releases/0.3.0-rc.3/audit/unit.log"
-    },
-    "build": "passed",
-    "typecheck": "passed",
-    "mutation": {
-      "expectedFailures": 2,
-      "sourceRestoredExactly": true,
-      "report": "build-artifacts/releases/0.3.0-rc.3/audit/mutation.json"
-    },
-    "archive": "build-artifacts/releases/0.3.0-rc.3/candidate/lilibonk-pi-pane-0.3.0-rc.3.tgz",
-    "sha256": "8db1793e03db9184c3077ca27599f5023b4082a256945bcedd1b541cfbcb2222",
+    "realProviderTrial": "not-run-for-this-candidate",
+    "evidenceDirectory": "build-artifacts/releases/0.3.0-rc.4",
+    "statusDocument": "docs/m3.1-status.md",
+    "migrationDocument": "docs/m3.1-migration.md",
+    "uiDocument": "docs/m3.1-ui-design.md",
+    "archive": "build-artifacts/releases/0.3.0-rc.4/candidate/lilibonk-pi-pane-0.3.0-rc.4.tgz",
+    "sha256": "2ef4d9361a8d7fe1156f264452336172dc393bc06dd4f774f28d4a227925317e",
     "packagedFiles": 131,
-    "packagedBytes": 661616,
-    "sourceSnapshot": "build-artifacts/releases/0.3.0-rc.3/candidate/source-snapshot.tar.gz",
-    "sourceSnapshotSha256": "dc2720777ad1594096f315f8f418f19bed40d7528e8b0f9581157176094c37fd",
-    "sourceFiles": 217,
+    "packagedBytes": 667307,
+    "sourceSnapshot": "build-artifacts/releases/0.3.0-rc.4/candidate/source-snapshot.tar.gz",
+    "sourceSnapshotSha256": "1a91a27583cca7f5e718150def5f671dec0590eddc609b6ad5002e64c8e781d7",
+    "sourceFiles": 243,
     "regression": {
+      "status": "passed",
       "singleContinuousRun": true,
-      "executions": 24,
-      "reports": 25,
-      "passed": 257,
-      "total": 257,
-      "report": "build-artifacts/releases/0.3.0-rc.3/regression/summary.json"
+      "executions": 25,
+      "reports": 26,
+      "passed": 293,
+      "total": 293,
+      "sourceAndBuildUnchanged": true,
+      "runnerTemporaryRootRemoved": true,
+      "report": "build-artifacts/releases/0.3.0-rc.4/regression/summary.json",
+      "executionScope": "candidate-associated built checkout dist; exact installed-artifact execution is separate"
     },
     "exactInstall": {
+      "status": "passed",
       "passed": 5,
       "total": 5,
-      "report": "build-artifacts/releases/0.3.0-rc.3/install/report.json"
+      "archiveFilesMatched": 131,
+      "registry": "temporary-local-simulated-registry; not public npm publication",
+      "installedPackageRoot": "/private/var/folders/xr/h4ddvv5d74vg7fb8bby5z81w0000gn/T/pi-pane-candidate-call-wal4o_60/tmp/pi-pane-m0-OIVfXF/agent/npm/node_modules/@lilibonk/pi-pane",
+      "installedExtension": "/private/var/folders/xr/h4ddvv5d74vg7fb8bby5z81w0000gn/T/pi-pane-candidate-call-wal4o_60/tmp/pi-pane-m0-OIVfXF/agent/npm/node_modules/@lilibonk/pi-pane/dist/extension/index.js",
+      "sourceExtensionLoaded": false,
+      "archiveSha256": "2ef4d9361a8d7fe1156f264452336172dc393bc06dd4f774f28d4a227925317e",
+      "report": "build-artifacts/releases/0.3.0-rc.4/install/report.json"
     },
     "installedIntegration": {
+      "status": "passed",
       "passed": 20,
       "total": 20,
-      "report": "build-artifacts/releases/0.3.0-rc.3/install/integration/report.json"
-    },
-    "zeroModelPageSupplement": {
-      "passed": 11,
-      "total": 11,
-      "realPi": "1.1.0",
-      "reloadBranches": [
-        "new_session",
-        "switch_session"
-      ],
-      "sendObserved": "old immediate post-fill disabled observation withdrawn as proof of stable zero-model behavior; original raw evidence preserved; see zeroModelSendFollowup",
-      "runtimeBytesMatchFreeze": true,
-      "report": "build-artifacts/releases/0.3.0-rc.3/zero-model-page/evidence/report.json"
-    },
-    "zeroModelSendFollowup": {
-      "passed": 2,
-      "total": 2,
-      "checkScope": "real enabled button click, one exact prompt dispatch and receipt capture per reload branch; failed prompts are observations, not successful model replies or additional E2E passes",
-      "originalNoticeAndPanelChecksRepeated": { "passed": 11, "total": 11 },
-      "immediatelyEnabled": false,
-      "settledEnabled": true,
-      "renderWaitMsBothCases": 24,
-      "ack": "dispatched",
-      "result": "failed",
-      "errorCode": "operation_failed",
-      "errorFirstLine": "No API key found for the selected model.",
-      "draftAfter": "",
-      "endpointRequestsAdded": 0,
-      "sessionFilesChanged": 0,
+      "installedExtension": "/private/var/folders/xr/h4ddvv5d74vg7fb8bby5z81w0000gn/T/pi-pane-candidate-call-wal4o_60/tmp/pi-pane-m0-OIVfXF/agent/npm/node_modules/@lilibonk/pi-pane/dist/extension/index.js",
+      "candidateTarballSha256": "2ef4d9361a8d7fe1156f264452336172dc393bc06dd4f774f28d4a227925317e",
+      "includedAsInternalEvidenceOfInstallGate5": true,
+      "notAddedToRegressionOrInstallTotals": true,
       "pageErrors": 0,
-      "residualProcesses": 0,
-      "forcedCleanup": 0,
-      "runtimeBytesMatchFreeze": true,
-      "oldDisabledConclusionWithdrawn": true,
-      "report": "build-artifacts/releases/0.3.0-rc.3/zero-model-send-followup/evidence/report.json"
+      "realRemoteModelCalls": 0,
+      "report": "build-artifacts/releases/0.3.0-rc.4/install/integration/report.json"
     },
-    "auditReport": "build-artifacts/releases/0.3.0-rc.3/audit/review.json",
-    "auditFindings": [
-      "ancestor-alias deletion/dangling historical diff",
-      "EACCES protection fallback",
-      "case-insensitive missing-root create",
-      "request-local symlink metadata race",
-      "availability-zero despite working selected model",
-      "notice delivery/query failure gaps",
-      "prior RPC/shutdown scope"
+    "repeats": {
+      "status": "passed",
+      "executions": 6,
+      "concurrencyRuns": 3,
+      "concurrencyEach": 7,
+      "resilienceRuns": 3,
+      "resilienceEach": 17,
+      "displayName": "并发与故障恢复",
+      "includedInFullMatrixCounts": false,
+      "allContentUnchanged": true,
+      "report": "build-artifacts/releases/0.3.0-rc.4/repeats/summary.json"
+    },
+    "uiRedesign": {
+      "status": "passed-local-implementation-checks-not-final-maintainer-visual",
+      "viewports": [
+        {
+          "width": 1280,
+          "height": 720
+        },
+        {
+          "width": 1024,
+          "height": 768
+        },
+        {
+          "width": 390,
+          "height": 844
+        },
+        {
+          "width": 320,
+          "height": 740
+        }
+      ],
+      "passed": 36,
+      "total": 36,
+      "focusRecoveryRecords": 96,
+      "exactFocusRecords": 92,
+      "usableFallbackRecords": 4,
+      "includedInRegression293": true,
+      "report": "build-artifacts/releases/0.3.0-rc.4/regression/m31-redesign/report.json",
+      "visualReview": "build-artifacts/releases/0.3.0-rc.4/preparation/screenshots-final-review.json",
+      "representativeCopy": "build-artifacts/releases/0.3.0-rc.4/preparation/screenshots-copy.json"
+    },
+    "approvedFixes": [
+      "unknown/unknown expected-model prefix omitted for zero-model and restored-model notices",
+      "one session/project-scoped pending model notice replayed after late hello/resync snapshot; existing availability===0 classification unchanged",
+      "touch-capable full-project-path button and visible connection text",
+      "redesign verification integrated as a full-matrix execution"
     ],
+    "modelNoticeVerification": {
+      "newUnits": {
+        "passed": 11,
+        "total": 11
+      },
+      "relatedFullFiles": {
+        "passed": 87,
+        "total": 87
+      },
+      "scope": "Affected Handoff/Hub tests only; not a claim of the entire unit suite",
+      "report": "build-artifacts/releases/0.3.0-rc.4/preparation/model-fixes/report.json",
+      "realPageSupplement": {
+        "passed": 5,
+        "total": 5,
+        "cleanupComplete": true,
+        "artifactKind": "pre-freeze built dist",
+        "includedInMatrixCounts": false,
+        "report": "build-artifacts/releases/0.3.0-rc.4/preparation/model-fixes/late-browser-attempt2/report.json"
+      }
+    },
+    "priorAcceptedBoundaries": {
+      "candidate": "0.3.0-rc.3",
+      "maintainerAcceptedDate": "2026-10-12",
+      "carriedForward": true,
+      "limits": [
+        "ancestor-alias/permission/case-insensitive/request-local symlink evidence boundaries remain as accepted",
+        "availability-zero despite usable selected model and catalog/query failure classifications remain unchanged",
+        "prior RPC/orphan/shutdown observation scope retained; no new long-soak/physical-device/real-vendor claim"
+      ],
+      "decisionDoesNotApproveExactRc4FinalVisual": true
+    },
     "acceptance": {
       "passed": 8,
       "partial": [
@@ -607,11 +644,31 @@
         "E2E-09",
         "E2E-10"
       ],
-      "partialNotCountedAsPassed": true
+      "partialNotCountedAsPassed": true,
+      "document": "docs/m3.1-gates.md",
+      "maintainerFinalVisual": "pending-for-exact-0.3.0-rc.4-archive",
+      "wholeM31CompletionClaimed": false
     },
-    "repeats": "not-repeated-this-round; concurrency/resilience included once in full matrix",
-    "closureReport": "build-artifacts/releases/0.3.0-rc.3/candidate-closure-final.json",
-    "validationCompletedDate": "2026-10-12"
+    "finalVerification": {
+      "status": "passed",
+      "report": "build-artifacts/releases/0.3.0-rc.4/finalization/verify-after-records-1.json",
+      "recordedAtUtc": "2026-10-12T16:14:44.547685+00:00",
+      "scope": "candidate byte identity and immutable historical evidence",
+      "packagedFilesEqualWorkingTree": 131,
+      "sourceSnapshotManifestFiles": 243,
+      "builtFilesEqualFreeze": 121,
+      "releaseHelpersEqualFreeze": 3,
+      "historicalEvidenceUnchangedFiles": 2100,
+      "allowedChangesOnly": true,
+      "addedSourceFiles": [],
+      "deletedSourceFiles": [],
+      "head": "3f116977185fc6685c3926c0378518468201676f",
+      "exactMaintainerVisualApproval": false
+    },
+    "validationCompletedDate": "2026-10-12",
+    "validationDateTimezone": "Asia/Shanghai; execution report timestamps UTC",
+    "documentationWritebackDate": "2026-10-13",
+    "documentationWritebackTimezone": "Asia/Shanghai"
   },
   "activeCandidate": "m31Candidate",
   "publicationFieldsScope": "Published package, daily installation and historical real-provider trial fields refer to 0.2.0; current unpublished validation is m31Candidate.",
@@ -787,6 +844,129 @@
         "document": "docs/m3.1-gates.md#14-m31-5-整合独立审核与-rc2-候选验证"
       },
       "closureReport": "build-artifacts/releases/0.3.0-rc.2/candidate-closure.json",
+      "validationCompletedDate": "2026-10-12"
+    },
+    {
+      "version": "0.3.0-rc.3",
+      "status": "m31-5-final-candidate-maintainer-accepted-boundaries",
+      "branch": "m3.1/gates",
+      "sourceBaseline": "bd6d4b9172b499fe966a8543deb9c526c256fb65",
+      "freezeTimeUncommittedChanges": true,
+      "sourceCheckpoint": "M31-D and M31-5 committed locally on m3.1/gates under explicit maintainer authorization; freeze-time baseline/snapshot remain historical",
+      "pushStatus": "not-pushed",
+      "finalCandidateDecision": {
+        "date": "2026-10-12",
+        "maintainerIndependentReview": "archive, 24 continuous executions/257 checks, exact install 5 checks and integration 20 checks independently verified",
+        "acceptedBoundaries": true,
+        "newCandidateForTheseFindings": false,
+        "deferredToFutureVisualChanges": [
+          "unknown/unknown wording on repeated zero-model reload",
+          "notice delivery to pages connecting after the broadcast"
+        ]
+      },
+      "evidenceDirectory": "build-artifacts/releases/0.3.0-rc.3",
+      "statusDocument": "docs/m3.1-status.md",
+      "migrationDocument": "docs/m3.1-migration.md",
+      "publicationStatus": "not-published",
+      "dailyPackageChanged": false,
+      "webOAuth": "disabled-maintainer-decision",
+      "realProviderTrial": "not-run",
+      "unit": {
+        "passed": 268,
+        "total": 268,
+        "log": "build-artifacts/releases/0.3.0-rc.3/audit/unit.log"
+      },
+      "build": "passed",
+      "typecheck": "passed",
+      "mutation": {
+        "expectedFailures": 2,
+        "sourceRestoredExactly": true,
+        "report": "build-artifacts/releases/0.3.0-rc.3/audit/mutation.json"
+      },
+      "archive": "build-artifacts/releases/0.3.0-rc.3/candidate/lilibonk-pi-pane-0.3.0-rc.3.tgz",
+      "sha256": "8db1793e03db9184c3077ca27599f5023b4082a256945bcedd1b541cfbcb2222",
+      "packagedFiles": 131,
+      "packagedBytes": 661616,
+      "sourceSnapshot": "build-artifacts/releases/0.3.0-rc.3/candidate/source-snapshot.tar.gz",
+      "sourceSnapshotSha256": "dc2720777ad1594096f315f8f418f19bed40d7528e8b0f9581157176094c37fd",
+      "sourceFiles": 217,
+      "regression": {
+        "singleContinuousRun": true,
+        "executions": 24,
+        "reports": 25,
+        "passed": 257,
+        "total": 257,
+        "report": "build-artifacts/releases/0.3.0-rc.3/regression/summary.json"
+      },
+      "exactInstall": {
+        "passed": 5,
+        "total": 5,
+        "report": "build-artifacts/releases/0.3.0-rc.3/install/report.json"
+      },
+      "installedIntegration": {
+        "passed": 20,
+        "total": 20,
+        "report": "build-artifacts/releases/0.3.0-rc.3/install/integration/report.json"
+      },
+      "zeroModelPageSupplement": {
+        "passed": 11,
+        "total": 11,
+        "realPi": "1.1.0",
+        "reloadBranches": [
+          "new_session",
+          "switch_session"
+        ],
+        "sendObserved": "old immediate post-fill disabled observation withdrawn as proof of stable zero-model behavior; original raw evidence preserved; see zeroModelSendFollowup",
+        "runtimeBytesMatchFreeze": true,
+        "report": "build-artifacts/releases/0.3.0-rc.3/zero-model-page/evidence/report.json"
+      },
+      "zeroModelSendFollowup": {
+        "passed": 2,
+        "total": 2,
+        "checkScope": "real enabled button click, one exact prompt dispatch and receipt capture per reload branch; failed prompts are observations, not successful model replies or additional E2E passes",
+        "originalNoticeAndPanelChecksRepeated": {
+          "passed": 11,
+          "total": 11
+        },
+        "immediatelyEnabled": false,
+        "settledEnabled": true,
+        "renderWaitMsBothCases": 24,
+        "ack": "dispatched",
+        "result": "failed",
+        "errorCode": "operation_failed",
+        "errorFirstLine": "No API key found for the selected model.",
+        "draftAfter": "",
+        "endpointRequestsAdded": 0,
+        "sessionFilesChanged": 0,
+        "pageErrors": 0,
+        "residualProcesses": 0,
+        "forcedCleanup": 0,
+        "runtimeBytesMatchFreeze": true,
+        "oldDisabledConclusionWithdrawn": true,
+        "report": "build-artifacts/releases/0.3.0-rc.3/zero-model-send-followup/evidence/report.json"
+      },
+      "auditReport": "build-artifacts/releases/0.3.0-rc.3/audit/review.json",
+      "auditFindings": [
+        "ancestor-alias deletion/dangling historical diff",
+        "EACCES protection fallback",
+        "case-insensitive missing-root create",
+        "request-local symlink metadata race",
+        "availability-zero despite working selected model",
+        "notice delivery/query failure gaps",
+        "prior RPC/shutdown scope"
+      ],
+      "acceptance": {
+        "passed": 8,
+        "partial": [
+          "E2E-05",
+          "E2E-08",
+          "E2E-09",
+          "E2E-10"
+        ],
+        "partialNotCountedAsPassed": true
+      },
+      "repeats": "not-repeated-this-round; concurrency/resilience included once in full matrix",
+      "closureReport": "build-artifacts/releases/0.3.0-rc.3/candidate-closure-final.json",
       "validationCompletedDate": "2026-10-12"
     }
   ]

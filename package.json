@@ -1,6 +1,6 @@
 {
   "name": "@lilibonk/pi-pane",
-  "version": "0.3.0-rc.3",
+  "version": "0.3.0-rc.4",
   "license": "MIT",
   "type": "module",
   "description": "Hand the current pi TUI session to a foreground browser workbench, with RPC-owned conversations and optional HTTPS access",
@@ -53,6 +53,7 @@
     "m31:ui": "node --import tsx scripts/m31-ui.mjs",
     "m31:gates": "node --import tsx scripts/m31-g1.mjs && node --import tsx scripts/m31-g2.mjs && node --import tsx scripts/m31-g3.mjs && node --import tsx scripts/m31-g4g5.mjs",
     "m31:design": "node --import tsx scripts/m31-design.mjs",
+    "m31:redesign": "node --import tsx scripts/m31-redesign.mjs",
     "m31:theme-tui": "node --import tsx scripts/m31-theme-tui.mjs",
     "m31:integration": "node --import tsx scripts/m31-integration.mjs",
     "m31:compat": "node --import tsx scripts/m31-compat.mjs",

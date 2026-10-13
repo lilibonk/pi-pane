@@ -3,7 +3,7 @@ import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "preact/ho
 import type { JSX } from "preact";
 import { IMAGE_TYPES } from "../protocol/index.js";
 import {
-  addImages, answerDialog, forgetSubmission, issueCommand, issueHostCommand, loadOlder, login, logout, openSettings, queryReceipt, reconnect, removeAttachment, setDraft, setProjectDialog,
+  addImages, answerDialog, forgetSubmission, issueCommand, issueHostCommand, loadOlder, login, logout, openSettings, queryReceipt, reconnect, removeAttachment, setDraft, setProjectDialog, setSessionDialog,
   startConnection, submitPrompt, webStore, type Attachment, type Dialog, type MessageView, type Submission, type ToolView, type WebState,
 } from "./store.js";
 import { Message, ToolCard, type ToolContext } from "./messages.js";
@@ -52,10 +52,6 @@ function DialogView({ dialog, online }: { dialog: Dialog; online: boolean }) {
     return () => {
       document.removeEventListener("keydown", keys);
       background.forEach((child, index) => { child.inert = inertStates[index]!; });
-      const workbench = shell?.querySelector<HTMLElement>(".workbench");
-      const topbar = background.find(child => child.classList.contains("topbar"));
-      // A drawer may regain its focus trap during the same commit that removes the dialog.
-      if (topbar && workbench) topbar.inert = (matchMedia("(max-width: 760px)").matches && workbench.classList.contains("left-open")) || (matchMedia("(max-width: 1100px)").matches && workbench.classList.contains("right-open"));
       if (previous?.isConnected && !previous.closest("[inert]")) previous.focus();
     };
   }, [dialog.id, online]);
@@ -219,6 +215,8 @@ function App() {
   const themeKeys = useRef<string[]>([]);
   const online = connection === "online" && !!snapshot && !!state.clientId;
   const host = snapshot?.state;
+  const projectPath = snapshot?.session.cwd;
+  const projectName = projectPath?.replace(/[\\/]+$/, "").split(/[\\/]/).pop() || projectPath || "连接当前会话";
   const recovery = state.host?.phase === "recovery_required" && !!state.host.recovery;
   const controlPending = state.submissions.some(item => item.epoch === snapshot?.epoch &&
     (item.command.startsWith("session_") || item.command === "set_model" || item.command === "compact") &&
@@ -369,14 +367,12 @@ function App() {
     <div class="app-shell">
       <Workbench state={state} canConfigure={canConfigure} commands={commandCatalog.value?.commands ?? []} controller={workbench} onFocusComposer={() => textarea.current?.focus()}
         empty={!!snapshot && !snapshot.session.messages.length && !host?.tools.length && !recovery && connection !== "login"}
-        connectionIndicator={<div class="connection" role="status"><span class={`status-dot status-${connection}`} /><span>{labels[connection]}</span>{state.authMode === "password" && connection !== "login" && <button type="button" class="quiet logout-button" onClick={() => void logout()}>退出登录</button>}</div>}>
-      <div class="session-bar">
-        <div class="session-identity"><h1>{snapshot?.session.name || "当前 pi 会话"}</h1><p title={snapshot?.session.cwd}>{snapshot?.session.cwd || "在浏览器中继续当前终端会话"}</p></div>
-        <div class="session-details">
+        connectionIndicator={<div class="connection" role="status"><span class={`status-dot status-${connection}`} /><span>{labels[connection]}</span>{state.authMode === "password" && connection !== "login" && <button type="button" class="quiet logout-button" onClick={() => void logout()}>退出登录</button>}</div>}
+        sessionIdentity={<div class="session-identity"><div class="session-identity-text"><h1>{snapshot?.session.name || "当前 pi 会话"}</h1><p title={projectPath}>{projectName}</p></div><button type="button" class="project-path-button" aria-label="查看项目完整路径" title={projectPath} disabled={!snapshot?.caps.workbench} onClick={() => setSessionDialog({ mode: "info" })}>⌄</button></div>}
+        sessionStatus={<div class="session-details" role="status">
           <span>{controlPending ? "正在处理会话或模型操作" : host?.compacting ? "压缩上下文中" : host?.running ? "正在运行" : host?.idle ? "空闲" : "状态未知"}</span>
           {host?.hasPendingMessages && <span class="queue-badge">存在待发消息</span>}
-        </div>
-      </div>
+        </div>}>
       {connection === "login" ? <div class="timeline"><div class="timeline-inner"><Login state={state} />{state.notice && <p class="login-notice" role="status">{state.notice}</p>}</div></div> : <>
       {state.notice && <div class={`notice notice-${connection}`} role="status"><span>{state.notice}</span>{(connection === "disconnected" || connection === "fatal") && <button type="button" onClick={reconnect}>重新连接</button>}</div>}
       {!!Object.keys(state.ui?.statuses ?? {}).length && <div class="extension-statuses" role="status">{Object.entries(state.ui!.statuses).map(([key, value]) => <span key={key} title={key}>{extensionText(value)}</span>)}</div>}
@@ -405,13 +401,16 @@ function App() {
             <textarea ref={textarea} aria-label="消息" rows={3} placeholder={host?.running ? coarsePointer ? "补充下一步…" : "补充下一步… Enter 请求 followUp；⌘ / Ctrl + Enter 请求 steer" : snapshot?.caps.workbench ? "给 pi 发送消息… / 命令 · @ 文件" : "给 pi 发送消息…"} value={state.draft} onInput={event => { const draft = event.currentTarget.value; setDraft(draft); const mention = /(?:^|\s)@([^\s]*)$/.exec(draft); if (snapshot?.caps.workbench && mention && !composing.current) workbench.current?.files(true, mention[1]); }} onKeyDown={onKeyDown}
               onPaste={event => { if (canAttach && event.clipboardData?.files.length && attachImages([...event.clipboardData.files])) event.preventDefault(); }} />
             <input ref={fileInput} type="file" accept={IMAGE_TYPES.join(",")} multiple hidden onChange={event => { attachImages([...(event.currentTarget.files ?? [])]); event.currentTarget.value = ""; }} />
-          <div class="host-controls">
-            <label><span>模型</span><select aria-label="模型" value={host?.model ? JSON.stringify({ provider: host.model.provider, id: host.model.id }) : ""} disabled={!canConfigure || !snapshot?.caps.commands.includes("set_model")} onChange={event => { const model = event.currentTarget.value; if (model) issueCommand("set_model", JSON.parse(model)); }}>{!resources.value?.models.some(model => model.provider === host?.model?.provider && model.id === host?.model?.id) && <option value="">{host?.model?.name || "未设置"}</option>}{resources.value?.models.map(model => <option key={`${model.provider}:${model.id}`} value={JSON.stringify({ provider: model.provider, id: model.id })}>{model.name || model.id}</option>)}</select></label>
-            <label><span>thinking</span><select aria-label="thinking 等级" value={host?.thinking ?? "off"} disabled={!canConfigure || !snapshot?.caps.commands.includes("set_thinking") || !resources.value?.thinkingLevels?.length} onChange={event => issueCommand("set_thinking", { level: event.currentTarget.value })}>{(resources.value?.thinkingLevels ?? [host?.thinking || "off"]).map(level => <option value={level} key={level}>{level}</option>)}</select></label>
-            <button type="button" class="compact-button" disabled={!canConfigure || !!host?.hasPendingMessages || !snapshot?.caps.commands.includes("compact")} onClick={() => issueCommand("compact")}>压缩上下文</button>
-            <ContextMeter state={state} />
-          </div>
-            <div class="composer-actions"><div class="context-buttons"><button type="button" class="attach-button" disabled={!canAttach || state.attachments.length >= 4} onClick={() => fileInput.current?.click()} aria-label="添加图片">图片</button>{snapshot?.caps.workbench && <button type="button" disabled={!online} onClick={() => workbench.current?.files(true)} aria-label="引用工作区文件">@ 文件</button>}</div><div class="action-buttons">{host && !host.idle && <button type="button" class="abort-button" disabled={!online || !snapshot?.caps.commands.includes("abort")} onClick={() => issueCommand("abort")}>■ 中止</button>}<button type="button" class="steer-button" disabled={!canPrompt || (!state.draft.trim() && !state.attachments.length)} onClick={() => submit("steer")} title="⌘ / Ctrl + Enter">steer</button><button type="button" class="send-button" disabled={!canPrompt || (!state.draft.trim() && !state.attachments.length)} onClick={() => submit("followUp")}>{host?.running ? "请求 followUp ↗" : "发送 ↗"}</button></div></div>
+            <div class="composer-toolbar">
+              <div class="context-buttons"><button type="button" class="attach-button" disabled={!canAttach || state.attachments.length >= 4} onClick={() => fileInput.current?.click()} aria-label="添加图片">图片</button>{snapshot?.caps.workbench && <button type="button" disabled={!online} onClick={() => workbench.current?.files(true)} aria-label="引用工作区文件">@ 文件</button>}</div>
+              <div class="host-controls">
+                <label><span>模型</span><select aria-label="模型" value={host?.model ? JSON.stringify({ provider: host.model.provider, id: host.model.id }) : ""} disabled={!canConfigure || !snapshot?.caps.commands.includes("set_model")} onChange={event => { const model = event.currentTarget.value; if (model) issueCommand("set_model", JSON.parse(model)); }}>{!resources.value?.models.some(model => model.provider === host?.model?.provider && model.id === host?.model?.id) && <option value="">{host?.model?.name || "未设置"}</option>}{resources.value?.models.map(model => <option key={`${model.provider}:${model.id}`} value={JSON.stringify({ provider: model.provider, id: model.id })}>{model.name || model.id}</option>)}</select></label>
+                <label><span>thinking</span><select aria-label="thinking 等级" value={host?.thinking ?? "off"} disabled={!canConfigure || !snapshot?.caps.commands.includes("set_thinking") || !resources.value?.thinkingLevels?.length} onChange={event => issueCommand("set_thinking", { level: event.currentTarget.value })}>{(resources.value?.thinkingLevels ?? [host?.thinking || "off"]).map(level => <option value={level} key={level}>{level}</option>)}</select></label>
+                <button type="button" class="compact-button" aria-label="压缩上下文" title="压缩当前会话的上下文" disabled={!canConfigure || !!host?.hasPendingMessages || !snapshot?.caps.commands.includes("compact")} onClick={() => issueCommand("compact")}>压缩</button>
+                <ContextMeter state={state} />
+              </div>
+              <div class="action-buttons">{host && !host.idle && <button type="button" class="abort-button" disabled={!online || !snapshot?.caps.commands.includes("abort")} onClick={() => issueCommand("abort")}>■ 中止</button>}<button type="button" class="steer-button" disabled={!canPrompt || (!state.draft.trim() && !state.attachments.length)} onClick={() => submit("steer")} title="⌘ / Ctrl + Enter">steer</button><button type="button" class="send-button" aria-label={host?.running ? "请求 followUp ↗" : "发送 ↗"} title={host?.running ? "回复结束后继续发送这条消息" : "发送消息"} disabled={!canPrompt || (!state.draft.trim() && !state.attachments.length)} onClick={() => submit("followUp")}>{host?.running ? "followUp ↗" : "发送 ↗"}</button></div>
+            </div>
           </div>
           </div>
           <div class="composer-guidance"><span>{coarsePointer ? "Enter 换行" : "Enter 发送 · Shift + Enter 换行"}</span><details class="composer-help"><summary>使用提示</summary><p>输入 / 选择命令、模板与 skill，输入 @ 引用项目文件。运行中可发送 followUp，或用 steer 引导当前回复。终端 Ctrl+C 停止服务并交还会话。</p></details></div>

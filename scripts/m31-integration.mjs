@@ -28,7 +28,13 @@ const report = { startedAt: new Date().toISOString(), scope: "M31-E2E-01/02 real
     "390×844 is a touch/mobile viewport, not a physical phone or its software keyboard.",
     "Draft retention is checked across project switches in one page; drafts intentionally clear on refresh.",
     "The writing tool is a real public extension tool with bounded fixture-only output, not a builtin shell tool."],
-  checks: [], screenshots: [], layouts: [], pageErrors: [], externalRequests: [], runs: [], cleanup: [], status: "running" };
+  checks: [], screenshots: [], layouts: [], pageErrors: [], externalRequests: [], runs: [], cleanup: [], status: "running",
+  assertionChanges: [
+    { location: "projectIs", before: "realpath(.workbench-project title) === cwd", after: "realpath(.session-identity p[title]) === cwd", reason: "rc.4 baseline stopped before checks at the removed header class; exact canonical path verification is retained." },
+    { location: "closeSidebar", before: "toggle visibility identifies a mobile drawer; desktop stays open", after: "viewport <=760 identifies the mobile full view; desktop stays open", reason: "The new desktop collapse opener can be visible. Escape and hidden/aria-expanded assertions remain strict on mobile." },
+    { location: "settings-to-composer transitions", before: "closing settings immediately allows hidden mobile composer actions", after: "verify focus returns to the retained navigation settings entry, then explicitly return to conversation", reason: "Mobile navigation intentionally remains behind settings; model/tool/project checks and exact modal focus checks are retained." },
+    { location: "slash model/resume cancellation", before: "only inspector/sidebar closed-state assertions", after: "also assert exact composer opener restoration", reason: "Strengthen coverage for the user-requested mobile return focus path without changing business routing or request counts." },
+  ] };
 const fixtures = [], secrets = new Set(), diagnosticFrames = [];
 const hash = bytes => createHash("sha256").update(bytes).digest("hex");
 const exists = path => stat(path).then(() => true, error => { if (error.code === "ENOENT") return false; throw error; });
@@ -77,7 +83,7 @@ async function openSidebar(page) {
 }
 async function closeSidebar(page) {
   const toggle = page.locator(".sidebar-toggle"), sidebar = page.locator(".workspace-sidebar");
-  if (!await toggle.isVisible()) return; // The desktop sidebar stays open.
+  if (page.viewportSize().width > 760) return; // Desktop navigation remains a docked workspace surface.
   await page.locator(".dialog-backdrop").waitFor({ state: "detached" });
   // A project change may already be closing the drawer. Escape is safe in either state,
   // whereas waiting for its disappearing close button to stabilize can time out.
@@ -95,7 +101,15 @@ async function closeModal(page, titleId) {
 }
 async function slash(page, command) { await composer(page).fill(command); await composer(page).press("Control+Enter"); }
 async function submit(page, text) { await composer(page).fill(text); await page.getByRole("button", { name: /^(发送 ↗|请求 followUp ↗)$/ }).click(); }
-async function projectIs(page, cwd) { await waitFor(async () => { const title = await page.locator(".workbench-project").getAttribute("title"); return title && await realpath(title) === cwd; }, `active project ${cwd}`, 30_000); }
+async function projectIs(page, cwd) { await waitFor(async () => { const title = await page.locator(".session-identity p[title]").getAttribute("title"); return title && await realpath(title) === cwd; }, `active project ${cwd}`, 30_000); }
+async function finishNavigationSettings(page) {
+  await closeModal(page, "settings-title");
+  const entry = page.locator(".workspace-sidebar .settings-button");
+  await waitFor(() => entry.evaluate(node => node === document.activeElement), "settings restores the retained navigation entry", 3_000);
+  await closeSidebar(page);
+  await composer(page).waitFor({ state: "visible" });
+  await page.evaluate(() => new Promise(done => requestAnimationFrame(() => requestAnimationFrame(done))));
+}
 async function switchProject(page, cwd) {
   const sidebar = await openSidebar(page);
   const button = sidebar.locator(".project-item").filter({ has: page.locator(".project-name") });
@@ -261,7 +275,7 @@ try {
       await page.locator("#account-step-input").fill(key); await page.getByRole("button", { name: "提交", exact: true }).click();
       await page.getByRole("heading", { name: `${providerId} 的凭据已保存`, exact: true }).waitFor();
       await page.locator('.dialog[aria-labelledby="account-dialog-title"]').getByRole("button", { name: "关闭", exact: true }).click();
-      await row.getByText("当前会话可用 1 个模型").waitFor(); await closeModal(page, "settings-title");
+      await row.getByText("当前会话可用 1 个模型").waitFor(); await finishNavigationSettings(page);
       assert.equal(JSON.parse(await readFile(join(fixture.agentDir, "auth.json"), "utf8"))[providerId].key, key);
       await page.getByLabel("模型", { exact: true }).selectOption(JSON.stringify({ provider: providerId, id: modelId }));
       await waitFor(async () => await page.getByLabel("模型", { exact: true }).inputValue() === JSON.stringify({ provider: providerId, id: modelId }), "custom model selected");
@@ -273,7 +287,7 @@ try {
       const option = page.getByRole("radio", { name: "pi-pane-porcelain", exact: true }); await option.waitFor(); await option.click();
       await page.getByRole("button", { name: "使用此外观", exact: true }).click(); await option.locator("small").waitFor();
       await waitFor(async () => await page.evaluate(() => getComputedStyle(document.documentElement).getPropertyValue("--bg").trim()) === source.expectedBg, "package theme color applied");
-      await layout(page, `${name}-theme`); await shot(page, `${name}-theme`); await closeModal(page, "settings-title");
+      await layout(page, `${name}-theme`); await shot(page, `${name}-theme`); await finishNavigationSettings(page);
       assert.equal(JSON.parse(await readFile(join(fixture.agentDir, "settings.json"), "utf8")).theme, undefined);
       assert.ok((await readFile(configPath)).equals(configBytes), "project theme file is unchanged");
       assert.equal(await page.evaluate(() => getComputedStyle(document.documentElement).getPropertyValue("--bg").trim()), source.expectedBg);
@@ -309,7 +323,9 @@ try {
       }
       assert.equal(await exists(join(fixture.agentDir, "pi-pane", "exports")), false, "export cancellation writes no file");
       await slash(page, "/model"); await page.locator(".workspace-inspector .model-resource").filter({ hasText: modelId }).waitFor(); await closeInspector(page);
+      await waitFor(() => composer(page).evaluate(node => node === document.activeElement), "model panel restores composer opener", 3_000);
       await slash(page, "/resume"); await page.locator(".workspace-sidebar .session-row").first().waitFor(); await closeSidebar(page);
+      if (page.viewportSize().width <= 760) await waitFor(() => composer(page).evaluate(node => node === document.activeElement), "resume restores composer opener", 3_000);
       assert.equal(requests.length, before, "slash commands did not request the provider");
       for (const command of ["/settings", "/login", "/session", "/export", "/model", "/resume"]) assert.equal(await page.locator(".message-user").filter({ hasText: command }).count(), 0, `${command} did not become a user message`);
       await composer(page).fill(bDraft);
@@ -325,7 +341,7 @@ try {
       const option = page.getByRole("radio", { name: "跟随 pi", exact: true }); await option.click();
       await page.getByText("当前项目的设置", { exact: false }).first().waitFor();
       await page.getByText("当前项目的设置指定了“light”", { exact: false }).waitFor();
-      await shot(page, `${name}-a-project-theme`); await closeModal(page, "settings-title");
+      await shot(page, `${name}-a-project-theme`); await finishNavigationSettings(page);
       await waitFor(async () => await page.evaluate(() => getComputedStyle(document.documentElement).getPropertyValue("--bg").trim()) === source.expectedBg, "canceling the project-theme preview restores the saved browser appearance");
       const inspect = page.getByRole("button", { name: "文件与改动", exact: true }); await inspect.click();
       const panel = page.locator(".workspace-inspector");

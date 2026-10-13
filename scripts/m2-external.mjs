@@ -35,6 +35,7 @@ const report = {
     "Binding a non-loopback interface with TLS (exercised by unit tests on loopback; the refusal of plain non-loopback is exercised here)",
     "Login expiry in the real TUI (the 8-hour lifetime is exercised with a short lifetime in tests/external.test.ts)"],
   checks: [], status: "running",
+  assertionChanges: [{ location: "M31-E2E-08 remote project selection", before: ".workbench-project[title] equals the created host path", after: ".session-identity p[title] equals the same created host path", reason: "rc.4 baseline failed at the intentionally removed header class; retain exact path equality, host-directory creation and login/reload assertions." }],
 };
 const check = async (name, action) => {
   const started = Date.now();
@@ -264,7 +265,7 @@ try {
     await directoryDialog.getByRole("button", { name: "创建并打开", exact: true }).tap();
     await directoryDialog.waitFor({ state: "hidden" });
     await waitFor(async () => (await stat(target).catch(() => undefined))?.isDirectory(), "new host directory");
-    await waitFor(async () => (await phone.locator(".workbench-project").getAttribute("title")) === target, "remote project selected");
+    await waitFor(async () => (await phone.locator(".session-identity p[title]").getAttribute("title")) === target, "remote project selected");
 
     await phone.getByRole("button", { name: "打开工作区与会话", exact: true }).tap();
     await phone.getByRole("button", { name: "设置", exact: true }).tap();

@@ -1,8 +1,8 @@
 #!/usr/bin/env node
 /**
  * M31-D visual matrix against the real TUI → /web → RPC page. Every appearance, dialog,
- * drawer, form and conversation is reached through the UI. Page evaluation only reads DOM/CSS;
- * it never changes the application store or browser preferences. No real credentials/models.
+ * navigation, form and conversation is reached through the UI. Evaluation reads DOM/CSS and observes
+ * real keyboard events with a temporary DOM listener; it never changes the application store or browser preferences. No real credentials/models.
  * Build first, then: node --import tsx scripts/m31-design.mjs
  */
 import assert from "node:assert/strict";
@@ -22,8 +22,15 @@ const report = {
   isolation: "temporary HOME/agent/workspace, environment allowlist, local deterministic provider, PI_OFFLINE=1",
   limits: ["Screenshots and measured UI checks require human visual review; this is not a pixel-baseline comparison.",
     "Viewport emulation does not establish behavior of a physical phone or its software keyboard.",
+    "Natural workspace keyboard checks install and remove a temporary capture listener; queued real Event references are read after actual key dispatch to observe final defaultPrevented, without app-store or focus mutation through evaluation.",
     "Theme source binding and malformed-manifest rejection are covered by unit tests, not by mutating shipped resources in this browser run."],
   checks: [], screenshots: [], pageErrors: [], externalRequests: [], layout: [], colors: [], focus: [], status: "running",
+  assertionChanges: [
+    { location: "natural keyboard boundary evidence", before: "require a sampled body focus when the mobile browser crosses the page boundary", after: "observe final defaultPrevented=false for every real Tab/Shift+Tab, verify all controls in DOM order and actual first/last boundary keys, retaining visibility and ring assertions", reason: "Preflight attempt2 showed headless mobile Chrome naturally wraps without a body sample. Browser-native wrap is not an application focus trap." },
+    { location: "chooseLook/surfaceMatrix", before: "close settings and immediately scroll the mobile conversation", after: "assert settings returns to its navigation entry, explicitly return to conversation, then retain the original visible content checks", reason: "rc.4 baseline mobile-light stopped at the hidden message; settings intentionally retains the navigation full view." },
+    { location: "mobile keyboard", before: "Tab/Shift+Tab must stay trapped in workspace-sidebar", after: "inactive retained pages are inert, natural Tab is unprevented and covers the complete control order and boundary keys, Escape restores the exact header opener", reason: "Mobile workspace navigation is a full page rather than a modal. True settings focus-trap and focus-ring assertions remain unchanged." },
+    { location: "navigation search keyboard ring", before: "only the active input's own outline/shadow can satisfy the visible ring assertion", after: "keep input focus-visible and strictly verify the known visible .panel-search:focus-within carrier's actual nontransparent outline; record active/carrier details before assertions", reason: "Preflight attempt1 failed at a legitimate grouped search input: style.css places its ring on .panel-search and deliberately removes the input outline." },
+  ],
 };
 const redact = value => String(value).replace(/#t=[A-Za-z0-9_-]+/g, "#t=[REDACTED]").replace(/pi-pane\.bearer\.[A-Za-z0-9_-]+/g, "pi-pane.bearer.[REDACTED]");
 let fixture, browser;
@@ -94,7 +101,12 @@ async function openSidebar(page) {
 
 async function closeSidebar(page) {
   const close = page.getByRole("button", { name: "关闭会话侧栏", exact: true });
-  if (await close.isVisible()) await close.click();
+  if (await close.isVisible()) {
+    await close.click();
+    await page.locator(".workspace-sidebar").waitFor({ state: "hidden" });
+    assert.equal(await page.locator(".workspace-sidebar").getAttribute("aria-hidden"), "true");
+    await page.locator(".conversation-panel").waitFor({ state: "visible" });
+  }
 }
 
 async function openSettings(page, section = "外观") {
@@ -130,6 +142,8 @@ async function chooseLook(page, title) {
   const expected = expectedBackgrounds.get(title);
   if (expected) await waitFor(async () => await page.evaluate(value => getComputedStyle(document.documentElement).getPropertyValue("--bg").trim() === value, expected), `${title} colors applied from its theme file`);
   await closeModal(page);
+  await waitFor(() => page.locator(".workspace-sidebar .settings-button").evaluate(node => node === document.activeElement), "appearance settings restores its navigation entry", 3_000);
+  await closeSidebar(page);
   if (expected) assert.equal(await page.evaluate(() => getComputedStyle(document.documentElement).getPropertyValue("--bg").trim()), expected, `${title} stayed selected after closing settings`);
   // Two animation frames let the host's directed theme reply paint without imposing a fixed sleep.
   await page.evaluate(() => new Promise(done => requestAnimationFrame(() => requestAnimationFrame(done))));
@@ -161,6 +175,90 @@ async function focusTrap(page, selector, name) {
   assert.ok(active.visible, `${name}: keyboard focus is focus-visible`);
   assert.ok((active.outline !== "none" && Number.parseFloat(active.width) > 0) || active.boxShadow !== "none", `${name}: focused control has a visible ring`);
   return { controls: count, active };
+}
+
+async function naturalKeyboard(page, selector, name) {
+  const observer = await page.evaluateHandle(selector => {
+    const surface = document.querySelector(selector);
+    const controls = [...surface.querySelectorAll('button:enabled, input:enabled, textarea:enabled, select:enabled, a[href], summary')].filter(node => node.tabIndex >= 0 && node.getClientRects().length && getComputedStyle(node).visibility === "visible" && !node.closest('[inert], [aria-hidden="true"], details:not([open]) > :not(summary)'));
+    const label = node => node.getAttribute("aria-label") || node.textContent?.trim().slice(0, 80) || node.id;
+    const records = [];
+    const listener = event => {
+      if (event.key !== "Tab") return;
+      const fromIndex = controls.indexOf(event.target), from = label(event.target);
+      // Keep the real Event reference after the capture microtask. read() is called
+      // only after Playwright completes dispatch, so defaultPrevented is final.
+      queueMicrotask(() => records.push({ event, fromIndex, from }));
+    };
+    document.addEventListener("keydown", listener, true);
+    return { controls, list: controls.map((node, index) => ({ index, tag: node.tagName, label: label(node) })),
+      read: () => records.map(({ event, fromIndex, from }) => ({ key: event.key, shiftKey: event.shiftKey, cancelable: event.cancelable, isTrusted: event.isTrusted, defaultPrevented: event.defaultPrevented, fromIndex, from })),
+      activeIndex: () => controls.indexOf(document.activeElement),
+      dispose: () => document.removeEventListener("keydown", listener, true) };
+  }, selector);
+  try {
+    const controls = await observer.evaluate(state => state.list), count = controls.length;
+    assert.ok(count > 0, "the active page has keyboard controls");
+    const first = (await observer.evaluateHandle(state => state.controls[0])).asElement();
+    const last = (await observer.evaluateHandle(state => state.controls.at(-1))).asElement();
+    const events = [];
+    const press = async (action, key, fromIndex, nextIndex) => {
+      const before = await observer.evaluate(state => state.read().length);
+      await action();
+      const observed = await waitFor(() => observer.evaluate((state, before) => { const rows = state.read(); return rows.length > before ? rows.slice(before) : null; }, before), `${name}: real ${key} event observed`, 2_000);
+      const active = await page.evaluate(selector => {
+        const node = document.activeElement, style = getComputedStyle(node);
+        const carrier = node.matches(".panel-search input") ? node.closest(".panel-search") : null;
+        const groupStyle = carrier && getComputedStyle(carrier), box = carrier?.getBoundingClientRect();
+        const group = carrier && { class: carrier.className, focusWithin: carrier.matches(":focus-within"), containsActive: carrier.contains(node), visible: !!carrier.getClientRects().length && groupStyle.visibility === "visible" && Number(groupStyle.opacity) > 0 && !carrier.closest('[inert], [aria-hidden="true"]'), outline: groupStyle.outlineStyle, width: groupStyle.outlineWidth, color: groupStyle.outlineColor, bounds: { x: box.x, y: box.y, width: box.width, height: box.height } };
+        const groupRing = !!group && group.focusWithin && group.containsActive && group.visible && !["none", "hidden"].includes(group.outline) && Number.parseFloat(group.width) > 0 && group.color !== "transparent" && !/^rgba\([^)]*,\s*0\)$/.test(group.color);
+        return { tag: node.tagName, label: node.getAttribute("aria-label") || node.textContent?.trim().slice(0, 80) || node.id, body: node === document.body || node === document.documentElement, inside: !!node.closest(selector), usable: !!node.getClientRects().length && style.visibility === "visible" && !node.matches(":disabled") && !node.closest('[inert], [aria-hidden="true"]'), focusVisible: node.matches(":focus-visible"), outline: style.outlineStyle, width: style.outlineWidth, color: style.outlineColor, shadow: style.boxShadow, group, groupRing };
+      }, selector);
+      const activeIndex = await observer.evaluate(state => state.activeIndex());
+      report.focus.push({ name, key, expectedFromIndex: fromIndex, events: observed, activeIndex, active });
+      assert.equal(observed.length, 1, "each actual key press dispatches one observed Tab event");
+      const event = observed[0]; events.push(event);
+      assert.equal(event.key, "Tab"); assert.equal(event.shiftKey, key === "Shift+Tab");
+      assert.ok(event.isTrusted && event.cancelable, "the observed event is a real cancellable browser keyboard event");
+      assert.equal(event.defaultPrevented, false, "the application does not prevent natural workspace Tab or Shift+Tab");
+      assert.equal(event.fromIndex, fromIndex, "keyboard traversal reaches the expected control in DOM order");
+      if (!active.body) {
+        assert.ok(active.inside && active.usable, "keyboard focus never reaches an inactive, hidden or inert page");
+        assert.ok(active.focusVisible && (active.outline !== "none" && Number.parseFloat(active.width) > 0 || active.shadow !== "none" || active.groupRing), "keyboard focus has a visible ring on the control or its verified search group");
+      }
+      if (nextIndex !== undefined) assert.equal(activeIndex, nextIndex, "forward Tab visits every available control in order");
+      return { event, activeIndex, active };
+    };
+    const reverseBoundary = await press(() => first.press("Shift+Tab"), "Shift+Tab", 0);
+    assert.ok(reverseBoundary.active.body || reverseBoundary.activeIndex === count - 1, "the first Shift+Tab uses the browser's natural boundary behavior");
+    const forwardBoundary = await press(() => last.press("Tab"), "Tab", count - 1);
+    assert.ok(forwardBoundary.active.body || forwardBoundary.activeIndex === 0, "the last Tab uses the browser's natural boundary behavior");
+    const order = [];
+    for (let index = 0; index < count; index++) {
+      const result = await press(index === 0 ? () => first.press("Tab") : () => page.keyboard.press("Tab"), "Tab", index, index < count - 1 ? index + 1 : undefined);
+      order.push(result.event.fromIndex);
+      if (index === count - 1) assert.ok(result.active.body || result.activeIndex === 0, "complete traversal reaches the browser's natural last boundary");
+    }
+    assert.deepEqual(order, controls.map(item => item.index), "real forward keyboard traversal covers every available control");
+    return { controls, events, order, reverseBoundary, forwardBoundary, appPreventedTabs: 0, eventObservation: "capture listener, queued real Event references, final defaultPrevented read after actual dispatch" };
+  } finally {
+    await observer.evaluate(state => state.dispose()); await observer.dispose();
+  }
+}
+
+async function navigationKeyboard(page) {
+  const target = page.locator(".workspace-sidebar");
+  assert.equal(await target.getAttribute("role"), null, "navigation has no dialog role");
+  assert.equal(await target.getAttribute("aria-modal"), null, "navigation has no modal semantics");
+  assert.equal(await target.getAttribute("inert"), null, "active navigation is interactive");
+  for (const selector of [".conversation-panel", ".workspace-inspector"]) {
+    const inactive = page.locator(selector);
+    assert.equal(await inactive.count(), 1, "inactive pages retain their DOM");
+    assert.equal(await inactive.getAttribute("inert"), "", "inactive full pages are inert");
+    assert.equal(await inactive.isVisible(), false, "inactive full pages are hidden");
+  }
+  assert.equal(await page.locator(".drawer-backdrop, .dialog-backdrop").count(), 0);
+  return naturalKeyboard(page, ".workspace-sidebar", "mobile-navigation-natural-keyboard");
 }
 
 async function decorations(page) {
@@ -333,7 +431,7 @@ try {
       await closeSidebar(page);
     });
 
-    await check(`${viewport.name}-keyboard`, "settings and mobile drawer retain visible keyboard focus and Escape dismisses", async () => {
+    await check(`${viewport.name}-keyboard`, "settings traps focus; mobile full-page navigation uses natural keyboard order and Escape restores its opener", async () => {
       await openSettings(page);
       const dialog = await focusTrap(page, '.dialog[aria-labelledby="settings-title"]', `${viewport.name} settings`);
       await shot(page, `${viewport.name}-settings-keyboard`);
@@ -341,7 +439,7 @@ try {
       let drawer;
       if (viewport.name === "mobile") {
         await openSidebar(page);
-        drawer = await focusTrap(page, ".workspace-sidebar", "mobile drawer");
+        drawer = await navigationKeyboard(page);
         await shot(page, "mobile-drawer-keyboard");
         await page.keyboard.press("Escape");
         assert.equal(await page.getByRole("button", { name: "打开工作区与会话", exact: true }).getAttribute("aria-expanded"), "false");

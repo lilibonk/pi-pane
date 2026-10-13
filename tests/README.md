@@ -2,7 +2,7 @@
 
 ## M3.1 candidate verification
 
-The local `0.3.0-rc.3` candidate adds project/account/settings/provider integration and the M31-D interface. Its current results and remaining release gates are recorded in [M3.1 status](../docs/m3.1-status.md); the 0.2.0 evidence below remains historical. The supported web login is API key; device OAuth is disabled and is not counted as a successful login trial.
+The local `0.3.0-rc.4` candidate adds the accepted M31-D workspace redesign to project/account/settings/provider integration. Its current results and remaining release gates are recorded in [M3.1 status](../docs/m3.1-status.md); rc.3 and the 0.2.0 evidence below remain historical. The supported web login is API key; device OAuth is disabled and is not counted as a successful login trial.
 
 After the last source or harness change, build and freeze the archive before running the complete serial matrix:
 
@@ -11,14 +11,15 @@ npm run typecheck
 npm test
 npm run build
 node scripts/m31-regression.mjs --list
-node scripts/m31-regression.mjs --run --output build-artifacts/releases/0.3.0-rc.3/regression --tarball /absolute/candidate.tgz
-PI_M31_INSTALL=1 PI_M2_CANDIDATE_TARBALL=/absolute/candidate.tgz PI_M2_REPORT_DIR=build-artifacts/releases/0.3.0-rc.3/install npm run m2:install
+node scripts/m31-regression.mjs --run --output build-artifacts/releases/0.3.0-rc.4/regression --tarball /absolute/candidate.tgz
+PI_M31_INSTALL=1 PI_M2_CANDIDATE_TARBALL=/absolute/candidate.tgz PI_M2_REPORT_DIR=build-artifacts/releases/0.3.0-rc.4/install npm run m2:install
 ```
 
-The runner executes 24 suites serially, creates isolated HOME/agent/TMPDIR environments, hashes source, build and harnesses before and after each suite, retains per-suite logs/reports and cleanup evidence, and refuses to reuse a nonempty evidence directory. `--suite <name>` runs a diagnostic subset and cannot claim a full-matrix pass. The final performance suite uses three observations per configuration; its RPC writer metrics do not isolate total application overhead. Real provider calls, real OAuth, publication and daily installation are separate gates.
+The runner executes 25 suites serially, including `m31:redesign` with `PI_M31_REDESIGN_REPORT_DIR`, creates isolated HOME/agent/TMPDIR environments, hashes source, build and harnesses before and after each suite, retains per-suite logs/reports and cleanup evidence, and refuses to reuse a nonempty evidence directory. `--suite <name>` runs a diagnostic subset and cannot claim a full-matrix pass. Keep source, scripts, tests, themes and public assets unchanged throughout each run. Use the candidate's isolated command wrapper for the build, tests and exact-install commands above. The final performance suite uses three observations per configuration; its RPC writer metrics do not isolate total application overhead. Real provider calls, real OAuth, publication and daily installation are separate gates.
 
 | Added harness | What it verifies |
 |---|---|
+| `m31:redesign` | Four viewports (1280/1024/390/320), nine checks each: workspace layout, real content/file reference/resources, settings/errors, queues/abort, themes/empty states and focus restoration across views, dialogs, file previews and responsive transitions |
 | `m31:integration` | Desktop 1280×720 and mobile 390×844: fresh HOME, create B from A, local custom provider, cancel/retry synthetic key, porcelain, a real public extension tool writing only B, slash routes, A draft and B session restoration; actual screenshots |
 | `m31:concurrency` | Actual browser pages competing for project/settings changes; account step ownership, cross-page cancellation, saved credentials during another page's reply, and explicit retry after an extension veto |
 | `m31:compat` | Frozen 0.2.0 → candidate → frozen 0.2.0 with native history/auth/settings; real old browser refresh notice; same-session model preservation across account/settings application and recovery |

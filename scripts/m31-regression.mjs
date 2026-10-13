@@ -33,6 +33,7 @@ const definitions = [
   suite("m3:workbench", "scripts/m3-workbench.mjs", "PI_M3_REPORT_DIR"),
   ...["runtime", "projects", "auth", "settings", "providers", "ui"].map(name => suite(`m31:${name}`, `scripts/m31-${name}.mjs`, "PI_M31_REPORT_DIR")),
   suite("m31:design", "scripts/m31-design.mjs", "PI_M31_DESIGN_REPORT_DIR"),
+  suite("m31:redesign", "scripts/m31-redesign.mjs", "PI_M31_REDESIGN_REPORT_DIR"),
   suite("m31:theme-tui", "scripts/m31-theme-tui.mjs", "PI_M31_THEME_REPORT_DIR"),
   suite("m31:integration", "scripts/m31-integration.mjs", "PI_M31_REPORT_DIR"),
   suite("m31:concurrency", "scripts/m31-concurrency.mjs", "PI_M31_REPORT_DIR"),
@@ -186,7 +187,7 @@ async function runSuite(item, index) {
   const env = { ...cleanProcessEnv, HOME: home, TMPDIR: temporary, TMP: temporary, TEMP: temporary, XDG_CONFIG_HOME: config, XDG_CACHE_HOME: cache, XDG_STATE_HOME: join(sandbox, "state"),
     PI_CODING_AGENT_DIR: agent, PI_CODING_AGENT_SESSION_DIR: join(agent, "sessions"), PI_OFFLINE: "1", PI_M0_EXTENSION: join(project, "dist/extension/index.js"),
     GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: "/dev/null", npm_config_userconfig: join(sandbox, "empty.npmrc"), npm_config_globalconfig: join(sandbox, "empty.npmrc"), npm_config_cache: join(cache, "npm"),
-    ...(initial.tarballSha256 ? { PI_M31_TARBALL_SHA256: initial.tarballSha256 } : {}), PI_M31_REPORT_DIR: directory, [item.envKey]: directory, ...item.env };
+    ...(initial.tarballSha256 ? { PI_M31_TARBALL_SHA256: initial.tarballSha256 } : {}), PI_M31_REGRESSION_LOG: join(directory, "suite.log"), PI_M31_REPORT_DIR: directory, [item.envKey]: directory, ...item.env };
   execution.environmentKeys = Object.keys(env).sort(); // Names only: never inherited credential values.
   const log = createWriteStream(join(directory, "suite.log"), { flags: "wx" });
   const known = new Set(), trackers = [];

@@ -32,6 +32,8 @@ export interface HostHandler {
   answer(id: string, response: Record<string, unknown>): void;
   pendingDialogs(): unknown[];
   uiState(): ExtensionUiState;
+  /** One unresolved model report for the bound session; ordinary extension notices remain ephemeral. */
+  pendingModelNotice?(): { t: "notice"; message: string } | undefined;
   /** Host state and its commands do not depend on a live session. */
   hostState?(): HostState;
   /** `revision` is the host state the viewer acted on; the handler decides which commands depend on it. */
@@ -426,12 +428,12 @@ export class Hub {
       if (hostState) this.send(peer, hostState);
       const accountState = this.hostHandler?.accountState?.(lease.id);
       if (accountState?.operation) this.send(peer, accountState);
-      this.sendSnapshot(peer);
+      this.sendSnapshot(peer, true);
       this.notifyCount();
       return;
     }
     const lease = this.validLease(peer);
-    if (message.t === "resync") { this.sendSnapshot(peer); return; }
+    if (message.t === "resync") { this.sendSnapshot(peer, true); return; }
     if (message.t === "ui_response") {
       if (!this.hostHandler) throw new ProtocolError("unsupported", "No dialog is open.");
       const { t: _t, id, ...response } = message;
@@ -635,7 +637,7 @@ export class Hub {
   publishHostState(): void { const state = this.hostHandler?.hostState?.(); if (state) this.broadcast(state); }
   /** Unsequenced notices from the session host (dialogs), delivered to every authenticated viewer. */
   notifyAll(message: ServerMessage): void { this.broadcast(message); }
-  private sendSnapshot(peer: Peer): void {
+  private sendSnapshot(peer: Peer, replayModelNotice = false): void {
     const bridge = this.boundBridge;
     if (!bridge || this._switching) { this.send(peer, { t: "switching", reason: "waiting_for_session" }); return; }
     // snapshot() and watermark capture contain no await, so incrementing events cannot interleave.
@@ -643,6 +645,10 @@ export class Hub {
     this.send(peer, { t: "snapshot", epoch: this._epoch, seq: this._seq, ...body, ...(this.hostHandler ? { ui: this.hostHandler.uiState() } : {}) });
     // Open dialogs follow the snapshot so a viewer that (re)connects can answer them.
     for (const dialog of this.hostHandler?.pendingDialogs() ?? []) this.send(peer, dialog as ServerMessage);
+    // A snapshot clears the page's notice. Replay only the host's unresolved model report on
+    // hello/resync; resets are followed by a fresh runtime report rather than duplicate warnings.
+    const modelNotice = replayModelNotice && this.hostHandler?.pendingModelNotice?.();
+    if (modelNotice) this.send(peer, modelNotice);
   }
   bindBridge(bridge: Bridge, reason = "session_start"): void {
     this.boundBridge?.setObserver(undefined);
